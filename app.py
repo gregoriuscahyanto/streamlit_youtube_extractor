@@ -434,9 +434,10 @@ with tab_cloud:
                     _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
                     _ok, _msg = _client.test_connection()
                 if _ok:
-                    st.session_state.update(
-                        webdav_connected=True, webdav_client=_client,
-                        webdav_url=wdav_url, webdav_user=wdav_user, webdav_pass=wdav_pass)
+                    # webdav_url/user/pass NICHT per update() setzen —
+                    # die sind als Widget-Keys registriert (read-only via session_state)
+                    st.session_state.webdav_connected = True
+                    st.session_state.webdav_client    = _client
                     st.session_state.webdav_root_options = get_root_folders()
                     st.session_state.fb_path  = "/"
                     st.session_state.fb_items = webdav_list("/")
