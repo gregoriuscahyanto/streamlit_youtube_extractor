@@ -131,6 +131,7 @@ def init_state():
         webdav_url=_sec_url or "https://bwsyncandshare.kit.edu/remote.php/dav/files/",
         webdav_user=_sec_user, webdav_pass=_sec_pass,
         webdav_connected=False, webdav_client=None,
+        webdav_auto_connect_tried=False,
         webdav_root="/",
         webdav_root_options=[],
         # Datei-Browser
@@ -317,6 +318,79 @@ def get_root_folders():
     return sorted(folders)
 
 
+def connect_webdav(url: str, user: str, password: str) -> tuple[bool, str]:
+    if not (url and user and password):
+        return False, "Bitte alle Felder ausfullen."
+
+    client = WebDAVClient(url, user, password)
+    ok, msg = client.test_connection()
+    if not ok:
+        st.session_state.webdav_connected = False
+        st.session_state.webdav_client = None
+        return False, msg
+
+    # ERST client und connected setzen, DANN Ordner laden
+    st.session_state.webdav_connected = True
+    st.session_state.webdav_client = client
+
+    # Ordner direkt mit dem neuen Client laden
+    ok_r, items_r = client.list_files("")
+    opts = ["/"]
+    if ok_r and isinstance(items_r, list):
+        for item in items_r:
+            if item.endswith("/"):
+                name = item.rstrip("/")
+                if name:
+                    opts.append("/" + name)
+        # Ebene 2
+        for folder in list(opts[1:]):
+            ok2, sub = client.list_files(folder)
+            if ok2 and isinstance(sub, list):
+                for entry in sub:
+                    if entry.endswith("/"):
+                        sub_name = entry.rstrip("/")
+                        if sub_name:
+                            full = folder.rstrip("/") + "/" + sub_name
+                            if full not in opts:
+                                opts.append(full)
+    opts = sorted(opts)
+    st.session_state.webdav_root_options = opts
+
+    # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
+    real = [o for o in opts if o != "/"]
+    if len(real) == 1:
+        st.session_state.webdav_root = real[0]
+        st.session_state.fb_path = real[0]
+        st.session_state.fb_items = webdav_list(real[0])
+        return True, f"Verbunden. Hauptordner automatisch gesetzt: {real[0]}"
+
+    st.session_state.fb_path = "/"
+    st.session_state.fb_items = webdav_list("")
+    return True, f"Verbunden. {len(opts)} Ordner gefunden."
+
+
+def try_auto_connect_webdav_once() -> None:
+    if st.session_state.webdav_connected:
+        return
+    if st.session_state.webdav_auto_connect_tried:
+        return
+
+    st.session_state.webdav_auto_connect_tried = True
+    wdav_url = (st.session_state.webdav_url or "").strip()
+    wdav_user = (st.session_state.webdav_user or "").strip()
+    wdav_pass = st.session_state.webdav_pass or ""
+    if not (wdav_url and wdav_user and wdav_pass):
+        return
+
+    ok, msg = connect_webdav(wdav_url, wdav_user, wdav_pass)
+    if ok:
+        set_status("Automatisch verbunden (secrets.toml).", "ok")
+        st.rerun()
+    else:
+        # Nur Info, damit die App auch offline ohne blockierenden Warnstatus startet.
+        set_status(f"Auto-Connect nicht moeglich: {msg}", "info")
+
+
 def _load_video_from_webdav(remote_path):
     client = st.session_state.webdav_client
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(remote_path).suffix)
@@ -379,6 +453,8 @@ def _load_ref_from_webdav(remote_path):
         set_status("Referenz-Track geladen ✓","ok")
     else: set_status(f"Ref-Download: {msg}","warn")
 
+try_auto_connect_webdav_once()
+
 # ── Header + Status ───────────────────────────────────────────────────────────
 st.markdown("""
 <div class="app-header">
@@ -429,54 +505,13 @@ with tab_cloud:
                                    help="Nextcloud: Einstellungen > Sicherheit > App-Passwoerter")
 
         if st.button("🔌 Verbinden", type="primary", use_container_width=True):
-            if wdav_url and wdav_user and wdav_pass:
-                with st.spinner("Verbinde ..."):
-                    _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
-                    _ok, _msg = _client.test_connection()
-                if _ok:
-                    # ERST client und connected setzen, DANN Ordner laden
-                    st.session_state.webdav_connected = True
-                    st.session_state.webdav_client    = _client
-                    # Ordner direkt mit dem neuen Client laden (nicht ueber get_root_folders
-                    # weil session_state update noch nicht geschrieben ist)
-                    _ok_r, _items_r = _client.list_files("")
-                    _opts = ["/"]
-                    if _ok_r and isinstance(_items_r, list):
-                        for _item in _items_r:
-                            if _item.endswith("/"):
-                                _n = _item.rstrip("/")
-                                if _n:
-                                    _opts.append("/" + _n)
-                        # Ebene 2
-                        for _folder in list(_opts[1:]):
-                            _ok2, _sub = _client.list_files(_folder)
-                            if _ok2 and isinstance(_sub, list):
-                                for _s in _sub:
-                                    if _s.endswith("/"):
-                                        _sn = _s.rstrip("/")
-                                        if _sn:
-                                            _full = _folder.rstrip("/") + "/" + _sn
-                                            if _full not in _opts:
-                                                _opts.append(_full)
-                    _opts = sorted(_opts)
-                    st.session_state.webdav_root_options = _opts
-                    # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
-                    _real = [o for o in _opts if o != "/"]
-                    if len(_real) == 1:
-                        st.session_state.webdav_root = _real[0]
-                        st.session_state.fb_path  = _real[0]
-                        st.session_state.fb_items = webdav_list(_real[0])
-                        set_status(f"Verbunden. Hauptordner automatisch gesetzt: {_real[0]}", "ok")
-                    else:
-                        st.session_state.fb_path  = "/"
-                        st.session_state.fb_items = webdav_list("")
-                        set_status(f"Verbunden. {len(_opts)} Ordner gefunden.", "ok")
-                else:
-                    st.session_state.webdav_connected = False
-                    set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
-                st.rerun()
+            with st.spinner("Verbinde ..."):
+                _ok, _msg = connect_webdav(wdav_url, wdav_user, wdav_pass)
+            if _ok:
+                set_status(_msg, "ok")
             else:
-                set_status("Bitte alle Felder ausfullen.", "warn"); st.rerun()
+                set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
+            st.rerun()
 
         if st.session_state.webdav_connected:
             st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">' +
