@@ -268,24 +268,24 @@ def _apply_video(local_path, display_name):
 
 def webdav_list(path):
     """
-    Listet Verzeichnis auf. path ist ein logischer Pfad relativ zum
-    Benutzer-Root, z.B. "/" oder "/captures" oder "/captures/20251104_202910".
-    Gibt [{"name", "path", "is_dir"}] zurück, wobei path der vollständige
-    logische Pfad für weitere Navigationsaufrufe ist.
+    Listet Verzeichnis auf.
+    path="" oder "/" -> Root (base_url)
+    path="/captures" -> captures-Ordner
+    Gibt [{"name", "path", "is_dir"}] zurueck.
     """
     if not st.session_state.webdav_connected: return []
     client = st.session_state.webdav_client
-    ok, items = client.list_files(path)
+    # Fuer list_files: "/" und "" sind beide = Root
+    list_path = path.strip("/")   # "" fuer Root, "captures" fuer Unterordner
+    ok, items = client.list_files(list_path)
     if not ok or not isinstance(items, list): return []
     result = []
+    base = path.rstrip("/")  # logischer Basispfad fuer Navigation
     for item in items:
-        # items sind jetzt relative Namen: "ordner/" oder "datei.txt"
         is_dir = item.endswith("/")
         name   = item.rstrip("/")
         if not name: continue
-        # Vollständiger logischer Pfad für Navigations-Klicks
-        base = path.rstrip("/")
-        full_path = (base + "/" + name).replace("//", "/")
+        full_path = (base + "/" + name) if base else ("/" + name)
         result.append({"name": name, "path": full_path, "is_dir": is_dir})
     result.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
     return result
@@ -434,14 +434,22 @@ with tab_cloud:
                     _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
                     _ok, _msg = _client.test_connection()
                 if _ok:
-                    # webdav_url/user/pass NICHT per update() setzen —
-                    # die sind als Widget-Keys registriert (read-only via session_state)
                     st.session_state.webdav_connected = True
                     st.session_state.webdav_client    = _client
-                    st.session_state.webdav_root_options = get_root_folders()
-                    st.session_state.fb_path  = "/"
-                    st.session_state.fb_items = webdav_list("/")
-                    set_status("WebDAV verbunden", "ok")
+                    # Ordner laden
+                    _opts = get_root_folders()
+                    st.session_state.webdav_root_options = _opts
+                    # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
+                    _real = [o for o in _opts if o != "/"]
+                    if len(_real) == 1:
+                        st.session_state.webdav_root = _real[0]
+                        st.session_state.fb_path  = _real[0]
+                        st.session_state.fb_items = webdav_list(_real[0])
+                        set_status(f"Verbunden. Hauptordner automatisch gesetzt: {_real[0]}", "ok")
+                    else:
+                        st.session_state.fb_path  = "/"
+                        st.session_state.fb_items = webdav_list("")
+                        set_status(f"Verbunden. {len(_opts)} Ordner gefunden.", "ok")
                 else:
                     st.session_state.webdav_connected = False
                     set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
@@ -501,13 +509,16 @@ with tab_cloud:
             # Pfad-Vorschau
             root = st.session_state.webdav_root
             cf   = st.session_state.capture_folder
+            _r2 = root.strip("/")
+            _cap_disp = ("/" + _r2 + "/captures/") if _r2 else "/captures/"
+            _res_disp = ("/" + _r2 + "/results/")  if _r2 else "/results/"
             st.markdown(f"""
             <div style="font-family:'JetBrains Mono',monospace;font-size:.64rem;
                  color:#4a5060;line-height:2.0;margin-top:.6rem;
                  border-top:1px solid #1e2535;padding-top:.5rem;">
             <span style="color:#8892a4">Root</span>&nbsp;&nbsp;&nbsp;&nbsp;{root or "/"}<br>
-            <span style="color:#8892a4">captures/</span>&nbsp;{root}/captures/<br>
-            <span style="color:#8892a4">results/</span>&nbsp;&nbsp;{root}/results/<br>
+            <span style="color:#8892a4">captures/</span>&nbsp;{_cap_disp}<br>
+            <span style="color:#8892a4">results/</span>&nbsp;&nbsp;{_res_disp}<br>
             <span style="color:#ffa040">{cf or "Aufnahme noch nicht gesetzt"}</span>
             </div>""", unsafe_allow_html=True)
         else:
@@ -524,8 +535,9 @@ with tab_cloud:
 
         if st.session_state.webdav_connected and st.session_state.webdav_root:
             root     = st.session_state.webdav_root
-            cap_path = f"{root}/captures".replace("//", "/")
-            _ok_cap, _cap_items = st.session_state.webdav_client.list_files(cap_path)
+            # cap_path relativ zum root: wenn root="/foo" -> "foo/captures"
+            _cap_rel = (root.strip("/") + "/captures").strip("/")
+            _ok_cap, _cap_items = st.session_state.webdav_client.list_files(_cap_rel)
             cap_folders = []
             if _ok_cap and isinstance(_cap_items, list):
                 cap_folders = sorted(
@@ -625,12 +637,16 @@ with tab_cloud:
             root = st.session_state.webdav_root or "/"
             cf   = st.session_state.capture_folder
             qa   = st.columns(4)
+            def _p(*parts):
+                """Baut logischen Pfad: _p("foo","bar") -> "/foo/bar" """
+                return "/" + "/".join(p.strip("/") for p in parts if p.strip("/"))
+            _r = root.strip("/")
             shortcuts = [
-                ("captures/",  f"{root}/captures".replace("//","/")),
-                ("results/",   f"{root}/results".replace("//","/")),
-                ("reference/", f"{root}/reference_track_siesmann".replace("//","/")),
+                ("captures/",  _p(_r, "captures")),
+                ("results/",   _p(_r, "results")),
+                ("reference/", _p(_r, "reference_track_siesmann")),
                 (f"{cf[:8]}.." if len(cf) > 8 else (cf or "—"),
-                 f"{root}/captures/{cf}".replace("//","/") if cf else None),
+                 _p(_r, "captures", cf) if cf else None),
             ]
             for i, (label, path) in enumerate(shortcuts):
                 if path:
