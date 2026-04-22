@@ -1,6 +1,6 @@
-﻿---
+---
 title: streamlit_youtube_extractor
-emoji: "🎬"
+emoji: "ðŸŽ¬"
 colorFrom: blue
 colorTo: indigo
 sdk: streamlit
@@ -9,28 +9,29 @@ python_version: "3.11"
 app_file: app.py
 pinned: false
 ---
-# OCR Extractor v2 â€” ROI + Track-Analyse
+
+# OCR Extractor v2 Ã¢â‚¬â€ ROI + Track-Analyse
 
 Streamlit-App zur interaktiven ROI-Auswahl und Track-Minimap-Analyse.  
-Ergebnisse werden als **JSON und MAT** parallel gespeichert â€” lokal und auf **bwSyncAndShare/Nextcloud** via WebDAV.
+Ergebnisse werden als **JSON und MAT** parallel gespeichert Ã¢â‚¬â€ lokal und auf **bwSyncAndShare/Nextcloud** via WebDAV.
 
 ---
 
 ## Features
 
-### Tab 1 â€“ ROI Setup
+### Tab 1 Ã¢â‚¬â€œ ROI Setup
 - Video laden: lokal oder von WebDAV (`captures/<folder>/<folder>.mp4`)
 - Start/Ende und Frame-Position scrubben
-- ROIs definieren, bearbeiten, lÃ¶schen (alle MATLAB-ROI-Namen inkl. `track_minimap`)
-- **Speichern als JSON + MAT** (gleichzeitig) â†’ `results/results_<folder>.{json,mat}`
+- ROIs definieren, bearbeiten, lÃƒÂ¶schen (alle MATLAB-ROI-Namen inkl. `track_minimap`)
+- **Speichern als JSON + MAT** (gleichzeitig) Ã¢â€ â€™ `results/results_<folder>.{json,mat}`
 - Vorherige Konfiguration laden: JSON lokal, JSON von WebDAV, MAT von WebDAV
 
-### Tab 2 â€“ Track-Analyse
+### Tab 2 Ã¢â‚¬â€œ Track-Analyse
 - **Referenz-Track** laden (Bild lokal oder von `reference_track_siesmann/`)
 - **8-Punkte-Kalibrierung**: je 8 Punkte auf Minimap + Referenzkarte definieren
-- **Homographie-Berechnung** (RANSAC): Minimap â†’ Referenzkarte
-- **Ãœberlagerungsvisualisierung**: transformierte Minimap auf Referenzkarte
-- **RÃ¼ckprojektionsfehler** fÃ¼r alle 8 Punkte (Abstand in Pixel)
+- **Homographie-Berechnung** (RANSAC): Minimap Ã¢â€ â€™ Referenzkarte
+- **ÃƒÅ“berlagerungsvisualisierung**: transformierte Minimap auf Referenzkarte
+- **RÃƒÂ¼ckprojektionsfehler** fÃƒÂ¼r alle 8 Punkte (Abstand in Pixel)
 - **Bewegenden Punkt** erkennen (HSV-Farberkennung, frei konfigurierbar)
 - Verlaufstabelle der erkannten Positionen (t, x, y)
 
@@ -40,19 +41,19 @@ Ergebnisse werden als **JSON und MAT** parallel gespeichert â€” lokal und a
 
 ```
 <root>/
-â”œâ”€â”€ captures/
-â”‚   â”œâ”€â”€ 20251104_202910/
-â”‚   â”‚   â”œâ”€â”€ 20251104_202910.mp4
-â”‚   â”‚   â””â”€â”€ 20251104_202910.wav
-â”‚   â””â”€â”€ 20251201_143022/
-â”‚       â”œâ”€â”€ 20251201_143022.mp4
-â”‚       â””â”€â”€ 20251201_143022.wav
-â”œâ”€â”€ results/
-â”‚   â”œâ”€â”€ results_20251104_202910.mat   â† MATLAB-kompatibel
-â”‚   â”œâ”€â”€ results_20251104_202910.json  â† fÃ¼r Streamlit / zukÃ¼nftige Python-Pipeline
-â”‚   â””â”€â”€ ...
-â””â”€â”€ reference_track_siesmann/
-    â””â”€â”€ track.png                     â† Referenzkarte
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ captures/
+Ã¢â€â€š   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ 20251104_202910/
+Ã¢â€â€š   Ã¢â€â€š   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ 20251104_202910.mp4
+Ã¢â€â€š   Ã¢â€â€š   Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ 20251104_202910.wav
+Ã¢â€â€š   Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ 20251201_143022/
+Ã¢â€â€š       Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ 20251201_143022.mp4
+Ã¢â€â€š       Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ 20251201_143022.wav
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ results/
+Ã¢â€â€š   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ results_20251104_202910.mat   Ã¢â€ Â MATLAB-kompatibel
+Ã¢â€â€š   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ results_20251104_202910.json  Ã¢â€ Â fÃƒÂ¼r Streamlit / zukÃƒÂ¼nftige Python-Pipeline
+Ã¢â€â€š   Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ ...
+Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ reference_track_siesmann/
+    Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ track.png                     Ã¢â€ Â Referenzkarte
 ```
 
 Die App legt diese Struktur automatisch an (MKCOL), wenn sie noch nicht existiert.
@@ -71,7 +72,7 @@ streamlit run app.py
 ## Deployment auf Streamlit Community Cloud
 
 1. GitHub-Repo (public oder private)
-2. https://share.streamlit.io â†’ New App â†’ `app.py`
+2. https://share.streamlit.io Ã¢â€ â€™ New App Ã¢â€ â€™ `app.py`
 3. Optional: Secrets hinterlegen:
 
 ```toml
@@ -129,13 +130,13 @@ rr.metadata.video             % Videoname
 
 ```
 ocr_extractor_v2/
-â”œâ”€â”€ app.py              â† Haupt-App (Tab1: ROI, Tab2: Track)
-â”œâ”€â”€ track_analysis.py   â† Homographie, Farberkennung, Overlay
-â”œâ”€â”€ webdav_client.py    â† WebDAV via requests
-â”œâ”€â”€ storage.py          â† Ordnerstruktur-Logik
-â”œâ”€â”€ requirements.txt
-â”œâ”€â”€ .streamlit/config.toml
-â”œâ”€â”€ .gitignore
-â””â”€â”€ README.md
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ app.py              Ã¢â€ Â Haupt-App (Tab1: ROI, Tab2: Track)
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ track_analysis.py   Ã¢â€ Â Homographie, Farberkennung, Overlay
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ webdav_client.py    Ã¢â€ Â WebDAV via requests
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ storage.py          Ã¢â€ Â Ordnerstruktur-Logik
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ requirements.txt
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ .streamlit/config.toml
+Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ .gitignore
+Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ README.md
 ```
 
