@@ -142,10 +142,11 @@ class WebDAVClient:
         """
         try:
             url = self._build_url(remote_dir)
-            body = """<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:">
-  <d:prop><d:resourcetype/><d:displayname/></d:prop>
-</d:propfind>"""
+            # Server-kompatibel: identisch zur funktionierenden curl-Abfrage
+            body = (
+                '<?xml version="1.0"?>'
+                '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+            )
             urls_to_try = [url]
             if remote_dir.strip("/") == "" and url.endswith("/"):
                 urls_to_try.append(url.rstrip("/"))
@@ -154,7 +155,11 @@ class WebDAVClient:
             for candidate_url in urls_to_try:
                 r = self.session.request(
                     "PROPFIND", candidate_url,
-                    headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+                    headers={
+                        "Depth": "1",
+                        "Content-Type": "application/xml",
+                        "Accept": "application/xml",
+                    },
                     data=body,
                     timeout=20)
 
