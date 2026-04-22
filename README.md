@@ -1,25 +1,36 @@
-# OCR Extractor v2 — ROI + Track-Analyse
+﻿---
+title: streamlit_youtube_extractor
+emoji: "🎬"
+colorFrom: blue
+colorTo: indigo
+sdk: streamlit
+sdk_version: "1.35.0"
+python_version: "3.11"
+app_file: app.py
+pinned: false
+---
+# OCR Extractor v2 â€” ROI + Track-Analyse
 
 Streamlit-App zur interaktiven ROI-Auswahl und Track-Minimap-Analyse.  
-Ergebnisse werden als **JSON und MAT** parallel gespeichert — lokal und auf **bwSyncAndShare/Nextcloud** via WebDAV.
+Ergebnisse werden als **JSON und MAT** parallel gespeichert â€” lokal und auf **bwSyncAndShare/Nextcloud** via WebDAV.
 
 ---
 
 ## Features
 
-### Tab 1 – ROI Setup
+### Tab 1 â€“ ROI Setup
 - Video laden: lokal oder von WebDAV (`captures/<folder>/<folder>.mp4`)
 - Start/Ende und Frame-Position scrubben
-- ROIs definieren, bearbeiten, löschen (alle MATLAB-ROI-Namen inkl. `track_minimap`)
-- **Speichern als JSON + MAT** (gleichzeitig) → `results/results_<folder>.{json,mat}`
+- ROIs definieren, bearbeiten, lÃ¶schen (alle MATLAB-ROI-Namen inkl. `track_minimap`)
+- **Speichern als JSON + MAT** (gleichzeitig) â†’ `results/results_<folder>.{json,mat}`
 - Vorherige Konfiguration laden: JSON lokal, JSON von WebDAV, MAT von WebDAV
 
-### Tab 2 – Track-Analyse
+### Tab 2 â€“ Track-Analyse
 - **Referenz-Track** laden (Bild lokal oder von `reference_track_siesmann/`)
 - **8-Punkte-Kalibrierung**: je 8 Punkte auf Minimap + Referenzkarte definieren
-- **Homographie-Berechnung** (RANSAC): Minimap → Referenzkarte
-- **Überlagerungsvisualisierung**: transformierte Minimap auf Referenzkarte
-- **Rückprojektionsfehler** für alle 8 Punkte (Abstand in Pixel)
+- **Homographie-Berechnung** (RANSAC): Minimap â†’ Referenzkarte
+- **Ãœberlagerungsvisualisierung**: transformierte Minimap auf Referenzkarte
+- **RÃ¼ckprojektionsfehler** fÃ¼r alle 8 Punkte (Abstand in Pixel)
 - **Bewegenden Punkt** erkennen (HSV-Farberkennung, frei konfigurierbar)
 - Verlaufstabelle der erkannten Positionen (t, x, y)
 
@@ -29,19 +40,19 @@ Ergebnisse werden als **JSON und MAT** parallel gespeichert — lokal und auf **
 
 ```
 <root>/
-├── captures/
-│   ├── 20251104_202910/
-│   │   ├── 20251104_202910.mp4
-│   │   └── 20251104_202910.wav
-│   └── 20251201_143022/
-│       ├── 20251201_143022.mp4
-│       └── 20251201_143022.wav
-├── results/
-│   ├── results_20251104_202910.mat   ← MATLAB-kompatibel
-│   ├── results_20251104_202910.json  ← für Streamlit / zukünftige Python-Pipeline
-│   └── ...
-└── reference_track_siesmann/
-    └── track.png                     ← Referenzkarte
+â”œâ”€â”€ captures/
+â”‚   â”œâ”€â”€ 20251104_202910/
+â”‚   â”‚   â”œâ”€â”€ 20251104_202910.mp4
+â”‚   â”‚   â””â”€â”€ 20251104_202910.wav
+â”‚   â””â”€â”€ 20251201_143022/
+â”‚       â”œâ”€â”€ 20251201_143022.mp4
+â”‚       â””â”€â”€ 20251201_143022.wav
+â”œâ”€â”€ results/
+â”‚   â”œâ”€â”€ results_20251104_202910.mat   â† MATLAB-kompatibel
+â”‚   â”œâ”€â”€ results_20251104_202910.json  â† fÃ¼r Streamlit / zukÃ¼nftige Python-Pipeline
+â”‚   â””â”€â”€ ...
+â””â”€â”€ reference_track_siesmann/
+    â””â”€â”€ track.png                     â† Referenzkarte
 ```
 
 Die App legt diese Struktur automatisch an (MKCOL), wenn sie noch nicht existiert.
@@ -60,7 +71,7 @@ streamlit run app.py
 ## Deployment auf Streamlit Community Cloud
 
 1. GitHub-Repo (public oder private)
-2. https://share.streamlit.io → New App → `app.py`
+2. https://share.streamlit.io â†’ New App â†’ `app.py`
 3. Optional: Secrets hinterlegen:
 
 ```toml
@@ -118,12 +129,13 @@ rr.metadata.video             % Videoname
 
 ```
 ocr_extractor_v2/
-├── app.py              ← Haupt-App (Tab1: ROI, Tab2: Track)
-├── track_analysis.py   ← Homographie, Farberkennung, Overlay
-├── webdav_client.py    ← WebDAV via requests
-├── storage.py          ← Ordnerstruktur-Logik
-├── requirements.txt
-├── .streamlit/config.toml
-├── .gitignore
-└── README.md
+â”œâ”€â”€ app.py              â† Haupt-App (Tab1: ROI, Tab2: Track)
+â”œâ”€â”€ track_analysis.py   â† Homographie, Farberkennung, Overlay
+â”œâ”€â”€ webdav_client.py    â† WebDAV via requests
+â”œâ”€â”€ storage.py          â† Ordnerstruktur-Logik
+â”œâ”€â”€ requirements.txt
+â”œâ”€â”€ .streamlit/config.toml
+â”œâ”€â”€ .gitignore
+â””â”€â”€ README.md
 ```
+
