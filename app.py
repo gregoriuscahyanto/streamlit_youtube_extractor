@@ -1015,7 +1015,6 @@ with tab_mat:
             st.session_state.capture_folder = capture_folder
         else:
             set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
-        st.rerun()
 
     if connected and mats and st.session_state.mat_auto_updated_prefix != st.session_state.r2_prefix and not running:
         st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
