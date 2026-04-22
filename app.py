@@ -182,6 +182,46 @@ def set_status(msg, kind="info"):
     st.session_state.status_msg  = msg
     st.session_state.status_type = kind
 
+def _normalize_webdav_path(path: str | None) -> str:
+    clean = (path or "").strip().strip("/")
+    return "/" + clean if clean else "/"
+
+def _join_webdav_path(*parts: str) -> str:
+    clean_parts = [part.strip("/") for part in parts if part and part.strip("/")]
+    return "/" + "/".join(clean_parts) if clean_parts else "/"
+
+def _build_root_folder_options(client: WebDAVClient | None = None) -> list[str]:
+    """Ermittelt moegliche Hauptordner bis 2 Ebenen tief, inkl. Root '/'."""
+    if client is None:
+        if not st.session_state.webdav_connected:
+            return ["/"]
+        client = st.session_state.webdav_client
+
+    folders = ["/"]
+    ok, items = client.list_files("")
+    if not ok or not isinstance(items, list):
+        return folders
+
+    level_one = []
+    for item in items:
+        if item.endswith("/"):
+            folder = _join_webdav_path(item)
+            if folder not in folders:
+                folders.append(folder)
+                level_one.append(folder)
+
+    for folder in level_one:
+        ok2, sub = client.list_files(folder.strip("/"))
+        if not ok2 or not isinstance(sub, list):
+            continue
+        for item in sub:
+            if item.endswith("/"):
+                subfolder = _join_webdav_path(folder, item)
+                if subfolder not in folders:
+                    folders.append(subfolder)
+
+    return sorted(folders, key=lambda value: (value != "/", value.lower()))
+
 def _file_icon(name):
     ext = Path(name).suffix.lower()
     return {".mp4":"🎬",".mov":"🎬",".avi":"🎬",".mkv":"🎬",
@@ -275,6 +315,7 @@ def webdav_list(path):
     """
     if not st.session_state.webdav_connected: return []
     client = st.session_state.webdav_client
+    path = _normalize_webdav_path(path)
     # Fuer list_files: "/" und "" sind beide = Root
     list_path = path.strip("/")   # "" fuer Root, "captures" fuer Unterordner
     ok, items = client.list_files(list_path)
@@ -285,36 +326,14 @@ def webdav_list(path):
         is_dir = item.endswith("/")
         name   = item.rstrip("/")
         if not name: continue
-        full_path = (base + "/" + name) if base else ("/" + name)
+        full_path = _join_webdav_path(base, name)
         result.append({"name": name, "path": full_path, "is_dir": is_dir})
     result.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
     return result
 
 def get_root_folders():
     """Listet Ordner fuer Hauptordner-Dropdown, 2 Ebenen tief."""
-    if not st.session_state.webdav_connected: return ["/"]
-    client = st.session_state.webdav_client
-    # "" = Benutzer-Root (base_url)
-    ok, items = client.list_files("")
-    folders = ["/"]
-    if ok and isinstance(items, list):
-        for item in items:
-            if item.endswith("/"):
-                name = item.rstrip("/")
-                if name:
-                    folders.append("/" + name)
-    # Ebene 2
-    for folder in list(folders[1:]):
-        ok2, sub = client.list_files(folder)
-        if ok2 and isinstance(sub, list):
-            for s in sub:
-                if s.endswith("/"):
-                    sname = s.rstrip("/")
-                    if sname:
-                        full = folder.rstrip("/") + "/" + sname
-                        if full not in folders:
-                            folders.append(full)
-    return sorted(folders)
+    return _build_root_folder_options()
 
 
 def _load_video_from_webdav(remote_path):
@@ -437,28 +456,7 @@ with tab_cloud:
                     # ERST client und connected setzen, DANN Ordner laden
                     st.session_state.webdav_connected = True
                     st.session_state.webdav_client    = _client
-                    # Ordner direkt mit dem neuen Client laden (nicht ueber get_root_folders
-                    # weil session_state update noch nicht geschrieben ist)
-                    _ok_r, _items_r = _client.list_files("")
-                    _opts = ["/"]
-                    if _ok_r and isinstance(_items_r, list):
-                        for _item in _items_r:
-                            if _item.endswith("/"):
-                                _n = _item.rstrip("/")
-                                if _n:
-                                    _opts.append("/" + _n)
-                        # Ebene 2
-                        for _folder in list(_opts[1:]):
-                            _ok2, _sub = _client.list_files(_folder)
-                            if _ok2 and isinstance(_sub, list):
-                                for _s in _sub:
-                                    if _s.endswith("/"):
-                                        _sn = _s.rstrip("/")
-                                        if _sn:
-                                            _full = _folder.rstrip("/") + "/" + _sn
-                                            if _full not in _opts:
-                                                _opts.append(_full)
-                    _opts = sorted(_opts)
+                    _opts = _build_root_folder_options(_client)
                     st.session_state.webdav_root_options = _opts
                     # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
                     _real = [o for o in _opts if o != "/"]
@@ -469,7 +467,7 @@ with tab_cloud:
                         set_status(f"Verbunden. Hauptordner automatisch gesetzt: {_real[0]}", "ok")
                     else:
                         st.session_state.fb_path  = "/"
-                        st.session_state.fb_items = webdav_list("")
+                        st.session_state.fb_items = webdav_list("/")
                         set_status(f"Verbunden. {len(_opts)} Ordner gefunden.", "ok")
                 else:
                     st.session_state.webdav_connected = False
@@ -505,8 +503,8 @@ with tab_cloud:
             if root_mode == "Aus Liste waehlen":
                 cur = st.session_state.webdav_root
                 idx = opts.index(cur) if cur in opts else 0
-                # key enthaelt Anzahl Optionen -> zwingt Neurender wenn Liste sich aendert
-                _dd_key = f"root_dd_{len(opts)}"
+                # key enthaelt die Optionen selbst -> Dropdown wird bei Listenwechsel sauber neu aufgebaut
+                _dd_key = "root_dd_" + "|".join(opts)
                 chosen = st.selectbox("Hauptordner", opts, index=idx,
                                        label_visibility="collapsed", key=_dd_key)
                 c1, c2 = st.columns(2)
@@ -522,7 +520,7 @@ with tab_cloud:
                                         placeholder="/mein_projekt",
                                         label_visibility="collapsed", key="root_manual")
                 if st.button("Uebernehmen", use_container_width=True, key="set_root_manual"):
-                    path = (manual.rstrip("/") or "/")
+                    path = _normalize_webdav_path(manual)
                     st.session_state.webdav_root = path
                     st.session_state.fb_path     = path
                     st.session_state.fb_items    = webdav_list(path)
