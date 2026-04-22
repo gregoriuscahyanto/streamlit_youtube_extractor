@@ -281,7 +281,11 @@ def webdav_list(path):
     return result
 
 def get_root_folders():
-    """Listet Ordner im Root auf für Hauptordner-Dropdown."""
+    """
+    Listet Ordner für Hauptordner-Dropdown.
+    Gibt "/" plus alle Unterordner der ersten Ebene zurück,
+    damit der Nutzer z.B. /streamlit_youtube_extractor_storage waehlen kann.
+    """
     if not st.session_state.webdav_connected: return ["/"]
     client = st.session_state.webdav_client
     ok, items = client.list_files("/")
@@ -292,6 +296,17 @@ def get_root_folders():
             name = item.rstrip("/")
             if name:
                 folders.append("/" + name)
+    # Auch eine Ebene tiefer schauen (für verschachtelte Projekte)
+    for folder in list(folders[1:]):
+        ok2, sub = client.list_files(folder)
+        if ok2 and isinstance(sub, list):
+            for s in sub:
+                if s.endswith("/"):
+                    sname = s.rstrip("/")
+                    if sname:
+                        full = folder.rstrip("/") + "/" + sname
+                        if full not in folders:
+                            folders.append(full)
     return sorted(folders)
 
 def _load_video_from_webdav(remote_path):
@@ -364,8 +379,13 @@ st.markdown("""
 </div>""", unsafe_allow_html=True)
 
 stype = st.session_state.status_type
+_root_display = st.session_state.webdav_root or ""
+_root_badge = (f'<span class="status-badge status-ok" style="margin-left:8px">'
+               f'HAUPTORDNER: {_root_display.upper()}</span>'
+               if st.session_state.webdav_connected and _root_display and _root_display != "/"
+               else "")
 st.markdown(
-    f'<span class="status-badge status-{stype}">{st.session_state.status_msg}</span>',
+    f'<span class="status-badge status-{stype}">{st.session_state.status_msg}</span>' + _root_badge,
     unsafe_allow_html=True)
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
@@ -387,23 +407,28 @@ with tab_cloud:
         st.markdown('<div class="section-title">Verbindung · bwSyncAndShare / Nextcloud</div>',
                     unsafe_allow_html=True)
 
-        # Streamlit-Secrets auto-fill
+        # Secrets einmalig aus Streamlit-Secrets in session_state laden
         try:
             sec = st.secrets.get("webdav", {})
-            _def_url  = sec.get("url",  st.session_state.webdav_url)
-            _def_user = sec.get("username", st.session_state.webdav_user)
-            _def_pass = sec.get("password", st.session_state.webdav_pass)
+            if sec.get("url")      and not st.session_state.webdav_url:
+                st.session_state.webdav_url  = sec["url"]
+            if sec.get("username") and not st.session_state.webdav_user:
+                st.session_state.webdav_user = sec["username"]
+            if sec.get("password") and not st.session_state.webdav_pass:
+                st.session_state.webdav_pass = sec["password"]
         except Exception:
-            _def_url  = st.session_state.webdav_url
-            _def_user = st.session_state.webdav_user
-            _def_pass = st.session_state.webdav_pass
+            pass
 
-        wdav_url  = st.text_input("WebDAV URL", value=_def_url,
-                                   help="z.B. https://bwsyncandshare.kit.edu/remote.php/dav/files/")
-        wdav_user = st.text_input("Benutzername", value=_def_user,
-                                   placeholder="KIT-Kürzel (z.B. ab1234)")
-        wdav_pass = st.text_input("App-Passwort", value=_def_pass, type="password",
-                                   help="Nextcloud → Einstellungen → Sicherheit → App-Passwörter")
+        wdav_url  = st.text_input("WebDAV URL",
+                                   value=st.session_state.webdav_url,
+                                   help="z.B. https://bwsyncandshare.kit.edu/remote.php/dav/files/UUID%40.../")
+        wdav_user = st.text_input("Benutzername",
+                                   value=st.session_state.webdav_user,
+                                   placeholder="UUID@bwidm.scc.kit.edu")
+        wdav_pass = st.text_input("App-Passwort",
+                                   value=st.session_state.webdav_pass,
+                                   type="password",
+                                   help="Nextcloud > Einstellungen > Sicherheit > App-Passwoerter")
 
         if st.button("🔌 Verbinden", type="primary", use_container_width=True):
             if wdav_url and wdav_user and wdav_pass:
@@ -414,7 +439,11 @@ with tab_cloud:
                     st.session_state.update(
                         webdav_connected=True, webdav_client=client,
                         webdav_url=wdav_url, webdav_user=wdav_user, webdav_pass=wdav_pass)
-                    st.session_state.webdav_root_options = get_root_folders()
+                    opts = get_root_folders()
+                    st.session_state.webdav_root_options = opts
+                    # Browser sofort auf Root zeigen
+                    st.session_state.fb_path  = "/"
+                    st.session_state.fb_items = webdav_list("/")
                     set_status("WebDAV verbunden ✓", "ok")
                 else:
                     st.session_state.webdav_connected = False
