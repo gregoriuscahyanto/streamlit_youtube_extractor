@@ -278,3 +278,26 @@ def draw_comparison_overlay(
         pass
 
     return overlay
+
+
+def project_point_with_homography(
+    point_xy: tuple[float, float] | list[float],
+    H: list[list[float]] | np.ndarray | None,
+) -> tuple[float, float] | None:
+    """
+    Projects one minimap point into reference coordinates using homography H.
+    Returns None if projection is not possible.
+    """
+    if H is None:
+        return None
+    try:
+        H_arr = np.array(H, dtype=np.float64)
+        x, y = float(point_xy[0]), float(point_xy[1])
+        denom = H_arr[2, 0] * x + H_arr[2, 1] * y + H_arr[2, 2]
+        if abs(denom) < 1e-9:
+            return None
+        px = (H_arr[0, 0] * x + H_arr[0, 1] * y + H_arr[0, 2]) / denom
+        py = (H_arr[1, 0] * x + H_arr[1, 1] * y + H_arr[1, 2]) / denom
+        return float(px), float(py)
+    except Exception:
+        return None

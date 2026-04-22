@@ -1,8 +1,8 @@
-"""
-OCR Extractor – Streamlit App v4
-Tab ☁  : Cloudflare R2-Verbindung, Prefix wählen, Datei-Browser
-Tab 🎬  : Video laden, Start/Ende, ROI-Auswahl
-Tab 🗺  : Track-Minimap Analyse – 8-Punkte + Farberkennung
+﻿"""
+OCR Extractor â€“ Streamlit App v4
+Tab â˜  : Cloudflare R2-Verbindung, Prefix wÃ¤hlen, Datei-Browser
+Tab ðŸŽ¬  : Video laden, Start/Ende, ROI-Auswahl
+Tab ðŸ—º  : Track-Minimap Analyse â€“ 8-Punkte + Farberkennung
 """
 
 import streamlit as st
@@ -12,6 +12,7 @@ import json
 import tempfile
 import io
 import scipy.io as sio
+import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
@@ -25,6 +26,7 @@ from backend import (
     connect_r2_client,
     list_root_prefixes,
     load_r2_credentials,
+    summarize_mat_file,
 )
 from storage import StorageManager
 from track_analysis import (
@@ -32,24 +34,25 @@ from track_analysis import (
     detect_moving_point,
     draw_comparison_overlay,
     extract_minimap_crop,
+    project_point_with_homography,
 )
 
-# ── Seitenkonfiguration ───────────────────────────────────────────────────────
+# â”€â”€ Seitenkonfiguration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 st.set_page_config(
     page_title="OCR Extractor",
-    page_icon="🎬",
+    page_icon="OCR",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+# â”€â”€ CSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;600;800&display=swap');
 
 html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
-.stApp { background: #0d0f14; color: #e8eaf0; }
-.block-container { padding-top: 1.1rem !important; max-width: 1500px; }
+.stApp { background: #0d0f14; color: #e8eaf0; overflow: auto; }
+.block-container { padding-top: 1.1rem !important; max-width: 1500px; height: calc(100vh - 3.2rem); overflow: auto; }
 
 .app-header { display:flex; align-items:baseline; gap:14px;
   margin-bottom:1rem; border-bottom:1px solid #1e2535; padding-bottom:.7rem; }
@@ -67,6 +70,12 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 
 .section-card { background:#13161f; border:1px solid #1e2535; border-radius:6px;
   padding:.9rem 1.1rem; margin-bottom:.9rem; }
+.section-card:empty { display:none !important; padding:0 !important; margin:0 !important; border:0 !important; }
+.mat-selection-no-scroll {
+  max-height: calc(100vh - 230px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
 .section-title { font-family:'JetBrains Mono',monospace; font-size:.68rem;
   letter-spacing:.15em; text-transform:uppercase; color:#4a90a4;
   margin-bottom:.6rem; border-bottom:1px solid #1e2535; padding-bottom:.35rem; }
@@ -101,10 +110,15 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
   border-color:#4a90a4 !important; color:#0d0f14 !important; }
 
 hr { border-color:#1e2535 !important; }
+
+/* selected row highlight in dataframe */
+.stDataFrame [aria-selected="true"] {
+  background-color: rgba(74, 144, 164, 0.30) !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ── ROI / Format Listen ───────────────────────────────────────────────────────
+# â”€â”€ ROI / Format Listen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ROI_NAMES = [
     "_","t_s","v_Fzg_kmph","v_Fzg_mph","numgear_GET",
     "a_G","a_mps2","a_x_G","a_x_pos_G","a_x_neg_G","a_x_mps",
@@ -122,8 +136,22 @@ FMT_OPTIONS = [
     "integer","int_1","int_2","int_3","int_4","int_min2_max3","int_min3_max4",
     "float","alnum","custom",
 ]
+MAT_OVERVIEW_COLCFG = {
+    "mat_datei": st.column_config.TextColumn("mat_datei", width="medium"),
+    "remote_key": st.column_config.TextColumn("remote_key", width="large"),
+    "audio_video_vorhanden": st.column_config.TextColumn("Audio+Video vorhanden", width="small"),
+    "roi_ausgewaehlt": st.column_config.TextColumn("ROI", width="small"),
+    "track_ausgewaehlt": st.column_config.TextColumn("Track", width="small"),
+    "anfang_ende_ausgewaehlt": st.column_config.TextColumn("Start/Ende", width="small"),
+    "ocr_durchgefuehrt": st.column_config.TextColumn("OCR", width="small"),
+    "ocr_vollstaendig": st.column_config.TextColumn("OCR vollstaendig", width="small"),
+    "audioanalyse_spektrogramm": st.column_config.TextColumn("Audio/Spektrogramm", width="small"),
+    "validierung": st.column_config.TextColumn("Validierung", width="small"),
+    "fehler": st.column_config.TextColumn("Fehler", width="large"),
+}
+MAT_TABLE_HEIGHT = 430
 
-# ── Session-State ──────────────────────────────────────────────────────────────
+# â”€â”€ Session-State â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def init_state():
     _acc, _key, _sec, _bkt = load_r2_credentials(streamlit_secrets=st.secrets)
 
@@ -137,6 +165,20 @@ def init_state():
         r2_prefix="",
         r2_prefix_options=[],
         r2_listing_debug=[],
+        auto_connect_attempted=False,
+        auto_connect_used=False,
+        mat_files=[],
+        mat_scan_prefix=None,
+        mat_selected_key="",
+        mat_selected_summary=None,
+        mat_overview_rows=[],
+        mat_auto_updated_prefix=None,
+        jump_to_mat_tab=False,
+        mat_update_running=False,
+        mat_update_idx=0,
+        mat_update_total=0,
+        mat_update_keys=[],
+        mat_run_state="idle",
         # Datei-Browser
         fb_path="", fb_items=[], fb_selected=None,
         # Aufnahme
@@ -159,7 +201,7 @@ def init_state():
 
 init_state()
 
-# ── Hilfsfunktionen ───────────────────────────────────────────────────────────
+# â”€â”€ Hilfsfunktionen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @st.cache_data(show_spinner=False)
 def get_frame(video_path: str, time_s: float):
     cap = cv2.VideoCapture(video_path)
@@ -186,12 +228,70 @@ def set_status(msg, kind="info"):
     st.session_state.status_msg  = msg
     st.session_state.status_type = kind
 
+
+def _has_valid_8_points(points):
+    if not isinstance(points, list) or len(points) != 8:
+        return False
+    for p in points:
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            return False
+        try:
+            float(p[0]); float(p[1])
+        except Exception:
+            return False
+    return True
+
+
+def _clamp_roi_to_video(x, y, w, h, vid_w, vid_h):
+    x = max(0.0, float(x))
+    y = max(0.0, float(y))
+    max_w = max(1.0, float(vid_w) - x) if vid_w else max(1.0, float(w))
+    max_h = max(1.0, float(vid_h) - y) if vid_h else max(1.0, float(h))
+    w = min(max(1.0, float(w)), max_w)
+    h = min(max(1.0, float(h)), max_h)
+    return x, y, w, h
+
+
+def _try_auto_connect_once():
+    if st.session_state.r2_connected or st.session_state.auto_connect_attempted:
+        return
+
+    st.session_state.auto_connect_attempted = True
+    acc = st.session_state.r2_account_id.strip()
+    key = st.session_state.r2_access_key_id.strip()
+    sec = st.session_state.r2_secret_access_key.strip()
+    bkt = st.session_state.r2_bucket.strip()
+    if not all([acc, key, sec, bkt]):
+        return
+
+    ok, msg, client = connect_r2_client(acc, key, sec, bkt)
+    if not ok or client is None:
+        set_status(f"Auto-Connect fehlgeschlagen: {msg}", "warn")
+        return
+
+    st.session_state.r2_connected = True
+    st.session_state.r2_client = client
+    opts = list_root_prefixes(client)
+    st.session_state.r2_prefix_options = opts
+    real = [o for o in opts if o]
+    if len(real) == 1:
+        st.session_state.r2_prefix = real[0]
+        st.session_state.fb_path = real[0]
+        st.session_state.fb_items = r2_list(real[0])
+    else:
+        st.session_state.fb_path = ""
+        st.session_state.fb_items = r2_list("")
+    st.session_state.auto_connect_used = True
+    set_status("Auto-Connect erfolgreich.", "ok")
+
 def _file_icon(name):
     ext = Path(name).suffix.lower()
-    return {".mp4":"🎬",".mov":"🎬",".avi":"🎬",".mkv":"🎬",
-            ".mat":"🧮",".json":"📋",".wav":"🎵",".mp3":"🎵",
-            ".png":"🖼",".jpg":"🖼",".jpeg":"🖼",
-            ".txt":"📄",".md":"📄"}.get(ext,"📄")
+    return {
+        ".mp4": "[VID]", ".mov": "[VID]", ".avi": "[VID]", ".mkv": "[VID]",
+        ".mat": "[MAT]", ".json": "[JSON]", ".wav": "[AUD]", ".mp3": "[AUD]",
+        ".png": "[IMG]", ".jpg": "[IMG]", ".jpeg": "[IMG]",
+        ".txt": "[TXT]", ".md": "[TXT]",
+    }.get(ext, "[FILE]")
 
 def draw_rois(frame, rois, sel, vid_w, vid_h):
     img = frame.copy()
@@ -272,11 +372,243 @@ def get_root_prefixes():
     if not st.session_state.r2_connected: return [""]
     return list_root_prefixes(st.session_state.r2_client)
 
+
+def _results_dir_key() -> str:
+    pfx = st.session_state.r2_prefix.strip("/")
+    return f"{pfx}/results" if pfx else "results"
+
+
+def _refresh_mat_files():
+    if not st.session_state.r2_connected or st.session_state.r2_client is None:
+        st.session_state.mat_files = []
+        return
+    res_key = _results_dir_key()
+    ok, items = st.session_state.r2_client.list_files(res_key)
+    if not ok or not isinstance(items, list):
+        st.session_state.mat_files = []
+        return
+    mats = []
+    for name in items:
+        if not name.endswith("/"):
+            full_key = f"{res_key}/{name}" if res_key else name
+            if full_key.lower().endswith(".mat"):
+                mats.append(full_key.strip("/"))
+    mats.sort(reverse=True)
+    st.session_state.mat_files = mats
+    if st.session_state.mat_selected_key not in mats:
+        st.session_state.mat_selected_key = mats[0] if mats else ""
+        st.session_state.mat_selected_summary = None
+    st.session_state.mat_scan_prefix = st.session_state.r2_prefix
+
+
+def _mat_capture_guess_from_key(remote_key: str) -> str:
+    filename = Path(remote_key).name
+    if filename.startswith("results_") and filename.lower().endswith(".mat"):
+        return filename[len("results_"):-4]
+    return ""
+
+
+def _download_mat_to_temp(remote_key: str):
+    client = st.session_state.r2_client
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+    tmp.close()
+    ok, msg = client.download_file(remote_key, tmp.name)
+    if not ok:
+        return False, msg, None
+    return True, "", tmp.name
+
+
+def _get_mat_summary_from_r2(remote_key: str):
+    ok, msg, tmp_path = _download_mat_to_temp(remote_key)
+    if not ok or not tmp_path:
+        return {"mat_file": Path(remote_key).name, "error": f"Download: {msg}"}
+    summary = summarize_mat_file(tmp_path)
+    summary["mat_file"] = Path(remote_key).name
+    summary["remote_key"] = remote_key
+    if not summary.get("capture_folder"):
+        summary["capture_folder"] = _mat_capture_guess_from_key(remote_key)
+    capture_folder = summary.get("capture_folder", "")
+    summary["video_file_exists"] = None
+    summary["audio_file_exists"] = None
+    if capture_folder and st.session_state.r2_client is not None:
+        pfx = st.session_state.r2_prefix.strip("/")
+        cap_dir = f"{pfx}/captures/{capture_folder}" if pfx else f"captures/{capture_folder}"
+        ok_list, items = st.session_state.r2_client.list_files(cap_dir)
+        if ok_list and isinstance(items, list):
+            files = [n for n in items if not n.endswith("/")]
+            lower_files = [n.lower() for n in files]
+            summary["video_file_exists"] = any(
+                n.endswith((".mp4", ".mov", ".avi", ".mkv")) for n in lower_files
+            )
+            summary["audio_file_exists"] = any(
+                n.endswith((".wav", ".mp3", ".m4a", ".aac")) for n in lower_files
+            )
+    return summary
+
+
+def _analyze_mat_from_r2(remote_key: str):
+    summary = _get_mat_summary_from_r2(remote_key)
+    if summary.get("error"):
+        set_status(f"MAT-Analysefehler: {summary['error']}", "warn")
+    st.session_state.mat_selected_summary = summary
+
+
+def _jn(value) -> str:
+    return "Ja" if bool(value) else "Nein"
+
+
+def _summary_to_overview_row(summary: dict) -> dict:
+    return {
+        "mat_datei": summary.get("mat_file", ""),
+        "remote_key": summary.get("remote_key", ""),
+        "audio_video_vorhanden": _jn(
+            bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists"))
+        ),
+        "roi_ausgewaehlt": _jn(summary.get("roi_selected")),
+        "track_ausgewaehlt": _jn(summary.get("track_selected")),
+        "anfang_ende_ausgewaehlt": _jn(summary.get("start_end_selected")),
+        "ocr_durchgefuehrt": _jn(summary.get("ocr_done")),
+        "ocr_vollstaendig": _jn(summary.get("ocr_complete")),
+        "audioanalyse_spektrogramm": _jn(summary.get("audio_spectrogram_done")),
+        "validierung": _jn(summary.get("validation_done")),
+        "fehler": summary.get("error", ""),
+    }
+
+
+def _placeholder_overview_row(remote_key: str) -> dict:
+    return {
+        "mat_datei": Path(remote_key).name,
+        "remote_key": remote_key,
+        "audio_video_vorhanden": "...",
+        "roi_ausgewaehlt": "...",
+        "track_ausgewaehlt": "...",
+        "anfang_ende_ausgewaehlt": "...",
+        "ocr_durchgefuehrt": "...",
+        "ocr_vollstaendig": "...",
+        "audioanalyse_spektrogramm": "...",
+        "validierung": "...",
+        "fehler": "",
+    }
+
+
+def _build_mat_overview_rows(remote_keys: list[str]) -> list[dict]:
+    rows = []
+    for key in remote_keys:
+        summary = _get_mat_summary_from_r2(key)
+        rows.append(_summary_to_overview_row(summary))
+    return rows
+
+
+def _start_mat_update(remote_keys: list[str]):
+    st.session_state.mat_update_keys = list(remote_keys)
+    st.session_state.mat_update_total = len(remote_keys)
+    st.session_state.mat_update_idx = 0
+    st.session_state.mat_update_running = len(remote_keys) > 0
+    st.session_state.mat_run_state = "running" if len(remote_keys) > 0 else "idle"
+    st.session_state.mat_overview_rows = [_placeholder_overview_row(k) for k in remote_keys]
+
+
+def _step_mat_update_once():
+    if not st.session_state.mat_update_running:
+        return
+    idx = st.session_state.mat_update_idx
+    total = st.session_state.mat_update_total
+    keys = st.session_state.mat_update_keys
+    if idx >= total:
+        st.session_state.mat_update_running = False
+        st.session_state.mat_run_state = "done"
+        return
+
+    key = keys[idx]
+    summary = _get_mat_summary_from_r2(key)
+    st.session_state.mat_overview_rows[idx] = _summary_to_overview_row(summary)
+    st.session_state.mat_update_idx = idx + 1
+
+    if st.session_state.mat_update_idx >= total:
+        st.session_state.mat_update_running = False
+        st.session_state.mat_run_state = "done"
+        set_status(f"Analyse fuer {total} MAT-Dateien abgeschlossen.", "ok")
+
+
+def _status_cell_style(value):
+    if str(value) == "Ja":
+        return "background-color: #0f3d1f; color: #e8ffe8;"
+    if str(value) == "Nein":
+        return "background-color: #4a1d1d; color: #ffe8e8;"
+    return ""
+
+
+def _style_overview_dataframe(df: pd.DataFrame):
+    status_cols = [
+        "audio_video_vorhanden",
+        "roi_ausgewaehlt",
+        "track_ausgewaehlt",
+        "anfang_ende_ausgewaehlt",
+        "ocr_durchgefuehrt",
+        "ocr_vollstaendig",
+        "audioanalyse_spektrogramm",
+        "validierung",
+    ]
+    styler = df.style
+    if hasattr(styler, "map"):
+        return styler.map(_status_cell_style, subset=status_cols)
+    if hasattr(styler, "applymap"):
+        return styler.applymap(_status_cell_style, subset=status_cols)
+    return df
+
+
+def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progress_slot=None):
+    """
+    Backward-compatible synchronous updater for MAT overview rows.
+    """
+    _start_mat_update(remote_keys)
+    total = len(remote_keys)
+    progress = progress_slot.progress(0, text=f"0/{total} MAT-Dateien analysiert") if (total > 0 and progress_slot is not None) else None
+
+    while st.session_state.mat_update_running:
+        _step_mat_update_once()
+        done = int(st.session_state.mat_update_idx or 0)
+        if live_table is not None:
+            live_table.dataframe(
+                _style_overview_dataframe(pd.DataFrame(st.session_state.mat_overview_rows)),
+                width="stretch",
+                hide_index=True,
+                height=MAT_TABLE_HEIGHT,
+                column_config=MAT_OVERVIEW_COLCFG,
+            )
+        if progress is not None and total > 0:
+            progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
+
+    if progress is not None:
+        progress.empty()
+
+
+def _try_load_video_for_capture_folder(capture_folder: str) -> bool:
+    if not capture_folder:
+        return False
+    client = st.session_state.r2_client
+    if client is None:
+        return False
+    pfx = st.session_state.r2_prefix.strip("/")
+    cap_dir = f"{pfx}/captures/{capture_folder}" if pfx else f"captures/{capture_folder}"
+    ok_list, items = client.list_files(cap_dir)
+    if not ok_list or not isinstance(items, list):
+        return False
+    preferred_name = f"{capture_folder}.mp4".lower()
+    if preferred_name in [n.lower() for n in items if not n.endswith("/")]:
+        _load_video_from_r2(f"{cap_dir}/{capture_folder}.mp4".strip("/"))
+        return True
+    for name in items:
+        if name.lower().endswith((".mp4", ".mov", ".avi", ".mkv")) and not name.endswith("/"):
+            _load_video_from_r2(f"{cap_dir}/{name}".strip("/"))
+            return True
+    return False
+
 def _load_video_from_r2(remote_key):
     client = st.session_state.r2_client
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(remote_key).suffix)
     tmp.close()
-    with st.spinner(f"Lade {Path(remote_key).name} …"):
+    with st.spinner(f"Lade {Path(remote_key).name} ..."):
         ok, msg = client.download_file(remote_key, tmp.name)
     if ok: _apply_video(tmp.name, Path(remote_key).name)
     else:  set_status(f"Download: {msg}", "warn")
@@ -288,7 +620,7 @@ def _load_json_from_r2(remote_key):
     if ok:
         try:
             with open(tmp.name) as f: load_json_config(json.load(f))
-            set_status("JSON geladen ✓", "ok")
+            set_status("JSON geladen OK", "ok")
         except Exception as e: set_status(f"JSON-Parse: {e}", "warn")
     else: set_status(f"JSON-Download: {msg}", "warn")
 
@@ -296,7 +628,7 @@ def _load_mat_from_r2(remote_key):
     client = st.session_state.r2_client
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp.close()
     ok, msg = client.download_file(remote_key, tmp.name)
-    if not ok: set_status(f"MAT-Download: {msg}", "warn"); return
+    if not ok: set_status(f"MAT-Download: {msg}", "warn"); return None
     try:
         cfg = config_from_mat_file(tmp.name, vid_duration=st.session_state.vid_duration)
         st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
@@ -306,8 +638,10 @@ def _load_mat_from_r2(remote_key):
             st.session_state.ref_track_pts = cfg["ref_track_pts"]
         if cfg.get("minimap_pts"):
             st.session_state.minimap_pts = cfg["minimap_pts"]
-        set_status("MAT geladen ✓","ok")
+        set_status("MAT geladen OK","ok")
+        return tmp.name
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
+    return None
 
 def _load_ref_from_r2(remote_key):
     client = st.session_state.r2_client
@@ -317,14 +651,17 @@ def _load_ref_from_r2(remote_key):
     if ok:
         img = np.array(Image.open(tmp.name).convert("RGB"))
         st.session_state.ref_track_img = img
-        set_status("Referenz-Track geladen ✓","ok")
+        set_status("Referenz-Track geladen OK","ok")
     else: set_status(f"Ref-Download: {msg}","warn")
 
-# ── Header + Status ───────────────────────────────────────────────────────────
+
+_try_auto_connect_once()
+
+# â”€â”€ Header + Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 st.markdown("""
 <div class="app-header">
   <h1>OCR Extractor</h1>
-  <span class="subtitle">R2 · ROI · Track</span>
+  <span class="subtitle">R2 | ROI | TRACK</span>
 </div>""", unsafe_allow_html=True)
 
 stype = st.session_state.status_type
@@ -337,32 +674,32 @@ st.markdown(
     f'<span class="status-badge status-{stype}">{st.session_state.status_msg}</span>' + _pfx_badge,
     unsafe_allow_html=True)
 
-# ── TABS ──────────────────────────────────────────────────────────────────────
-tab_cloud, tab_roi, tab_track = st.tabs(
-    ["☁️  Cloud & Dateien", "🎬  ROI-Setup", "🗺  Track-Analyse"]
+# â”€â”€ TABS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+tab_setup, tab_mat, tab_roi, tab_track = st.tabs(
+    ["Cloud Connection & Root", "MAT Selection", "ROI Setup", "Track Analysis"]
 )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB ☁️  – CLOUD & DATEIEN
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_cloud:
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB â˜ï¸  â€“ CLOUD & DATEIEN
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+with tab_setup:
 
     col_l, col_r = st.columns([1, 2], gap="large")
 
-    # ── Linke Spalte ───────────────────────────────────────────────────────────
+    # â”€â”€ Linke Spalte â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     with col_l:
 
-        # ── Verbindung ─────────────────────────────────────────────────────────
+        # â”€â”€ Verbindung â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Verbindung · Cloudflare R2</div>',
+        st.markdown('<div class="section-title">Verbindung | Cloudflare R2</div>',
                     unsafe_allow_html=True)
 
         r2_account  = st.text_input("Account ID",
                                      key="r2_account_id",
-                                     help="Cloudflare Dashboard → R2 → Account ID (oben rechts)")
+                                     help="Cloudflare Dashboard -> R2 -> Account ID (oben rechts)")
         r2_key      = st.text_input("Access Key ID",
                                      key="r2_access_key_id",
-                                     help="R2 → Manage API Tokens → Create API Token")
+                                     help="R2 -> Manage API Tokens -> Create API Token")
         r2_secret   = st.text_input("Secret Access Key",
                                      key="r2_secret_access_key",
                                      type="password")
@@ -370,31 +707,26 @@ with tab_cloud:
                                      key="r2_bucket",
                                      placeholder="mein-bucket")
 
-        if st.button("🔌 Verbinden", type="primary", use_container_width=True):
+        if st.button("Verbinden", type="primary", use_container_width=True):
             if r2_account and r2_key and r2_secret and r2_bucket:
-                with st.spinner("Verbinde …"):
+                with st.spinner("Verbinde..."):
                     _ok, _msg, _client = connect_r2_client(r2_account, r2_key, r2_secret, r2_bucket)
                 if _ok:
                     st.session_state.r2_connected = True
                     st.session_state.r2_client    = _client
                     _opts = list_root_prefixes(_client)
                     st.session_state.r2_prefix_options = _opts
-                    _real = [o for o in _opts if o != ""]
-                    if len(_real) == 1:
-                        st.session_state.r2_prefix = _real[0]
-                        st.session_state.fb_path   = _real[0]
-                        st.session_state.fb_items  = r2_list(_real[0])
-                        set_status(f"Verbunden. Prefix automatisch gesetzt: {_real[0]}", "ok")
-                    else:
-                        st.session_state.fb_path  = ""
-                        st.session_state.fb_items = r2_list("")
-                        set_status(f"Verbunden. {len(_opts)} Top-Level-Prefixe gefunden.", "ok")
+                    st.session_state.r2_prefix = ""
+                    st.session_state.fb_path = ""
+                    st.session_state.fb_items = r2_list("")
+                    st.session_state.mat_scan_prefix = None
+                    set_status(f"Verbunden. Projektroot automatisch auf (root) gesetzt. {len(_opts)} Prefixe verfuegbar.", "ok")
                 else:
                     st.session_state.r2_connected = False
                     set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
                 st.rerun()
             else:
-                set_status("Bitte alle Felder ausfüllen.", "warn"); st.rerun()
+                set_status("Bitte alle Felder ausfuellen.", "warn"); st.rerun()
 
         if st.session_state.r2_connected:
             st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">' +
@@ -426,45 +758,45 @@ with tab_cloud:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Bucket-Prefix ──────────────────────────────────────────────────────
+        # â”€â”€ Bucket-Prefix â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Bucket-Prefix (Projekt-Root)</div>',
                     unsafe_allow_html=True)
-        st.caption("Optionaler Präfix für alle Pfade im Bucket — leer = Bucket-Root.")
+        st.caption("Optionaler Praefix fuer alle Pfade im Bucket - leer = Bucket-Root.")
 
         if st.session_state.r2_connected:
             opts = st.session_state.r2_prefix_options or [""]
-            root_mode = st.radio("Eingabe", ["Aus Liste wählen", "Manuell eingeben"],
+            root_mode = st.radio("Eingabe", ["Aus Liste waehlen", "Manuell eingeben"],
                                   horizontal=True, label_visibility="collapsed",
                                   key="root_mode")
 
-            if root_mode == "Aus Liste wählen":
+            if root_mode == "Aus Liste waehlen":
                 cur = st.session_state.r2_prefix
                 idx = opts.index(cur) if cur in opts else 0
                 chosen = st.selectbox("Prefix", opts, index=idx,
                                        format_func=lambda x: x or "(Bucket-Root)",
                                        label_visibility="collapsed", key="root_dd")
-                c1, c2 = st.columns(2)
-                if c1.button("Übernehmen", use_container_width=True, key="set_root_dd"):
+                if chosen != st.session_state.r2_prefix:
                     st.session_state.r2_prefix = chosen
                     st.session_state.fb_path   = chosen
                     st.session_state.fb_items  = r2_list(chosen)
-                    set_status(f"Prefix: {chosen or '(root)'}", "ok"); st.rerun()
-                if c2.button("Liste neu", use_container_width=True, key="refresh_root"):
+                    st.session_state.mat_scan_prefix = None
+                    set_status(f"Prefix: {chosen or '(root)'}", "ok")
+                if st.button("Liste neu", use_container_width=True, key="refresh_root"):
                     st.session_state.r2_prefix_options = get_root_prefixes(); st.rerun()
             else:
                 manual = st.text_input("Pfad", value=st.session_state.r2_prefix,
                                         placeholder="mein_projekt",
                                         label_visibility="collapsed", key="root_manual")
-                if st.button("Übernehmen", use_container_width=True, key="set_root_manual"):
+                if st.button("Uebernehmen", use_container_width=True, key="set_root_manual"):
                     pfx = manual.strip("/")
                     st.session_state.r2_prefix = pfx
                     st.session_state.fb_path   = pfx
                     st.session_state.fb_items  = r2_list(pfx)
+                    st.session_state.mat_scan_prefix = None
                     set_status(f"Prefix: {pfx or '(root)'}", "ok"); st.rerun()
 
             pfx = st.session_state.r2_prefix
-            cf  = st.session_state.capture_folder
             _p  = (pfx + "/") if pfx else ""
             st.markdown(f"""
             <div style="font-family:'JetBrains Mono',monospace;font-size:.64rem;
@@ -472,8 +804,7 @@ with tab_cloud:
                  border-top:1px solid #1e2535;padding-top:.5rem;">
             <span style="color:#8892a4">Prefix</span>&nbsp;&nbsp;&nbsp;{pfx or "(root)"}<br>
             <span style="color:#8892a4">captures/</span>&nbsp;{_p}captures/<br>
-            <span style="color:#8892a4">results/</span>&nbsp;&nbsp;{_p}results/<br>
-            <span style="color:#ffa040">{cf or "Aufnahme noch nicht gesetzt"}</span>
+            <span style="color:#8892a4">results/</span>&nbsp;&nbsp;{_p}results/
             </div>""", unsafe_allow_html=True)
         else:
             st.markdown('<div style="font-family:JetBrains Mono,monospace;font-size:.72rem;' +
@@ -482,80 +813,7 @@ with tab_cloud:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Aufnahme-Ordner ────────────────────────────────────────────────────
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Aufnahme-Ordner</div>', unsafe_allow_html=True)
-        st.caption("Format: YYYYMMDD_HHMMSS aus captures/ — bestimmt alle Datei-Pfade.")
-
-        if st.session_state.r2_connected and st.session_state.r2_client is not None:
-            pfx = st.session_state.r2_prefix
-            cap_key = (pfx + "/captures").strip("/") if pfx else "captures"
-            _ok_cap, _cap_items = st.session_state.r2_client.list_files(cap_key)
-            cap_folders = []
-            if _ok_cap and isinstance(_cap_items, list):
-                cap_folders = sorted(
-                    [i.rstrip("/") for i in _cap_items if i.endswith("/") and i.rstrip("/")],
-                    reverse=True)
-
-            if cap_folders:
-                cf_idx = (cap_folders.index(st.session_state.capture_folder)
-                          if st.session_state.capture_folder in cap_folders else 0)
-                chosen_cf = st.selectbox(
-                    "Aufnahme auswählen", cap_folders, index=cf_idx,
-                    format_func=lambda x: f"📁 {x}",
-                    label_visibility="collapsed", key="cf_dd")
-                if st.button("Auswählen", use_container_width=True, key="set_cf"):
-                    st.session_state.capture_folder = chosen_cf
-                    nav = (cap_key + "/" + chosen_cf).strip("/")
-                    st.session_state.fb_path  = nav
-                    st.session_state.fb_items = r2_list(nav)
-                    set_status(f"Aufnahme: {chosen_cf}", "ok"); st.rerun()
-            else:
-                st.caption("Keine Unterordner in captures/ — ggf. Prefix setzen.")
-
-        cf_manual = st.text_input("Oder manuell eingeben",
-                                   value=st.session_state.capture_folder,
-                                   placeholder="20251104_202910",
-                                   label_visibility="collapsed", key="cf_manual")
-        if cf_manual != st.session_state.capture_folder:
-            st.session_state.capture_folder = cf_manual
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # ── Lokal laden ────────────────────────────────────────────────────────
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Lokal laden</div>', unsafe_allow_html=True)
-
-        up_v = st.file_uploader("Video (MP4/MOV/AVI)",
-                                 type=["mp4","mov","avi","mkv"],
-                                 label_visibility="collapsed", key="up_v")
-        if up_v and st.session_state.video_name != up_v.name:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(up_v.name).suffix)
-            tmp.write(up_v.read()); tmp.close()
-            _apply_video(tmp.name, up_v.name)
-            st.rerun()
-
-        up_r = st.file_uploader("Referenz-Bild (PNG/JPG)",
-                                 type=["png","jpg","jpeg"],
-                                 label_visibility="collapsed", key="up_r")
-        if up_r:
-            img = np.array(Image.open(up_r).convert("RGB"))
-            st.session_state.ref_track_img = img
-            set_status("Referenz-Track geladen", "ok")
-
-        up_j = st.file_uploader("Config (JSON)",
-                                 type=["json"],
-                                 label_visibility="collapsed", key="up_j")
-        if up_j:
-            try:
-                load_json_config(json.load(up_j))
-                set_status("JSON-Config geladen", "ok"); st.rerun()
-            except Exception as e:
-                set_status(f"JSON-Fehler: {e}", "warn")
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # ── Rechte Spalte: Datei-Browser ───────────────────────────────────────────
+    # â”€â”€ Rechte Spalte: Datei-Browser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     with col_r:
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Datei-Browser</div>', unsafe_allow_html=True)
@@ -570,7 +828,7 @@ with tab_cloud:
             # Breadcrumb + Buttons
             nav1, nav2, nav3 = st.columns([4, 1, 1])
             with nav1:
-                st.markdown(f'<div class="breadcrumb">📂 /{cur}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="breadcrumb">/{cur}</div>', unsafe_allow_html=True)
             with nav2:
                 if st.button("Hoch", use_container_width=True, key="fb_up"):
                     parts = cur.rstrip("/").split("/")
@@ -585,8 +843,7 @@ with tab_cloud:
 
             # Schnellzugriff
             pfx = st.session_state.r2_prefix or ""
-            cf  = st.session_state.capture_folder
-            qa  = st.columns(4)
+            qa  = st.columns(3)
             def _k(*parts):
                 segs = [p.strip("/") for p in [pfx] + list(parts) if p.strip("/")]
                 return "/".join(segs)
@@ -594,8 +851,6 @@ with tab_cloud:
                 ("captures/",  _k("captures")),
                 ("results/",   _k("results")),
                 ("reference/", _k("reference_track_siesmann")),
-                (f"{cf[:8]}.." if len(cf) > 8 else (cf or "—"),
-                 _k("captures", cf) if cf else None),
             ]
             for i, (label, path) in enumerate(shortcuts):
                 if path:
@@ -617,7 +872,7 @@ with tab_cloud:
                             'Leer oder kein Zugriff.</div>', unsafe_allow_html=True)
             else:
                 for entry in items:
-                    icon = "📁" if entry["is_dir"] else _file_icon(entry["name"])
+                    icon = "[DIR]" if entry["is_dir"] else _file_icon(entry["name"])
                     c_name, c_btn = st.columns([5, 1])
                     with c_name:
                         if st.button(f"{icon}  {entry['name']}",
@@ -685,19 +940,159 @@ with tab_cloud:
             st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 🎬 – ROI-SETUP
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB ðŸ§® â€“ MAT-AUSWAHL
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+with tab_mat:
+    st.markdown('<div class="section-card mat-selection-no-scroll">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">MAT-Auswahl und Analyse</div>', unsafe_allow_html=True)
+
+    connected = st.session_state.r2_connected and st.session_state.r2_client is not None
+    if connected and st.session_state.mat_scan_prefix != st.session_state.r2_prefix:
+        _refresh_mat_files()
+        st.session_state.mat_auto_updated_prefix = None
+
+    mats = st.session_state.mat_files if connected else []
+    running = bool(st.session_state.mat_update_running)
+
+    # Controls are always visible.
+    if st.session_state.mat_run_state == "stopped":
+        update_label = "Reset"
+    else:
+        update_label = "Update"
+
+    c1, c2 = st.columns(2)
+    update_clicked = c1.button(
+        update_label,
+        use_container_width=True,
+        key="mat_update_tab",
+        disabled=not connected,
+    )
+    can_load_state = st.session_state.mat_run_state in ("stopped", "done")
+    can_load = connected and bool(st.session_state.mat_selected_key) and can_load_state and not running
+    load_clicked = c2.button(
+        "MAT + Video laden",
+        type="primary",
+        use_container_width=True,
+        key="mat_load_all_tab",
+        disabled=not can_load,
+    )
+
+    # Progress appears below the buttons.
+    progress_slot = st.empty()
+    table_slot = st.empty()
+
+    if update_clicked:
+        if st.session_state.mat_run_state == "stopped":
+            st.session_state.mat_run_state = "idle"
+            st.session_state.mat_update_running = False
+            st.session_state.mat_update_idx = 0
+            st.session_state.mat_update_total = 0
+            st.session_state.mat_update_keys = []
+            set_status("Stop zurueckgesetzt. Mit Update neu starten.", "info")
+        else:
+            _refresh_mat_files()
+            mats = st.session_state.mat_files
+            st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
+            if mats:
+                st.session_state.mat_run_state = "running"
+                set_status(f"Analyse gestartet ({len(mats)} MAT-Dateien).", "info")
+                _update_all_mat_overview_rows(mats, live_table=table_slot, progress_slot=progress_slot)
+                st.session_state.mat_run_state = "done"
+                set_status(f"Analyse fuer {len(mats)} MAT-Dateien abgeschlossen.", "ok")
+            else:
+                st.session_state.mat_run_state = "idle"
+                set_status("Keine MAT-Dateien gefunden.", "warn")
+
+    if load_clicked:
+        selected = st.session_state.mat_selected_key
+        _analyze_mat_from_r2(selected)
+        _load_mat_from_r2(selected)
+        summary = st.session_state.mat_selected_summary or {}
+        capture_folder = summary.get("capture_folder") or _mat_capture_guess_from_key(selected)
+        video_ok = _try_load_video_for_capture_folder(capture_folder)
+        if video_ok:
+            st.session_state.capture_folder = capture_folder
+        else:
+            set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
+        st.rerun()
+
+    if connected and mats and st.session_state.mat_auto_updated_prefix != st.session_state.r2_prefix and not running:
+        st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
+        st.session_state.mat_run_state = "running"
+        _update_all_mat_overview_rows(mats, live_table=table_slot, progress_slot=progress_slot)
+        st.session_state.mat_run_state = "done"
+        set_status(f"Analyse fuer {len(mats)} MAT-Dateien abgeschlossen.", "ok")
+
+    if not connected:
+        st.caption("Erst in Tab 'Verbindung & Root' verbinden und Projektroot wählen.")
+    if st.session_state.mat_overview_rows:
+        df_overview = pd.DataFrame(st.session_state.mat_overview_rows)
+        colorize_cells = st.session_state.mat_run_state in ("stopped", "done")
+        styled_df = _style_overview_dataframe(df_overview) if colorize_cells else df_overview
+        allow_select = (st.session_state.mat_run_state in ("stopped", "done", "idle")) and not st.session_state.mat_update_running
+        if allow_select:
+            try:
+                event = table_slot.dataframe(
+                    styled_df,
+                    width="stretch",
+                    hide_index=True,
+                    height=MAT_TABLE_HEIGHT,
+                    column_config=MAT_OVERVIEW_COLCFG,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                )
+            except Exception:
+                event = table_slot.dataframe(
+                    df_overview,
+                    width="stretch",
+                    hide_index=True,
+                    height=MAT_TABLE_HEIGHT,
+                    column_config=MAT_OVERVIEW_COLCFG,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                )
+        else:
+            table_slot.dataframe(
+                styled_df,
+                width="stretch",
+                hide_index=True,
+                height=MAT_TABLE_HEIGHT,
+                column_config=MAT_OVERVIEW_COLCFG,
+            )
+            event = None
+        if isinstance(event, dict):
+            sel_rows = event.get("selection", {}).get("rows", [])
+        else:
+            sel = getattr(event, "selection", None)
+            sel_rows = getattr(sel, "rows", []) if sel is not None else []
+        if sel_rows:
+            selected_idx = sel_rows[0]
+            if 0 <= selected_idx < len(st.session_state.mat_overview_rows):
+                selected_key = st.session_state.mat_overview_rows[selected_idx].get("remote_key", "")
+                if selected_key and selected_key != st.session_state.mat_selected_key:
+                    st.session_state.mat_selected_key = selected_key
+                    st.session_state.mat_selected_summary = _get_mat_summary_from_r2(selected_key)
+    else:
+        table_slot.empty()
+        st.caption("Noch keine MAT analysiert.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB ðŸŽ¬ â€“ ROI-SETUP
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_roi:
     if not st.session_state.video_path:
         st.markdown("""
         <div style="text-align:center;padding:3rem 2rem;color:#4a5060;">
-          <div style="font-size:2.5rem;margin-bottom:.8rem">🎬</div>
+          <div style="font-size:2.5rem;margin-bottom:.8rem">VIDEO</div>
           <div style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:600">
             Kein Video geladen</div>
           <div style="font-family:'JetBrains Mono',monospace;font-size:.72rem;
                margin-top:.4rem;color:#2e3545">
-            → Tab ☁️  öffnen → Video laden oder von R2 laden</div>
+            -> Tab CLOUD oeffnen -> Video laden oder von R2 laden</div>
         </div>""", unsafe_allow_html=True)
     else:
         dur=st.session_state.vid_duration; fps=st.session_state.vid_fps
@@ -731,14 +1126,14 @@ with tab_roi:
             if frame is not None:
                 st.image(draw_rois(frame,st.session_state.rois,
                                    st.session_state.selected_roi,fw,fh),
-                         use_container_width=True,
-                         caption=f"t={t_cur:.3f}s  |  {fw}×{fh}  |  {fps:.1f}fps")
+                         width="stretch",
+                         caption=f"t={t_cur:.3f}s  |  {fw}x{fh}  |  {fps:.1f}fps")
             else:
-                st.warning("Frame nicht verfügbar.")
+                st.warning("Frame nicht verfuegbar.")
             st.markdown('</div>',unsafe_allow_html=True)
 
             st.markdown('<div class="section-card">',unsafe_allow_html=True)
-            st.markdown('<div class="section-title">ROI hinzufügen</div>',unsafe_allow_html=True)
+            st.markdown('<div class="section-title">ROI hinzufuegen</div>',unsafe_allow_html=True)
             rc=st.columns(4)
             rx=rc[0].number_input("X",0,fw or 9999,0,1,key="rx")
             ry=rc[1].number_input("Y",0,fh or 9999,0,1,key="ry")
@@ -754,13 +1149,17 @@ with tab_roi:
             roi_pat=rn[2].text_input("Pattern","",key="rn_pat",placeholder="Regex")
             roi_sc=rn[3].number_input("max_scale",1.2,step=0.1,key="rn_sc")
             if roi_name=="track_minimap":
-                st.info("ℹ️ Danach in Tab 🗺 Track-Analyse weiterarbeiten.")
-            if st.button("➕ ROI hinzufügen",type="primary",use_container_width=True):
+                st.info("[i] Danach in Tab Track Analysis weiterarbeiten.")
+            if st.button("+ ROI hinzufuegen",type="primary",use_container_width=True):
+                if roi_name == "track_minimap" and any(r["name"] == "track_minimap" for r in st.session_state.rois):
+                    set_status("track_minimap ist nur einmal erlaubt.", "warn")
+                    st.rerun()
+                cx, cy, cw_roi, ch_roi = _clamp_roi_to_video(rx, ry, rw, rh, fw, fh)
                 st.session_state.rois.append(dict(name=roi_name,
-                    x=float(rx),y=float(ry),w=float(rw),h=float(rh),
+                    x=cx,y=cy,w=cw_roi,h=ch_roi,
                     fmt=roi_fmt,pattern=roi_pat,max_scale=roi_sc))
                 st.session_state.selected_roi=len(st.session_state.rois)-1
-                get_frame.clear(); set_status(f"ROI '{roi_name}' hinzugefügt.","ok"); st.rerun()
+                get_frame.clear(); set_status(f"ROI '{roi_name}' hinzugefuegt.","ok"); st.rerun()
             st.markdown('</div>',unsafe_allow_html=True)
 
         with col_r:
@@ -773,7 +1172,7 @@ with tab_roi:
             for i,roi in enumerate(st.session_state.rois):
                 is_track=roi["name"]=="track_minimap"; is_sel=i==st.session_state.selected_roi
                 pos=f'[{int(roi["x"])},{int(roi["y"])},{int(roi["w"])},{int(roi["h"])}]'
-                if st.button(("▶ " if is_sel else "")+roi["name"],
+                if st.button(("> " if is_sel else "")+roi["name"],
                               key=f"rsel_{i}",use_container_width=True):
                     st.session_state.selected_roi=i; st.rerun()
                 tag_cls="roi-tag-track" if is_track else ("roi-tag-sel" if is_sel else "roi-tag")
@@ -804,13 +1203,21 @@ with tab_roi:
                 esc=st.number_input("max_scale",float(roi.get("max_scale",1.2)),
                                      step=0.1,min_value=0.5,key=f"esc_{sel}")
                 ca,cb=st.columns(2)
-                if ca.button("💾",use_container_width=True,key=f"sv_{sel}"):
+                if ca.button("Save",use_container_width=True,key=f"sv_{sel}"):
+                    cx, cy, cw_roi, ch_roi = _clamp_roi_to_video(ex, ey, ew, eh, fw, fh)
+                    if en == "track_minimap" and any(
+                        idx != sel and r["name"] == "track_minimap"
+                        for idx, r in enumerate(st.session_state.rois)
+                    ):
+                        set_status("track_minimap ist nur einmal erlaubt.", "warn")
+                        st.rerun()
                     st.session_state.rois[sel]=dict(name=en,x=float(ex),y=float(ey),
                         w=float(ew),h=float(eh),fmt=ef,pattern=ep,max_scale=esc)
+                    st.session_state.rois[sel].update(dict(x=cx, y=cy, w=cw_roi, h=ch_roi))
                     get_frame.clear(); set_status("ROI gespeichert.","ok"); st.rerun()
-                if cb.button("🗑",use_container_width=True,key=f"dl_{sel}"):
+                if cb.button("Delete",use_container_width=True,key=f"dl_{sel}"):
                     st.session_state.rois.pop(sel); st.session_state.selected_roi=None
-                    get_frame.clear(); set_status("ROI gelöscht.","info"); st.rerun()
+                    get_frame.clear(); set_status("ROI geloescht.","info"); st.rerun()
                 st.markdown('</div>',unsafe_allow_html=True)
 
             st.markdown('<div class="section-card">',unsafe_allow_html=True)
@@ -818,10 +1225,10 @@ with tab_roi:
             cf=st.session_state.capture_folder or "output"
             result=build_result_json()
             result_str=json.dumps(result,indent=2,ensure_ascii=False)
-            st.download_button("⬇ JSON",result_str,f"results_{cf}.json",
+            st.download_button("Download JSON",result_str,f"results_{cf}.json",
                                "application/json",use_container_width=True)
             mat_buf=io.BytesIO(); sio.savemat(mat_buf,build_mat_struct(result))
-            st.download_button("⬇ MAT",mat_buf.getvalue(),f"results_{cf}.mat",
+            st.download_button("Download MAT",mat_buf.getvalue(),f"results_{cf}.mat",
                                "application/octet-stream",use_container_width=True)
             st.markdown('</div>',unsafe_allow_html=True)
 
@@ -831,17 +1238,17 @@ with tab_roi:
             st.markdown(f"""
             <div style="font-family:'JetBrains Mono',monospace;font-size:.67rem;
                  color:#8892a4;line-height:2.0;">
-            <b style="color:#e8eaf0">Video</b> {fw}×{fh} @ {fps:.1f}fps<br>
+            <b style="color:#e8eaf0">Video</b> {fw}x{fh} @ {fps:.1f}fps<br>
             <b style="color:#e8eaf0">Dauer</b> {dur:.2f}s<br>
-            <b style="color:#e8eaf0">Bereich</b> {t_start:.2f}→{st.session_state.t_end:.2f}s<br>
+            <b style="color:#e8eaf0">Bereich</b> {t_start:.2f}->{st.session_state.t_end:.2f}s<br>
             <b style="color:#e8eaf0">ROIs</b> {len(st.session_state.rois)} ({n_t} track)
             </div>""",unsafe_allow_html=True)
             st.markdown('</div>',unsafe_allow_html=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 🗺 – TRACK-ANALYSE
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB ðŸ—º â€“ TRACK-ANALYSE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_track:
     has_ref   = st.session_state.ref_track_img is not None
     track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
@@ -849,9 +1256,9 @@ with tab_track:
     fw=st.session_state.vid_width; fh=st.session_state.vid_height
 
     if not has_ref:
-        st.info("ℹ️  Referenz-Track fehlt → Tab ☁️  → Bild laden.")
+        st.info("[i] Referenz-Track fehlt -> Tab CLOUD -> Bild laden.")
     if not track_roi:
-        st.info("ℹ️  Keine track_minimap ROI → Tab 🎬  → ROI anlegen.")
+        st.info("[i] Keine track_minimap ROI -> Tab ROI Setup -> ROI anlegen.")
 
     col_a,col_b=st.columns(2,gap="medium")
     clrs=[(255,80,80),(255,160,0),(255,255,0),(80,255,80),
@@ -859,7 +1266,7 @@ with tab_track:
 
     with col_a:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Referenz-Track · 8 Kalibrierpunkte</div>',
+        st.markdown('<div class="section-title">Referenz-Track | 8 Kalibrierpunkte</div>',
                     unsafe_allow_html=True)
         if has_ref:
             ref_pts=st.session_state.ref_track_pts or [[0,0]]*8
@@ -876,7 +1283,7 @@ with tab_track:
                 py=c3.number_input(f"RY{pi}",value=int(pt[1]),step=1,
                                     label_visibility="collapsed",key=f"rp_y_{pi}")
                 pt_data.append([px,py])
-            if st.button("💾 Referenzpunkte speichern",use_container_width=True):
+            if st.button("Save Referenzpunkte",use_container_width=True):
                 st.session_state.ref_track_pts=pt_data
                 set_status("Referenzpunkte gespeichert.","ok"); st.rerun()
             vis=st.session_state.ref_track_img.copy()
@@ -885,7 +1292,7 @@ with tab_track:
                     cv2.circle(vis,(int(pt[0]),int(pt[1])),8,clrs[pi%8],-1)
                     cv2.putText(vis,f"P{pi+1}",(int(pt[0])+10,int(pt[1])),
                                 cv2.FONT_HERSHEY_SIMPLEX,.5,clrs[pi%8],1)
-            st.image(vis,use_container_width=True,caption="Referenz-Track")
+            st.image(vis, width="stretch", caption="Referenz-Track")
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
                         'Kein Referenzbild</div>',unsafe_allow_html=True)
@@ -893,7 +1300,7 @@ with tab_track:
 
     with col_b:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Minimap · 8 Punkte + Bewegungserkennung</div>',
+        st.markdown('<div class="section-title">Minimap | 8 Punkte + Bewegungserkennung</div>',
                     unsafe_allow_html=True)
         if has_vid and track_roi:
             frame=get_frame(st.session_state.video_path,st.session_state.t_current)
@@ -916,7 +1323,7 @@ with tab_track:
                                         max_value=max(1,ch),step=1,
                                         label_visibility="collapsed",key=f"mp_y_{pi}")
                     mm_data.append([px,py])
-                if st.button("💾 Minimap-Punkte speichern",use_container_width=True):
+                if st.button("Save Minimap-Punkte",use_container_width=True):
                     st.session_state.minimap_pts=mm_data
                     set_status("Minimap-Punkte gespeichert.","ok"); st.rerun()
                 vis_c=crop.copy()
@@ -925,14 +1332,14 @@ with tab_track:
                         cv2.circle(vis_c,(int(pt[0]),int(pt[1])),6,clrs[pi%8],-1)
                         cv2.putText(vis_c,f"P{pi+1}",(int(pt[0])+7,int(pt[1])),
                                     cv2.FONT_HERSHEY_SIMPLEX,.4,clrs[pi%8],1)
-                st.image(vis_c,use_container_width=True,caption=f"Minimap ({cw}×{ch}px)")
+                st.image(vis_c, width="stretch", caption=f"Minimap ({cw}x{ch}px)")
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
-                        'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
+                        'Video + track_minimap ROI benoetigt</div>',unsafe_allow_html=True)
         st.markdown('</div>',unsafe_allow_html=True)
 
     st.markdown('<div class="section-card">',unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Vergleich · Überlagerung · Bewegende Punkte</div>',
+    st.markdown('<div class="section-title">Vergleich | Ueberlagerung | Bewegende Punkte</div>',
                 unsafe_allow_html=True)
     cv1,cv2_,cv3=st.columns([2,2,1])
     with cv3:
@@ -949,27 +1356,40 @@ with tab_track:
         h_m=(h_lo+h_hi)//2; s_m=(s_lo+s_hi)//2; v_m=(v_lo+v_hi)//2
         px=np.zeros((28,56,3),dtype=np.uint8)
         px[:]=cv2.cvtColor(np.array([[[h_m,s_m,v_m]]],dtype=np.uint8),cv2.COLOR_HSV2RGB)[0,0]
-        st.image(px,caption="Zielfarbe",use_container_width=True)
+        st.image(px, caption="Zielfarbe", width="stretch")
 
     can_cmp=(has_ref and track_roi and has_vid and
-             st.session_state.ref_track_pts and st.session_state.minimap_pts)
+             _has_valid_8_points(st.session_state.ref_track_pts) and
+             _has_valid_8_points(st.session_state.minimap_pts))
     with cv1:
-        if can_cmp and st.button("▶ Vergleich",type="primary",use_container_width=True):
+        if can_cmp and st.button("> Vergleich",type="primary",use_container_width=True):
             frame=get_frame(st.session_state.video_path,st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
                 cmp=compare_minimap_to_reference(crop,st.session_state.ref_track_img,
                     st.session_state.minimap_pts,st.session_state.ref_track_pts)
                 st.session_state.track_comparison=cmp
+                if cmp.get("error"):
+                    set_status(f"Vergleich fehlgeschlagen: {cmp['error']}", "warn")
+                    st.rerun()
                 mp=detect_moving_point(crop,st.session_state.moving_pt_color_range)
                 if mp:
-                    st.session_state.moving_pt_history.append(
-                        {"t":st.session_state.t_current,"x":mp["x"],"y":mp["y"]})
-                set_status("Vergleich durchgeführt.","ok"); st.rerun()
+                    ref_pt = project_point_with_homography((mp["x"], mp["y"]), cmp.get("H"))
+                    st.session_state.moving_pt_history.append({
+                        "t": st.session_state.t_current,
+                        "x_minimap": mp["x"],
+                        "y_minimap": mp["y"],
+                        "x_ref": ref_pt[0] if ref_pt else None,
+                        "y_ref": ref_pt[1] if ref_pt else None,
+                        "confidence": mp.get("confidence", 0.0),
+                    })
+                set_status("Vergleich durchgefuehrt.","ok"); st.rerun()
         cmp=st.session_state.track_comparison
         if cmp:
+            if cmp.get("error"):
+                st.warning(cmp["error"])
             m1,m2,m3=st.columns(3)
-            for col,val,lbl in [(m1,cmp["mean_dist_px"],"Ø px"),
+            for col,val,lbl in [(m1,cmp["mean_dist_px"],"O px"),
                                  (m2,cmp["max_dist_px"],"Max px"),
                                  (m3,cmp["homography_err"],"H-Err")]:
                 col.markdown(f'<div class="metric-box"><div class="metric-val">'
@@ -984,8 +1404,8 @@ with tab_track:
                 overlay=draw_comparison_overlay(crop,st.session_state.ref_track_img,
                     st.session_state.minimap_pts,st.session_state.ref_track_pts,
                     cmp,st.session_state.moving_pt_color_range)
-                st.image(overlay,use_container_width=True,
-                         caption="Minimap (blau) vs. Referenz (grün)")
+                st.image(overlay, width="stretch",
+                         caption="Minimap (blau) vs. Referenz (gruen)")
     st.markdown('</div>',unsafe_allow_html=True)
 
     if st.session_state.moving_pt_history:
@@ -998,5 +1418,6 @@ with tab_track:
         if c1.button("Leeren",key="hist_clear"):
             st.session_state.moving_pt_history=[]; st.rerun()
         df=pd.DataFrame(st.session_state.moving_pt_history[-100:])
-        c2.dataframe(df,use_container_width=True,height=180)
+        c2.dataframe(df, width="stretch", height=180)
         st.markdown('</div>',unsafe_allow_html=True)
+
