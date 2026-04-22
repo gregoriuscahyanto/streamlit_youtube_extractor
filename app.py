@@ -516,7 +516,7 @@ def _step_mat_update_once():
     keys = st.session_state.mat_update_keys
     if idx >= total:
         st.session_state.mat_update_running = False
-        st.session_state.mat_run_state = "done"
+        st.session_state.mat_run_state = "idle"
         return
 
     key = keys[idx]
@@ -526,7 +526,7 @@ def _step_mat_update_once():
 
     if st.session_state.mat_update_idx >= total:
         st.session_state.mat_update_running = False
-        st.session_state.mat_run_state = "done"
+        st.session_state.mat_run_state = "idle"
         set_status(f"Analyse fuer {total} MAT-Dateien abgeschlossen.", "ok")
 
 
@@ -955,21 +955,14 @@ with tab_mat:
     mats = st.session_state.mat_files if connected else []
     running = bool(st.session_state.mat_update_running)
 
-    # Controls are always visible.
-    if st.session_state.mat_run_state == "stopped":
-        update_label = "Reset"
-    else:
-        update_label = "Update"
-
     c1, c2 = st.columns(2)
     update_clicked = c1.button(
-        update_label,
+        "Update",
         use_container_width=True,
         key="mat_update_tab",
         disabled=not connected,
     )
-    can_load_state = st.session_state.mat_run_state in ("stopped", "done")
-    can_load = connected and bool(st.session_state.mat_selected_key) and can_load_state and not running
+    can_load = connected and bool(st.session_state.mat_selected_key) and not running
     load_clicked = c2.button(
         "MAT + Video laden",
         type="primary",
@@ -983,13 +976,10 @@ with tab_mat:
     table_slot = st.empty()
 
     if update_clicked:
-        if st.session_state.mat_run_state == "stopped":
-            st.session_state.mat_run_state = "idle"
+        if running:
             st.session_state.mat_update_running = False
-            st.session_state.mat_update_idx = 0
-            st.session_state.mat_update_total = 0
-            st.session_state.mat_update_keys = []
-            set_status("Stop zurueckgesetzt. Mit Update neu starten.", "info")
+            st.session_state.mat_run_state = "idle"
+            set_status("Analyse abgebrochen.", "warn")
         else:
             _refresh_mat_files()
             mats = st.session_state.mat_files
@@ -998,38 +988,27 @@ with tab_mat:
                 st.session_state.mat_run_state = "running"
                 set_status(f"Analyse gestartet ({len(mats)} MAT-Dateien).", "info")
                 _update_all_mat_overview_rows(mats, live_table=table_slot, progress_slot=progress_slot)
-                st.session_state.mat_run_state = "done"
+                st.session_state.mat_run_state = "idle"
                 set_status(f"Analyse fuer {len(mats)} MAT-Dateien abgeschlossen.", "ok")
             else:
                 st.session_state.mat_run_state = "idle"
                 set_status("Keine MAT-Dateien gefunden.", "warn")
 
-    if load_clicked:
-        selected = st.session_state.mat_selected_key
-        _analyze_mat_from_r2(selected)
-        _load_mat_from_r2(selected)
-        summary = st.session_state.mat_selected_summary or {}
-        capture_folder = summary.get("capture_folder") or _mat_capture_guess_from_key(selected)
-        video_ok = _try_load_video_for_capture_folder(capture_folder)
-        if video_ok:
-            st.session_state.capture_folder = capture_folder
-        else:
-            set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
-
     if connected and mats and st.session_state.mat_auto_updated_prefix != st.session_state.r2_prefix and not running:
         st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
         st.session_state.mat_run_state = "running"
         _update_all_mat_overview_rows(mats, live_table=table_slot, progress_slot=progress_slot)
-        st.session_state.mat_run_state = "done"
+        st.session_state.mat_run_state = "idle"
         set_status(f"Analyse fuer {len(mats)} MAT-Dateien abgeschlossen.", "ok")
 
     if not connected:
         st.caption("Erst in Tab 'Verbindung & Root' verbinden und Projektroot wählen.")
     if st.session_state.mat_overview_rows:
         df_overview = pd.DataFrame(st.session_state.mat_overview_rows)
-        colorize_cells = st.session_state.mat_run_state in ("stopped", "done")
+        is_running_now = bool(st.session_state.mat_update_running)
+        colorize_cells = not is_running_now
         styled_df = _style_overview_dataframe(df_overview) if colorize_cells else df_overview
-        allow_select = (st.session_state.mat_run_state in ("stopped", "done", "idle")) and not st.session_state.mat_update_running
+        allow_select = not is_running_now
         if allow_select:
             try:
                 event = table_slot.dataframe(
@@ -1075,6 +1054,19 @@ with tab_mat:
     else:
         table_slot.empty()
         st.caption("Noch keine MAT analysiert.")
+
+    if load_clicked:
+        selected = st.session_state.mat_selected_key
+        with st.spinner("Lade MAT + Video ..."):
+            _analyze_mat_from_r2(selected)
+            _load_mat_from_r2(selected)
+            summary = st.session_state.mat_selected_summary or {}
+            capture_folder = summary.get("capture_folder") or _mat_capture_guess_from_key(selected)
+            video_ok = _try_load_video_for_capture_folder(capture_folder)
+            if video_ok:
+                st.session_state.capture_folder = capture_folder
+            else:
+                set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
