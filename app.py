@@ -76,6 +76,18 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
   overflow-y: auto;
   overflow-x: hidden;
 }
+.st-key-cloud_access_card,
+.st-key-cloud_root_card,
+.st-key-cloud_access_card [data-testid="stVerticalBlockBorderWrapper"],
+.st-key-cloud_root_card [data-testid="stVerticalBlockBorderWrapper"] {
+  background: #0b1524 !important;
+  border-color: #2b4f77 !important;
+}
+.st-key-local_access_card,
+.st-key-local_access_card [data-testid="stVerticalBlockBorderWrapper"] {
+  background: #132114 !important;
+  border-color: #376a3d !important;
+}
 .section-title { font-family:'JetBrains Mono',monospace; font-size:.68rem;
   letter-spacing:.15em; text-transform:uppercase; color:#4a90a4;
   margin-bottom:.6rem; border-bottom:1px solid #1e2535; padding-bottom:.35rem; }
@@ -167,6 +179,12 @@ def init_state():
         r2_listing_debug=[],
         auto_connect_attempted=False,
         auto_connect_used=False,
+        # Local DB
+        local_base_path=str(Path.cwd()),
+        local_base_path_input=str(Path.cwd()),
+        local_connected=False,
+        local_root="",
+        local_root_options=[],
         mat_files=[],
         mat_scan_prefix=None,
         mat_selected_key="",
@@ -227,6 +245,47 @@ def get_video_info(video_path: str):
 def set_status(msg, kind="info"):
     st.session_state.status_msg  = msg
     st.session_state.status_type = kind
+
+
+def _list_local_root_options(base_path: str) -> list[str]:
+    try:
+        base = Path(base_path).expanduser().resolve()
+    except Exception:
+        return [""]
+    if not base.exists() or not base.is_dir():
+        return [""]
+    opts = [""]
+    try:
+        for p in sorted(base.iterdir(), key=lambda x: x.name.lower()):
+            if p.is_dir():
+                opts.append(p.name)
+    except Exception:
+        pass
+    return opts
+
+
+def _local_effective_root() -> str:
+    base = Path(st.session_state.local_base_path).expanduser()
+    root = st.session_state.local_root.strip("/\\")
+    return str((base / root).resolve() if root else base.resolve())
+
+
+def _pick_local_folder_dialog(initial_dir: str = "") -> tuple[bool, str]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        start_dir = initial_dir or str(Path.cwd())
+        selected = filedialog.askdirectory(initialdir=start_dir)
+        root.destroy()
+        if selected:
+            return True, selected
+        return False, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def _has_valid_8_points(points):
@@ -683,261 +742,161 @@ tab_setup, tab_mat, tab_roi, tab_track = st.tabs(
 # TAB â˜ï¸  â€“ CLOUD & DATEIEN
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_setup:
+    cloud_ok = bool(st.session_state.r2_connected)
+    local_ok = bool(st.session_state.local_connected)
 
-    col_l, col_r = st.columns([1, 2], gap="large")
+    col_cloud, col_local = st.columns(2, gap="large")
 
-    # â”€â”€ Linke Spalte â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    with col_l:
+    with col_cloud:
+        st.markdown('<div class="section-card" style="background:#0b1524;border-color:#234465;">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Cloud DB | Cloudflare R2</div>', unsafe_allow_html=True)
+        # Card 1: Status
+        st.markdown(
+            f"""
+            <div style="background:#0b1524;border:1px solid #2b4f77;border-radius:10px;padding:.8rem 1rem;margin-bottom:.7rem;">
+              <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;">Cloud DB Status</div>
+              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+                <span class="conn-dot {'ok' if cloud_ok else 'off'}" style="width:13px;height:13px;"></span>
+                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if cloud_ok else '#a0a7b4'};">
+                  {'Verbunden' if cloud_ok else 'Nicht verbunden'}
+                </span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        # â”€â”€ Verbindung â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Verbindung | Cloudflare R2</div>',
-                    unsafe_allow_html=True)
+        # Card 2: Credentials + connect
+        with st.container(border=True, key="cloud_access_card"):
+            st.markdown(
+                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Cloud Zugang</div>",
+                unsafe_allow_html=True,
+            )
+            r2_account = st.text_input(
+                "Account ID",
+                key="r2_account_id",
+                help="Cloudflare Dashboard -> R2 -> Account ID",
+            )
+            r2_key = st.text_input(
+                "Access Key ID",
+                key="r2_access_key_id",
+                help="R2 -> Manage API Tokens -> Create API Token",
+            )
+            r2_secret = st.text_input(
+                "Secret Access Key",
+                key="r2_secret_access_key",
+                type="password",
+            )
+            r2_bucket = st.text_input(
+                "Bucket Name",
+                key="r2_bucket",
+                placeholder="mein-bucket",
+            )
 
-        r2_account  = st.text_input("Account ID",
-                                     key="r2_account_id",
-                                     help="Cloudflare Dashboard -> R2 -> Account ID (oben rechts)")
-        r2_key      = st.text_input("Access Key ID",
-                                     key="r2_access_key_id",
-                                     help="R2 -> Manage API Tokens -> Create API Token")
-        r2_secret   = st.text_input("Secret Access Key",
-                                     key="r2_secret_access_key",
-                                     type="password")
-        r2_bucket   = st.text_input("Bucket Name",
-                                     key="r2_bucket",
-                                     placeholder="mein-bucket")
-
-        if st.button("Verbinden", type="primary", use_container_width=True):
-            if r2_account and r2_key and r2_secret and r2_bucket:
-                with st.spinner("Verbinde..."):
-                    _ok, _msg, _client = connect_r2_client(r2_account, r2_key, r2_secret, r2_bucket)
-                if _ok:
-                    st.session_state.r2_connected = True
-                    st.session_state.r2_client    = _client
-                    _opts = list_root_prefixes(_client)
-                    st.session_state.r2_prefix_options = _opts
-                    st.session_state.r2_prefix = ""
-                    st.session_state.fb_path = ""
-                    st.session_state.fb_items = r2_list("")
-                    st.session_state.mat_scan_prefix = None
-                    set_status(f"Verbunden. Projektroot automatisch auf (root) gesetzt. {len(_opts)} Prefixe verfuegbar.", "ok")
+            if st.button("Cloud DB verbinden", type="primary", use_container_width=True, key="r2_connect_btn"):
+                if r2_account and r2_key and r2_secret and r2_bucket:
+                    with st.spinner("Verbinde Cloud DB ..."):
+                        _ok, _msg, _client = connect_r2_client(r2_account, r2_key, r2_secret, r2_bucket)
+                    if _ok:
+                        st.session_state.r2_connected = True
+                        st.session_state.r2_client = _client
+                        st.session_state.r2_prefix_options = list_root_prefixes(_client)
+                        st.session_state.r2_prefix = ""
+                        st.session_state.mat_scan_prefix = None
+                        set_status("Cloud DB verbunden.", "ok")
+                    else:
+                        st.session_state.r2_connected = False
+                        set_status(f"Cloud DB Verbindung fehlgeschlagen: {_msg}", "warn")
+                    st.rerun()
                 else:
-                    st.session_state.r2_connected = False
-                    set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
-                st.rerun()
-            else:
-                set_status("Bitte alle Felder ausfuellen.", "warn"); st.rerun()
+                    set_status("Bitte alle Cloud-DB Felder ausfuellen.", "warn")
+                    st.rerun()
 
-        if st.session_state.r2_connected:
-            st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">' +
-                        '<span class="conn-dot ok"></span>' +
-                        '<span style="font-family:JetBrains Mono,monospace;font-size:.72rem;' +
-                        'color:#3ddc84">Verbunden</span></div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">' +
-                        '<span class="conn-dot off"></span>' +
-                        '<span style="font-family:JetBrains Mono,monospace;font-size:.72rem;' +
-                        'color:#4a5060">Nicht verbunden</span></div>', unsafe_allow_html=True)
-
-        dbg1, dbg2 = st.columns(2)
-        if dbg1.button("Debug Listing", use_container_width=True, key="dbg_listing_btn"):
-            if st.session_state.r2_connected and st.session_state.r2_client is not None:
-                st.session_state.r2_listing_debug = collect_r2_listing_debug(
-                    st.session_state.r2_client,
-                    prefix=st.session_state.r2_prefix,
-                    capture_folder=st.session_state.capture_folder,
-                )
-            else:
-                st.session_state.r2_listing_debug = [{"error": "Nicht verbunden."}]
-        if dbg2.button("Debug leeren", use_container_width=True, key="dbg_listing_clear_btn"):
-            st.session_state.r2_listing_debug = []
-
-        if st.session_state.r2_listing_debug:
-            with st.expander("Debug: Bucket-Listing", expanded=False):
-                st.json(st.session_state.r2_listing_debug)
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # â”€â”€ Bucket-Prefix â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Bucket-Prefix (Projekt-Root)</div>',
-                    unsafe_allow_html=True)
-        st.caption("Optionaler Praefix fuer alle Pfade im Bucket - leer = Bucket-Root.")
-
-        if st.session_state.r2_connected:
-            opts = st.session_state.r2_prefix_options or [""]
-            root_mode = st.radio("Eingabe", ["Aus Liste waehlen", "Manuell eingeben"],
-                                  horizontal=True, label_visibility="collapsed",
-                                  key="root_mode")
-
-            if root_mode == "Aus Liste waehlen":
+        # Card 3: Root + refresh
+        with st.container(border=True, key="cloud_root_card"):
+            st.markdown(
+                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Cloud Root</div>",
+                unsafe_allow_html=True,
+            )
+            if st.session_state.r2_connected:
+                opts = st.session_state.r2_prefix_options or [""]
                 cur = st.session_state.r2_prefix
                 idx = opts.index(cur) if cur in opts else 0
-                chosen = st.selectbox("Prefix", opts, index=idx,
-                                       format_func=lambda x: x or "(Bucket-Root)",
-                                       label_visibility="collapsed", key="root_dd")
+                chosen = st.selectbox(
+                    "Cloud Prefix",
+                    opts,
+                    index=idx,
+                    format_func=lambda x: x or "(Bucket-Root)",
+                    label_visibility="collapsed",
+                    key="root_dd",
+                )
                 if chosen != st.session_state.r2_prefix:
                     st.session_state.r2_prefix = chosen
-                    st.session_state.fb_path   = chosen
-                    st.session_state.fb_items  = r2_list(chosen)
                     st.session_state.mat_scan_prefix = None
-                    set_status(f"Prefix: {chosen or '(root)'}", "ok")
-                if st.button("Liste neu", use_container_width=True, key="refresh_root"):
-                    st.session_state.r2_prefix_options = get_root_prefixes(); st.rerun()
+                    set_status(f"Cloud Root: {chosen or '(root)'}", "ok")
+                if st.button("Cloud Liste aktualisieren", use_container_width=True, key="refresh_root"):
+                    st.session_state.r2_prefix_options = get_root_prefixes()
+                    st.rerun()
             else:
-                manual = st.text_input("Pfad", value=st.session_state.r2_prefix,
-                                        placeholder="mein_projekt",
-                                        label_visibility="collapsed", key="root_manual")
-                if st.button("Uebernehmen", use_container_width=True, key="set_root_manual"):
-                    pfx = manual.strip("/")
-                    st.session_state.r2_prefix = pfx
-                    st.session_state.fb_path   = pfx
-                    st.session_state.fb_items  = r2_list(pfx)
-                    st.session_state.mat_scan_prefix = None
-                    set_status(f"Prefix: {pfx or '(root)'}", "ok"); st.rerun()
-
-            pfx = st.session_state.r2_prefix
-            _p  = (pfx + "/") if pfx else ""
-            st.markdown(f"""
-            <div style="font-family:'JetBrains Mono',monospace;font-size:.64rem;
-                 color:#4a5060;line-height:2.0;margin-top:.6rem;
-                 border-top:1px solid #1e2535;padding-top:.5rem;">
-            <span style="color:#8892a4">Prefix</span>&nbsp;&nbsp;&nbsp;{pfx or "(root)"}<br>
-            <span style="color:#8892a4">captures/</span>&nbsp;{_p}captures/<br>
-            <span style="color:#8892a4">results/</span>&nbsp;&nbsp;{_p}results/
-            </div>""", unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="font-family:JetBrains Mono,monospace;font-size:.72rem;' +
-                        'color:#2e3545;padding:.5rem 0;">Erst verbinden.</div>',
-                        unsafe_allow_html=True)
-
+                st.caption("Erst Cloud DB verbinden.")
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # â”€â”€ Rechte Spalte: Datei-Browser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    with col_r:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Datei-Browser</div>', unsafe_allow_html=True)
+    with col_local:
+        st.markdown('<div class="section-card" style="background:#132114;border-color:#305b34;">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Lokale DB</div>', unsafe_allow_html=True)
+        # Card 1: Status
+        st.markdown(
+            f"""
+            <div style="background:#132114;border:1px solid #376a3d;border-radius:10px;padding:.8rem 1rem;margin-bottom:.7rem;">
+              <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#9fbe9f;text-transform:uppercase;letter-spacing:.08em;">Lokale DB Status</div>
+              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+                <span class="conn-dot {'ok' if local_ok else 'off'}" style="width:13px;height:13px;"></span>
+                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if local_ok else '#a0a7b4'};">
+                  {'Verbunden' if local_ok else 'Nicht verbunden'}
+                </span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        # Card 2: Notice + picker + path
+        with st.container(border=True, key="local_access_card"):
+            st.markdown(
+                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#9fbe9f;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Lokaler Zugriff</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                """
+                <div style="background:#17301a;border:1px solid #2b5a31;border-radius:8px;padding:.55rem .7rem;
+                     font-family:'JetBrains Mono',monospace;font-size:.68rem;color:#b8ddb9;line-height:1.5;margin-bottom:.6rem;">
+                Hinweis: Nur auf localhost nutzbar. Der gewaehlte Ordner muss einen Unterordner <b>captures</b> enthalten.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        if not st.session_state.r2_connected:
-            st.markdown('<div style="text-align:center;color:#2e3545;padding:3rem;' +
-                        'font-family:JetBrains Mono,monospace;font-size:.8rem;">' +
-                        'Erst verbinden und Bucket konfigurieren</div>', unsafe_allow_html=True)
-        else:
-            cur = st.session_state.fb_path or ""
-
-            # Breadcrumb + Buttons
-            nav1, nav2, nav3 = st.columns([4, 1, 1])
-            with nav1:
-                st.markdown(f'<div class="breadcrumb">/{cur}</div>', unsafe_allow_html=True)
-            with nav2:
-                if st.button("Hoch", use_container_width=True, key="fb_up"):
-                    parts = cur.rstrip("/").split("/")
-                    parent = "/".join(parts[:-1])
-                    st.session_state.fb_path  = parent
-                    st.session_state.fb_items = r2_list(parent)
+            if st.button("Ordner waehlen (lokal)", use_container_width=True, key="local_pick_btn"):
+                ok_pick, picked = _pick_local_folder_dialog(st.session_state.local_base_path_input)
+                if ok_pick and picked:
+                    st.session_state.local_base_path_input = picked
+                    lp = Path(picked).expanduser().resolve()
+                    captures_dir = lp / "captures"
+                    if captures_dir.exists() and captures_dir.is_dir():
+                        st.session_state.local_connected = True
+                        st.session_state.local_base_path = str(lp)
+                        st.session_state.local_root = ""
+                        set_status(f"Lokale DB verbunden: {lp}", "ok")
+                    else:
+                        st.session_state.local_connected = False
+                        set_status("Lokale DB nicht verbunden: Unterordner 'captures' fehlt.", "warn")
                     st.rerun()
-            with nav3:
-                if st.button("Neu", use_container_width=True, key="fb_refresh"):
-                    st.session_state.fb_items = r2_list(cur)
-                    st.rerun()
-
-            # Schnellzugriff
-            pfx = st.session_state.r2_prefix or ""
-            qa  = st.columns(3)
-            def _k(*parts):
-                segs = [p.strip("/") for p in [pfx] + list(parts) if p.strip("/")]
-                return "/".join(segs)
-            shortcuts = [
-                ("captures/",  _k("captures")),
-                ("results/",   _k("results")),
-                ("reference/", _k("reference_track_siesmann")),
-            ]
-            for i, (label, path) in enumerate(shortcuts):
-                if path:
-                    if qa[i].button(label, use_container_width=True, key=f"qa_{i}"):
-                        st.session_state.fb_path  = path
-                        st.session_state.fb_items = r2_list(path)
-                        st.rerun()
-
-            st.markdown("<hr>", unsafe_allow_html=True)
-
-            items = st.session_state.fb_items
-            if not items:
-                items = r2_list(cur)
-                st.session_state.fb_items = items
-
-            if not items:
-                st.markdown('<div style="font-family:JetBrains Mono,monospace;' +
-                            'font-size:.72rem;color:#2e3545;padding:1rem;">' +
-                            'Leer oder kein Zugriff.</div>', unsafe_allow_html=True)
-            else:
-                for entry in items:
-                    icon = "[DIR]" if entry["is_dir"] else _file_icon(entry["name"])
-                    c_name, c_btn = st.columns([5, 1])
-                    with c_name:
-                        if st.button(f"{icon}  {entry['name']}",
-                                     key=f"fb_{entry['path']}",
-                                     use_container_width=True):
-                            if entry["is_dir"]:
-                                nav_p = entry["path"].rstrip("/")
-                                st.session_state.fb_path  = nav_p
-                                st.session_state.fb_items = r2_list(nav_p)
-                                st.session_state.fb_selected = None
-                            else:
-                                st.session_state.fb_selected = entry["path"]
-                            st.rerun()
-                    with c_btn:
-                        if not entry["is_dir"]:
-                            ext = Path(entry["name"]).suffix.lower()
-                            if ext in (".mp4",".mov",".avi",".mkv"):
-                                if st.button("Play", key=f"act_{entry['path']}",
-                                             help="Als Video laden", use_container_width=True):
-                                    _load_video_from_r2(entry["path"]); st.rerun()
-                            elif ext == ".json":
-                                if st.button("Laden", key=f"act_{entry['path']}",
-                                             help="Als JSON-Config laden", use_container_width=True):
-                                    _load_json_from_r2(entry["path"]); st.rerun()
-                            elif ext == ".mat":
-                                if st.button("Laden", key=f"act_{entry['path']}",
-                                             help="Als MAT-Config laden", use_container_width=True):
-                                    _load_mat_from_r2(entry["path"]); st.rerun()
-                            elif ext in (".png",".jpg",".jpeg"):
-                                if st.button("Ref", key=f"act_{entry['path']}",
-                                             help="Als Referenz-Track laden", use_container_width=True):
-                                    _load_ref_from_r2(entry["path"]); st.rerun()
-
+                elif picked:
+                    set_status(f"Ordnerdialog nicht verfuegbar: {picked}", "warn")
+            st.markdown(
+                f'<div class="breadcrumb">Lokaler Basispfad: {st.session_state.local_base_path if st.session_state.local_connected else "(noch nicht gesetzt)"}</div>',
+                unsafe_allow_html=True,
+            )
         st.markdown('</div>', unsafe_allow_html=True)
-
-        # Ergebnis hochladen
-        if st.session_state.r2_connected and st.session_state.rois:
-            st.markdown('<div class="section-card">', unsafe_allow_html=True)
-            st.markdown('<div class="section-title">Ergebnis hochladen (JSON + MAT)</div>',
-                        unsafe_allow_html=True)
-            cf   = st.session_state.capture_folder or "output"
-            pfx  = st.session_state.r2_prefix
-            save_name = st.text_input("Dateiname (ohne Endung)",
-                                       value=f"results_{cf}",
-                                       label_visibility="collapsed",
-                                       key="cloud_save")
-            if st.button("Hochladen", type="primary", use_container_width=True, key="cloud_up"):
-                result     = build_result_json()
-                result_str = json.dumps(result, indent=2, ensure_ascii=False)
-                _client    = st.session_state.r2_client
-                _p         = (pfx + "/") if pfx else ""
-                _ok1, _m1  = _client.upload_string(
-                    result_str, f"{_p}results/{save_name}.json")
-                mat_buf = io.BytesIO(); sio.savemat(mat_buf, build_mat_struct(result))
-                _ok2, _m2  = _client.upload_bytes(
-                    mat_buf.getvalue(), f"{_p}results/{save_name}.mat")
-                if _ok1 and _ok2:
-                    set_status(f"Hochgeladen: results/{save_name}.*", "ok")
-                    res_p = f"{_p}results".strip("/")
-                    st.session_state.fb_path  = res_p
-                    st.session_state.fb_items = r2_list(res_p)
-                else:
-                    set_status(f"Upload: JSON={'OK' if _ok1 else _m1}  MAT={'OK' if _ok2 else _m2}", "warn")
-                st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
