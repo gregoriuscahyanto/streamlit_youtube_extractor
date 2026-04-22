@@ -8,18 +8,36 @@ import requests
 from requests.auth import HTTPBasicAuth
 from pathlib import PurePosixPath
 import xml.etree.ElementTree as ET
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 
 class WebDAVClient:
 
     def __init__(self, base_url: str, username: str, password: str):
         # base_url endet immer mit /
-        self.base_url = base_url.rstrip("/") + "/"
+        self.base_url = self._normalize_base_url(base_url, username)
         self.auth     = HTTPBasicAuth(username, password)
         self.session  = requests.Session()
         self.session.auth = self.auth
         self.session.headers.update({"User-Agent": "OCR-Extractor/1.0"})
+
+    def _normalize_base_url(self, base_url: str, username: str) -> str:
+        """
+        Akzeptiert sowohl die generische DAV-URL .../files/ als auch
+        die benutzerspezifische URL .../files/<username>/.
+        """
+        clean = (base_url or "").strip().rstrip("/")
+        if not clean:
+            return ""
+
+        parsed = urlsplit(clean)
+        path = parsed.path.rstrip("/")
+        username_raw = (username or "").strip()
+        username_encoded = quote(username_raw, safe="")
+
+        if path.endswith("/remote.php/dav/files"):
+            clean = clean + "/" + username_encoded
+        return clean.rstrip("/") + "/"
 
     def _build_url(self, remote_path: str) -> str:
         """
