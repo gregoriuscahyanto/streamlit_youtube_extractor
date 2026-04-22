@@ -397,9 +397,22 @@ tab_cloud, tab_roi, tab_track = st.tabs(
 # TAB ☁️  – CLOUD & DATEIEN
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_cloud:
+
+    # Secrets VOR dem Rendern laden (damit Felder befüllt sind)
+    try:
+        sec = st.secrets.get("webdav", {})
+        if sec.get("url")      and not st.session_state.webdav_url:
+            st.session_state.webdav_url  = sec["url"]
+        if sec.get("username") and not st.session_state.webdav_user:
+            st.session_state.webdav_user = sec["username"]
+        if sec.get("password") and not st.session_state.webdav_pass:
+            st.session_state.webdav_pass = sec["password"]
+    except Exception:
+        pass
+
     col_l, col_r = st.columns([1, 2], gap="large")
 
-    # ── Linke Spalte: Verbindung + Ordner-Auswahl ──────────────────────────────
+    # ── Linke Spalte ───────────────────────────────────────────────────────────
     with col_l:
 
         # ── Verbindung ─────────────────────────────────────────────────────────
@@ -407,99 +420,80 @@ with tab_cloud:
         st.markdown('<div class="section-title">Verbindung · bwSyncAndShare / Nextcloud</div>',
                     unsafe_allow_html=True)
 
-        # Secrets einmalig aus Streamlit-Secrets in session_state laden
-        try:
-            sec = st.secrets.get("webdav", {})
-            if sec.get("url")      and not st.session_state.webdav_url:
-                st.session_state.webdav_url  = sec["url"]
-            if sec.get("username") and not st.session_state.webdav_user:
-                st.session_state.webdav_user = sec["username"]
-            if sec.get("password") and not st.session_state.webdav_pass:
-                st.session_state.webdav_pass = sec["password"]
-        except Exception:
-            pass
-
         wdav_url  = st.text_input("WebDAV URL",
                                    value=st.session_state.webdav_url,
-                                   help="z.B. https://bwsyncandshare.kit.edu/remote.php/dav/files/UUID%40.../")
+                                   help="Vollstaendige URL inkl. UUID-Ordner, z.B. .../dav/files/UUID%40bwidm.../")
         wdav_user = st.text_input("Benutzername",
                                    value=st.session_state.webdav_user,
                                    placeholder="UUID@bwidm.scc.kit.edu")
         wdav_pass = st.text_input("App-Passwort",
                                    value=st.session_state.webdav_pass,
                                    type="password",
-                                   help="Nextcloud > Einstellungen > Sicherheit > App-Passwoerter")
+                                   help="Nextcloud: Einstellungen > Sicherheit > App-Passwoerter")
 
         if st.button("🔌 Verbinden", type="primary", use_container_width=True):
             if wdav_url and wdav_user and wdav_pass:
-                with st.spinner("Verbinde …"):
-                    client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
-                    ok, msg = client.test_connection()
-                if ok:
+                with st.spinner("Verbinde ..."):
+                    _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
+                    _ok, _msg = _client.test_connection()
+                if _ok:
                     st.session_state.update(
-                        webdav_connected=True, webdav_client=client,
+                        webdav_connected=True, webdav_client=_client,
                         webdav_url=wdav_url, webdav_user=wdav_user, webdav_pass=wdav_pass)
-                    opts = get_root_folders()
-                    st.session_state.webdav_root_options = opts
-                    # Browser sofort auf Root zeigen
+                    st.session_state.webdav_root_options = get_root_folders()
                     st.session_state.fb_path  = "/"
                     st.session_state.fb_items = webdav_list("/")
-                    set_status("WebDAV verbunden ✓", "ok")
+                    set_status("WebDAV verbunden", "ok")
                 else:
                     st.session_state.webdav_connected = False
-                    set_status(f"Verbindung fehlgeschlagen: {msg}", "warn")
+                    set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
                 st.rerun()
             else:
-                set_status("Bitte alle Felder ausfüllen.", "warn"); st.rerun()
+                set_status("Bitte alle Felder ausfullen.", "warn"); st.rerun()
 
-        # Verbindungsstatus-Anzeige
         if st.session_state.webdav_connected:
-            st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">'
-                        '<span class="conn-dot ok"></span>'
-                        '<span style="font-family:\'JetBrains Mono\',monospace;font-size:.72rem;'
+            st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">' +
+                        '<span class="conn-dot ok"></span>' +
+                        '<span style="font-family:JetBrains Mono,monospace;font-size:.72rem;' +
                         'color:#3ddc84">Verbunden</span></div>', unsafe_allow_html=True)
         else:
-            st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">'
-                        '<span class="conn-dot off"></span>'
-                        '<span style="font-family:\'JetBrains Mono\',monospace;font-size:.72rem;'
+            st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">' +
+                        '<span class="conn-dot off"></span>' +
+                        '<span style="font-family:JetBrains Mono,monospace;font-size:.72rem;' +
                         'color:#4a5060">Nicht verbunden</span></div>', unsafe_allow_html=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Hauptordner wählen ─────────────────────────────────────────────────
+        # ── Hauptordner ────────────────────────────────────────────────────────
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Hauptordner (Projekt-Root)</div>',
                     unsafe_allow_html=True)
-        st.caption("Dieser Ordner enthält captures/, results/, reference_track_siesmann/ usw.")
+        st.caption("Dieser Ordner enthaelt captures/, results/, reference_track_siesmann/ usw.")
 
-        if not st.session_state.webdav_connected:
-            st.markdown('<div style="font-family:\'JetBrains Mono\',monospace;font-size:.72rem;'
-                        'color:#2e3545;padding:.5rem 0;">Erst verbinden.</div>',
-                        unsafe_allow_html=True)
-        else:
+        if st.session_state.webdav_connected:
             opts = st.session_state.webdav_root_options or ["/"]
-            root_mode = st.radio("Eingabe", ["Aus Liste wählen", "Manuell eingeben"],
+            root_mode = st.radio("Eingabe", ["Aus Liste waehlen", "Manuell eingeben"],
                                   horizontal=True, label_visibility="collapsed",
                                   key="root_mode")
 
-            if root_mode == "Aus Liste wählen":
+            if root_mode == "Aus Liste waehlen":
                 cur = st.session_state.webdav_root
                 idx = opts.index(cur) if cur in opts else 0
                 chosen = st.selectbox("Hauptordner", opts, index=idx,
                                        label_visibility="collapsed", key="root_dd")
                 c1, c2 = st.columns(2)
-                if c1.button("✓ Übernehmen", use_container_width=True, key="set_root_dd"):
+                if c1.button("Uebernehmen", use_container_width=True, key="set_root_dd"):
                     st.session_state.webdav_root = chosen
                     st.session_state.fb_path     = chosen
                     st.session_state.fb_items    = webdav_list(chosen)
                     set_status(f"Hauptordner: {chosen}", "ok"); st.rerun()
-                if c2.button("🔄 Liste neu", use_container_width=True, key="refresh_root"):
+                if c2.button("Liste neu", use_container_width=True, key="refresh_root"):
                     st.session_state.webdav_root_options = get_root_folders(); st.rerun()
             else:
                 manual = st.text_input("Pfad", value=st.session_state.webdav_root,
                                         placeholder="/mein_projekt",
                                         label_visibility="collapsed", key="root_manual")
-                if st.button("✓ Übernehmen", use_container_width=True, key="set_root_manual"):
+                if st.button("Uebernehmen", use_container_width=True, key="set_root_manual"):
                     path = (manual.rstrip("/") or "/")
                     st.session_state.webdav_root = path
                     st.session_state.fb_path     = path
@@ -516,47 +510,50 @@ with tab_cloud:
             <span style="color:#8892a4">Root</span>&nbsp;&nbsp;&nbsp;&nbsp;{root or "/"}<br>
             <span style="color:#8892a4">captures/</span>&nbsp;{root}/captures/<br>
             <span style="color:#8892a4">results/</span>&nbsp;&nbsp;{root}/results/<br>
-            <span style="color:#8892a4">Aufnahme</span>&nbsp;&nbsp;
-            <span style="color:#ffa040">{cf or "— (noch nicht gesetzt)"}</span>
+            <span style="color:#ffa040">{cf or "Aufnahme noch nicht gesetzt"}</span>
             </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="font-family:JetBrains Mono,monospace;font-size:.72rem;' +
+                        'color:#2e3545;padding:.5rem 0;">Erst verbinden.</div>',
+                        unsafe_allow_html=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
 
         # ── Aufnahme-Ordner ────────────────────────────────────────────────────
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Aufnahme-Ordner</div>', unsafe_allow_html=True)
-        st.caption("Format: YYYYMMDD_HHMMSS — bestimmt alle Datei-Pfade.")
+        st.caption("Format: YYYYMMDD_HHMMSS aus captures/ — bestimmt alle Datei-Pfade.")
 
-        if st.session_state.webdav_connected:
-            root = st.session_state.webdav_root
+        if st.session_state.webdav_connected and st.session_state.webdav_root:
+            root     = st.session_state.webdav_root
             cap_path = f"{root}/captures".replace("//", "/")
-            ok_cap, cap_items = st.session_state.webdav_client.list_files(cap_path)
-            if ok_cap and isinstance(cap_items, list):
-                # items sind jetzt relative Namen: "20251104_202910/"
+            _ok_cap, _cap_items = st.session_state.webdav_client.list_files(cap_path)
+            cap_folders = []
+            if _ok_cap and isinstance(_cap_items, list):
                 cap_folders = sorted(
-                    [i.rstrip("/") for i in cap_items
-                     if i.endswith("/") and i.rstrip("/")],
+                    [i.rstrip("/") for i in _cap_items if i.endswith("/") and i.rstrip("/")],
                     reverse=True)
-            else:
-                cap_folders = []
 
             if cap_folders:
                 cf_idx = (cap_folders.index(st.session_state.capture_folder)
                           if st.session_state.capture_folder in cap_folders else 0)
-                chosen_cf = st.selectbox("Aus captures/ wählen", cap_folders,
-                                          index=cf_idx, label_visibility="collapsed",
-                                          key="cf_dd")
-                if st.button("✓ Auswählen", use_container_width=True, key="set_cf"):
+                chosen_cf = st.selectbox(
+                    "Aufnahme auswahlen",
+                    cap_folders,
+                    index=cf_idx,
+                    format_func=lambda x: f"📁 {x}",
+                    label_visibility="collapsed",
+                    key="cf_dd")
+                if st.button("Auswahlen", use_container_width=True, key="set_cf"):
                     st.session_state.capture_folder = chosen_cf
-                    # Browser direkt auf diesen Ordner zeigen
-                    nav = f"{root}/captures/{chosen_cf}".replace("//","/")
+                    nav = f"{root}/captures/{chosen_cf}".replace("//", "/")
                     st.session_state.fb_path  = nav
                     st.session_state.fb_items = webdav_list(nav)
                     set_status(f"Aufnahme: {chosen_cf}", "ok"); st.rerun()
             else:
-                st.caption("Keine Unterordner in captures/ gefunden.")
+                st.caption("Keine Unterordner in captures/ — ggf. Hauptordner setzen.")
 
-        cf_manual = st.text_input("Oder manuell",
+        cf_manual = st.text_input("Oder manuell eingeben",
                                    value=st.session_state.capture_folder,
                                    placeholder="20251104_202910",
                                    label_visibility="collapsed", key="cf_manual")
@@ -565,11 +562,11 @@ with tab_cloud:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Lokal hochladen ────────────────────────────────────────────────────
+        # ── Lokal laden ────────────────────────────────────────────────────────
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Lokal laden</div>', unsafe_allow_html=True)
 
-        up_v = st.file_uploader("🎬 Video (MP4/MOV/AVI)",
+        up_v = st.file_uploader("Video (MP4/MOV/AVI)",
                                  type=["mp4","mov","avi","mkv"],
                                  label_visibility="collapsed", key="up_v")
         if up_v and st.session_state.video_name != up_v.name:
@@ -578,21 +575,21 @@ with tab_cloud:
             _apply_video(tmp.name, up_v.name)
             st.rerun()
 
-        up_r = st.file_uploader("🗺 Referenz-Bild (PNG/JPG)",
+        up_r = st.file_uploader("Referenz-Bild (PNG/JPG)",
                                  type=["png","jpg","jpeg"],
                                  label_visibility="collapsed", key="up_r")
         if up_r:
             img = np.array(Image.open(up_r).convert("RGB"))
             st.session_state.ref_track_img = img
-            set_status("Referenz-Track geladen ✓", "ok")
+            set_status("Referenz-Track geladen", "ok")
 
-        up_j = st.file_uploader("📋 Config (JSON)",
+        up_j = st.file_uploader("Config (JSON)",
                                  type=["json"],
                                  label_visibility="collapsed", key="up_j")
         if up_j:
             try:
                 load_json_config(json.load(up_j))
-                set_status("JSON-Config geladen ✓", "ok"); st.rerun()
+                set_status("JSON-Config geladen", "ok"); st.rerun()
             except Exception as e:
                 set_status(f"JSON-Fehler: {e}", "warn")
 
@@ -604,40 +601,37 @@ with tab_cloud:
         st.markdown('<div class="section-title">Datei-Browser</div>', unsafe_allow_html=True)
 
         if not st.session_state.webdav_connected:
-            st.markdown('<div style="text-align:center;color:#2e3545;padding:3rem;'
-                        'font-family:\'JetBrains Mono\',monospace;font-size:.8rem;">'
-                        '← Erst verbinden und Hauptordner setzen</div>',
-                        unsafe_allow_html=True)
+            st.markdown('<div style="text-align:center;color:#2e3545;padding:3rem;' +
+                        'font-family:JetBrains Mono,monospace;font-size:.8rem;">' +
+                        'Erst verbinden und Hauptordner setzen</div>', unsafe_allow_html=True)
         else:
             cur = st.session_state.fb_path or "/"
 
             # Breadcrumb + Buttons
             nav1, nav2, nav3 = st.columns([4, 1, 1])
             with nav1:
-                st.markdown(f'<div class="breadcrumb">📂 {cur}</div>',
-                            unsafe_allow_html=True)
+                st.markdown(f'<div class="breadcrumb">📂 {cur}</div>', unsafe_allow_html=True)
             with nav2:
-                if st.button("↑ Hoch", use_container_width=True, key="fb_up"):
+                if st.button("Hoch", use_container_width=True, key="fb_up"):
                     parts = cur.rstrip("/").split("/")
                     parent = "/".join(parts[:-1]) or "/"
                     st.session_state.fb_path  = parent
                     st.session_state.fb_items = webdav_list(parent)
                     st.rerun()
             with nav3:
-                if st.button("🔄", use_container_width=True, key="fb_refresh",
-                              help="Aktualisieren"):
+                if st.button("Neu", use_container_width=True, key="fb_refresh", help="Aktualisieren"):
                     st.session_state.fb_items = webdav_list(cur)
                     st.rerun()
 
-            # Schnellzugriff-Buttons
-            root = st.session_state.webdav_root
+            # Schnellzugriff
+            root = st.session_state.webdav_root or "/"
             cf   = st.session_state.capture_folder
-            qa = st.columns(4)
+            qa   = st.columns(4)
             shortcuts = [
-                ("captures/", f"{root}/captures".replace("//","/")),
-                ("results/",  f"{root}/results".replace("//","/")),
-                ("reference/",f"{root}/reference_track_siesmann".replace("//","/")),
-                (f"📁 {cf[:10]}" if cf else "—",
+                ("captures/",  f"{root}/captures".replace("//","/")),
+                ("results/",   f"{root}/results".replace("//","/")),
+                ("reference/", f"{root}/reference_track_siesmann".replace("//","/")),
+                (f"{cf[:8]}.." if len(cf) > 8 else (cf or "—"),
                  f"{root}/captures/{cf}".replace("//","/") if cf else None),
             ]
             for i, (label, path) in enumerate(shortcuts):
@@ -649,65 +643,55 @@ with tab_cloud:
 
             st.markdown("<hr>", unsafe_allow_html=True)
 
-            # Einträge laden falls leer
+            # Eintraege laden
             items = st.session_state.fb_items
             if not items:
                 items = webdav_list(cur)
                 st.session_state.fb_items = items
 
             if not items:
-                st.markdown('<div style="font-family:\'JetBrains Mono\',monospace;'
-                            'font-size:.72rem;color:#2e3545;padding:1rem;">'
+                st.markdown('<div style="font-family:JetBrains Mono,monospace;' +
+                            'font-size:.72rem;color:#2e3545;padding:1rem;">' +
                             'Leer oder kein Zugriff.</div>', unsafe_allow_html=True)
             else:
                 for entry in items:
                     icon = "📁" if entry["is_dir"] else _file_icon(entry["name"])
                     c_name, c_btn = st.columns([5, 1])
-
                     with c_name:
-                        btn_lbl = f"{icon}  {entry['name']}"
-                        if st.button(btn_lbl, key=f"fb_{entry['path']}",
+                        if st.button(f"{icon}  {entry['name']}",
+                                     key=f"fb_{entry['path']}",
                                      use_container_width=True):
                             if entry["is_dir"]:
-                                nav_path = entry["path"].rstrip("/")
-                                st.session_state.fb_path  = nav_path
-                                st.session_state.fb_items = webdav_list(nav_path)
+                                nav_p = entry["path"].rstrip("/")
+                                st.session_state.fb_path  = nav_p
+                                st.session_state.fb_items = webdav_list(nav_p)
                                 st.session_state.fb_selected = None
                             else:
                                 st.session_state.fb_selected = entry["path"]
                             st.rerun()
-
                     with c_btn:
                         if not entry["is_dir"]:
                             ext = Path(entry["name"]).suffix.lower()
                             if ext in (".mp4",".mov",".avi",".mkv"):
-                                if st.button("▶", key=f"act_{entry['path']}",
-                                             help="Als Video laden",
-                                             use_container_width=True):
-                                    _load_video_from_webdav(entry["path"])
-                                    st.rerun()
+                                if st.button("Play", key=f"act_{entry['path']}",
+                                             help="Als Video laden", use_container_width=True):
+                                    _load_video_from_webdav(entry["path"]); st.rerun()
                             elif ext == ".json":
-                                if st.button("📥", key=f"act_{entry['path']}",
-                                             help="Als JSON-Config laden",
-                                             use_container_width=True):
-                                    _load_json_from_webdav(entry["path"])
-                                    st.rerun()
+                                if st.button("Laden", key=f"act_{entry['path']}",
+                                             help="Als JSON-Config laden", use_container_width=True):
+                                    _load_json_from_webdav(entry["path"]); st.rerun()
                             elif ext == ".mat":
-                                if st.button("📥", key=f"act_{entry['path']}",
-                                             help="Als MAT-Config laden",
-                                             use_container_width=True):
-                                    _load_mat_from_webdav(entry["path"])
-                                    st.rerun()
+                                if st.button("Laden", key=f"act_{entry['path']}",
+                                             help="Als MAT-Config laden", use_container_width=True):
+                                    _load_mat_from_webdav(entry["path"]); st.rerun()
                             elif ext in (".png",".jpg",".jpeg"):
-                                if st.button("🗺", key=f"act_{entry['path']}",
-                                             help="Als Referenz-Track laden",
-                                             use_container_width=True):
-                                    _load_ref_from_webdav(entry["path"])
-                                    st.rerun()
+                                if st.button("Ref", key=f"act_{entry['path']}",
+                                             help="Als Referenz-Track laden", use_container_width=True):
+                                    _load_ref_from_webdav(entry["path"]); st.rerun()
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Ergebnis hochladen ─────────────────────────────────────────────────
+        # Ergebnis hochladen
         if st.session_state.webdav_connected and st.session_state.rois:
             st.markdown('<div class="section-card">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Ergebnis hochladen (JSON + MAT)</div>',
@@ -718,28 +702,22 @@ with tab_cloud:
                                        value=f"results_{cf}",
                                        label_visibility="collapsed",
                                        key="cloud_save")
-            if st.button("☁ Hochladen", type="primary", use_container_width=True,
-                         key="cloud_up"):
-                result = build_result_json()
+            if st.button("Hochladen", type="primary", use_container_width=True, key="cloud_up"):
+                result     = build_result_json()
                 result_str = json.dumps(result, indent=2, ensure_ascii=False)
-                client = st.session_state.webdav_client
-                ok1, m1 = client.upload_string(
-                    result_str,
-                    f"{root}/results/{save_name}.json".replace("//","/"))
-                mat_buf = io.BytesIO()
-                sio.savemat(mat_buf, build_mat_struct(result))
-                ok2, m2 = client.upload_bytes(
-                    mat_buf.getvalue(),
-                    f"{root}/results/{save_name}.mat".replace("//","/"))
-                if ok1 and ok2:
-                    set_status(f"✓ Hochgeladen: results/{save_name}.*", "ok")
-                    # Browser auf results/ zeigen
-                    res_path = f"{root}/results".replace("//","/")
-                    st.session_state.fb_path  = res_path
-                    st.session_state.fb_items = webdav_list(res_path)
+                _client    = st.session_state.webdav_client
+                _ok1, _m1  = _client.upload_string(
+                    result_str, f"{root}/results/{save_name}.json".replace("//","/"))
+                mat_buf = io.BytesIO(); sio.savemat(mat_buf, build_mat_struct(result))
+                _ok2, _m2  = _client.upload_bytes(
+                    mat_buf.getvalue(), f"{root}/results/{save_name}.mat".replace("//","/"))
+                if _ok1 and _ok2:
+                    set_status(f"Hochgeladen: results/{save_name}.*", "ok")
+                    res_p = f"{root}/results".replace("//","/")
+                    st.session_state.fb_path  = res_p
+                    st.session_state.fb_items = webdav_list(res_p)
                 else:
-                    set_status(f"Upload-Fehler: JSON={'OK' if ok1 else m1}  "
-                               f"MAT={'OK' if ok2 else m2}", "warn")
+                    set_status(f"Upload: JSON={'OK' if _ok1 else _m1}  MAT={'OK' if _ok2 else _m2}", "warn")
                 st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
