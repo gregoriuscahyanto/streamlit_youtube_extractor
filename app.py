@@ -12,6 +12,7 @@ import json
 import tempfile
 import io
 import scipy.io as sio
+import tomllib
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
@@ -115,16 +116,43 @@ FMT_OPTIONS = [
 ]
 
 # ── Session-State ──────────────────────────────────────────────────────────────
-def init_state():
-    # Secrets sofort laden bevor session_state initialisiert wird
-    _sec_url = _sec_user = _sec_pass = ""
+def _load_webdav_secrets() -> tuple[str, str, str]:
+    """
+    Einheitliches Verhalten:
+    1) Bevorzugt st.secrets (Cloud + lokal bei vorhandenem secrets.toml).
+    2) Fallback auf lokale .streamlit/secrets.toml nur wenn st.secrets nicht verfuegbar ist.
+    """
+    sec_url = sec_user = sec_pass = ""
+
+    # Primary: Streamlit-Secrets
     try:
-        _sec = st.secrets.get("webdav", {})
-        _sec_url  = _sec.get("url", "")
-        _sec_user = _sec.get("username", "")
-        _sec_pass = _sec.get("password", "")
+        sec = st.secrets.get("webdav", {})
+        sec_url = sec.get("url", "")
+        sec_user = sec.get("username", "")
+        sec_pass = sec.get("password", "")
+        return sec_url, sec_user, sec_pass
     except Exception:
         pass
+
+    # Fallback: lokale Datei
+    try:
+        secrets_path = Path(".streamlit") / "secrets.toml"
+        if secrets_path.exists():
+            with open(secrets_path, "rb") as f:
+                data = tomllib.load(f)
+            sec = data.get("webdav", {})
+            sec_url = sec.get("url", "")
+            sec_user = sec.get("username", "")
+            sec_pass = sec.get("password", "")
+    except Exception:
+        pass
+
+    return sec_url, sec_user, sec_pass
+
+
+def init_state():
+    # Secrets sofort laden bevor session_state initialisiert wird
+    _sec_url, _sec_user, _sec_pass = _load_webdav_secrets()
 
     defs = dict(
         # WebDAV
