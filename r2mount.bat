@@ -1,1 +1,0 @@
-rclone mount r2:streamlityoutubeextractorstorage X: --vfs-cache-mode full
