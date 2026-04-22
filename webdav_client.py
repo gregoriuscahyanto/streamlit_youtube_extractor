@@ -20,6 +20,7 @@ class WebDAVClient:
         self.session  = requests.Session()
         self.session.auth = self.auth
         self.session.headers.update({"User-Agent": "OCR-Extractor/1.0"})
+        self.last_list_debug = ""
 
     def _normalize_base_url(self, base_url: str, username: str) -> str:
         """
@@ -77,6 +78,35 @@ class WebDAVClient:
             return ""
         return relative
 
+    def _parse_propfind_items(self, response_text: str, requested_url: str) -> list[str]:
+        root_xml = ET.fromstring(response_text)
+        ns = {"d": "DAV:"}
+        responses = root_xml.findall("d:response", ns)
+        items = []
+        seen = set()
+        requested_path = self._normalize_href_path(requested_url)
+
+        for resp in responses:
+            href_el = resp.find("d:href", ns)
+            if href_el is None or not href_el.text:
+                continue
+            raw_href = unquote(href_el.text)
+            name = self._relative_href_name(raw_href, requested_path)
+            if not name:
+                continue
+            is_dir = (
+                resp.find(".//d:resourcetype/d:collection", ns) is not None
+                or raw_href.rstrip().endswith("/")
+            )
+            item_name = name + "/" if is_dir else name
+            if item_name in seen:
+                continue
+            seen.add(item_name)
+            items.append(item_name)
+
+        items.sort(key=lambda x: (not x.endswith("/"), x.lower()))
+        return items
+
     # ── Verbindungstest ────────────────────────────────────────────────────────
 
     def test_connection(self) -> tuple[bool, str]:
@@ -112,50 +142,39 @@ class WebDAVClient:
         """
         try:
             url = self._build_url(remote_dir)
-            r = self.session.request(
-                "PROPFIND", url,
-                headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
-                data="""<?xml version="1.0" encoding="utf-8"?>
+            body = """<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop><d:resourcetype/><d:displayname/></d:prop>
-</d:propfind>""",
-                timeout=20)
+</d:propfind>"""
+            urls_to_try = [url]
+            if remote_dir.strip("/") == "" and url.endswith("/"):
+                urls_to_try.append(url.rstrip("/"))
 
-            if r.status_code not in (207, 200):
-                return False, f"HTTP {r.status_code}"
+            last_error = "Keine Antwort."
+            for candidate_url in urls_to_try:
+                r = self.session.request(
+                    "PROPFIND", candidate_url,
+                    headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+                    data=body,
+                    timeout=20)
 
-            root_xml  = ET.fromstring(r.text)
-            ns        = {"d": "DAV:"}
-            responses = root_xml.findall("d:response", ns)
-            items     = []
-            requested_path = self._normalize_href_path(url)
-            seen = set()
-
-            for resp in responses:
-                href_el = resp.find("d:href", ns)
-                if href_el is None or not href_el.text:
+                if r.status_code not in (207, 200):
+                    last_error = f"HTTP {r.status_code} @ {candidate_url}"
                     continue
-                raw_href = unquote(href_el.text)
-                name = self._relative_href_name(raw_href, requested_path)
-                if not name:
-                    continue
-                is_dir = (
-                    resp.find(".//d:resourcetype/d:collection", ns) is not None
-                    or raw_href.rstrip().endswith("/")
-                )
-                item_name = name + "/" if is_dir else name
-                if item_name in seen:
-                    continue
-                seen.add(item_name)
-                items.append(item_name)
 
-            # Ordner zuerst, dann Dateien, alphabetisch
-            items.sort(key=lambda x: (not x.endswith("/"), x.lower()))
-            return True, items
+                items = self._parse_propfind_items(r.text, candidate_url)
+                self.last_list_debug = f"url={candidate_url} items={items!r}"
+                if items or len(urls_to_try) == 1 or candidate_url == urls_to_try[-1]:
+                    return True, items
+
+            self.last_list_debug = last_error
+            return False, last_error
 
         except ET.ParseError as e:
+            self.last_list_debug = f"XML-Fehler: {e}"
             return False, f"XML-Fehler: {e}"
         except Exception as e:
+            self.last_list_debug = str(e)
             return False, str(e)
 
     # ── Download ───────────────────────────────────────────────────────────────

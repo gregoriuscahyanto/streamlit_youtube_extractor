@@ -468,7 +468,14 @@ with tab_cloud:
                     else:
                         st.session_state.fb_path  = "/"
                         st.session_state.fb_items = webdav_list("/")
-                        set_status(f"Verbunden. {len(_real)} Ordner gefunden.", "ok")
+                        if _real:
+                            set_status(f"Verbunden. {len(_real)} Ordner gefunden.", "ok")
+                        else:
+                            dbg = getattr(_client, "last_list_debug", "")
+                            set_status(
+                                f"Verbunden. 0 ordner gefunden. Basis: {_client.base_url} | Root-Debug: {dbg}",
+                                "warn",
+                            )
                 else:
                     st.session_state.webdav_connected = False
                     set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
