@@ -8,37 +8,18 @@ import requests
 from requests.auth import HTTPBasicAuth
 from pathlib import PurePosixPath
 import xml.etree.ElementTree as ET
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import unquote
 
 
 class WebDAVClient:
 
     def __init__(self, base_url: str, username: str, password: str):
         # base_url endet immer mit /
-        self.base_url = self._normalize_base_url(base_url, username)
+        self.base_url = base_url.rstrip("/") + "/"
         self.auth     = HTTPBasicAuth(username, password)
         self.session  = requests.Session()
         self.session.auth = self.auth
         self.session.headers.update({"User-Agent": "OCR-Extractor/1.0"})
-        self.last_list_debug = ""
-
-    def _normalize_base_url(self, base_url: str, username: str) -> str:
-        """
-        Akzeptiert sowohl die generische DAV-URL .../files/ als auch
-        die benutzerspezifische URL .../files/<username>/.
-        """
-        clean = (base_url or "").strip().rstrip("/")
-        if not clean:
-            return ""
-
-        parsed = urlsplit(clean)
-        path = parsed.path.rstrip("/")
-        username_raw = (username or "").strip()
-        username_encoded = quote(username_raw, safe="")
-
-        if path.endswith("/remote.php/dav/files"):
-            clean = clean + "/" + username_encoded
-        return clean.rstrip("/") + "/"
 
     def _build_url(self, remote_path: str) -> str:
         """
@@ -54,68 +35,6 @@ class WebDAVClient:
         last = clean.split("/")[-1]
         is_file = "." in last and not last.startswith(".")
         return self.base_url + clean + ("" if is_file else "/")
-
-    def _normalize_href_path(self, href: str) -> str:
-        """Normalisiert HREF/URL auf einen vergleichbaren Pfad ohne abschliessenden Slash."""
-        parsed = urlsplit(href)
-        path = unquote(parsed.path or href).strip()
-        if not path:
-            return "/"
-        return path.rstrip("/") or "/"
-
-    def _relative_href_name(self, href: str, requested_path: str) -> str:
-        """Extrahiert den direkten Kindnamen relativ zum angefragten Verzeichnis."""
-        href_path = self._normalize_href_path(href)
-        if href_path == requested_path:
-            return ""
-
-        prefix = requested_path.rstrip("/") + "/"
-        if not href_path.startswith(prefix):
-            return ""
-
-        relative = href_path[len(prefix):].strip("/")
-        if not relative or "/" in relative:
-            return ""
-        return relative
-
-    def _parse_propfind_items(self, response_text: str, requested_url: str) -> list[str]:
-        root_xml = ET.fromstring(response_text)
-        ns = {"d": "DAV:"}
-        responses = root_xml.findall("d:response", ns)
-        items = []
-        seen = set()
-        requested_path = self._normalize_href_path(requested_url)
-
-        for resp in responses:
-            href_el = resp.find("d:href", ns)
-            if href_el is None or not href_el.text:
-                continue
-            raw_href = unquote(href_el.text)
-            name = self._relative_href_name(raw_href, requested_path)
-            if not name:
-                continue
-            is_dir = (
-                resp.find(".//d:resourcetype/d:collection", ns) is not None
-                or raw_href.rstrip().endswith("/")
-            )
-            item_name = name + "/" if is_dir else name
-            if item_name in seen:
-                continue
-            seen.add(item_name)
-            items.append(item_name)
-
-        items.sort(key=lambda x: (not x.endswith("/"), x.lower()))
-        return items
-
-    def _extract_response_hrefs(self, response_text: str) -> list[str]:
-        ns = {"d": "DAV:"}
-        root_xml = ET.fromstring(response_text)
-        hrefs = []
-        for resp in root_xml.findall("d:response", ns):
-            href_el = resp.find("d:href", ns)
-            if href_el is not None and href_el.text:
-                hrefs.append(unquote(href_el.text))
-        return hrefs
 
     # ── Verbindungstest ────────────────────────────────────────────────────────
 
@@ -152,74 +71,42 @@ class WebDAVClient:
         """
         try:
             url = self._build_url(remote_dir)
-            # Server-kompatibel: identisch zur funktionierenden curl-Abfrage
-            body = (
-                '<?xml version="1.0"?>'
-                '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
-            )
-            urls_to_try = []
-            for candidate in [url, url.rstrip("/"), unquote(url), unquote(url).rstrip("/")]:
-                if candidate and candidate not in urls_to_try:
-                    urls_to_try.append(candidate)
+            r = self.session.request(
+                "PROPFIND", url,
+                headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+                data="""<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:resourcetype/><d:displayname/></d:prop>
+</d:propfind>""",
+                timeout=20)
 
-            header_variants = [
-                {
-                    "Depth": "1",
-                    "Content-Type": "application/xml",
-                    "Accept": "application/xml",
-                },
-                {
-                    "Depth": "1",
-                    "Content-Type": "application/xml; charset=utf-8",
-                },
-            ]
+            if r.status_code not in (207, 200):
+                return False, f"HTTP {r.status_code}"
 
-            attempt_logs = []
-            first_success_items = None
-            first_success_log = ""
-            last_error = "Keine Antwort."
+            root_xml  = ET.fromstring(r.text)
+            ns        = {"d": "DAV:"}
+            responses = root_xml.findall("d:response", ns)
+            items     = []
 
-            for candidate_url in urls_to_try:
-                for headers in header_variants:
-                    r = self.session.request(
-                        "PROPFIND",
-                        candidate_url,
-                        headers=headers,
-                        data=body,
-                        timeout=20,
-                    )
-                    attempt_logs.append(f"{r.status_code} {candidate_url}")
+            # Ersten Eintrag ueberspringen = das Verzeichnis selbst
+            for resp in responses[1:]:
+                href_el = resp.find("d:href", ns)
+                if href_el is None or not href_el.text:
+                    continue
+                href   = unquote(href_el.text)          # %40 -> @, %20 -> Leerzeichen
+                name   = href.rstrip("/").split("/")[-1]
+                if not name:
+                    continue
+                is_dir = resp.find(".//d:resourcetype/d:collection", ns) is not None
+                items.append(name + "/" if is_dir else name)
 
-                    if r.status_code not in (207, 200):
-                        last_error = f"HTTP {r.status_code} @ {candidate_url}"
-                        continue
-
-                    items = self._parse_propfind_items(r.text, candidate_url)
-                    hrefs = self._extract_response_hrefs(r.text)
-                    log_line = f"{r.status_code} {candidate_url} items={items!r} hrefs={hrefs!r}"
-
-                    # Sofort zurueck bei echtem Treffer
-                    if items:
-                        self.last_list_debug = log_line
-                        return True, items
-
-                    # Leere, aber erfolgreiche Antwort als Fallback merken
-                    if first_success_items is None:
-                        first_success_items = items
-                        first_success_log = log_line
-
-            if first_success_items is not None:
-                self.last_list_debug = first_success_log
-                return True, first_success_items
-
-            self.last_list_debug = f"{last_error}; attempts={attempt_logs!r}"
-            return False, last_error
+            # Ordner zuerst, dann Dateien, alphabetisch
+            items.sort(key=lambda x: (not x.endswith("/"), x.lower()))
+            return True, items
 
         except ET.ParseError as e:
-            self.last_list_debug = f"XML-Fehler: {e}"
             return False, f"XML-Fehler: {e}"
         except Exception as e:
-            self.last_list_debug = str(e)
             return False, str(e)
 
     # ── Download ───────────────────────────────────────────────────────────────

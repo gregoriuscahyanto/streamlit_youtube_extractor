@@ -182,76 +182,6 @@ def set_status(msg, kind="info"):
     st.session_state.status_msg  = msg
     st.session_state.status_type = kind
 
-def _normalize_webdav_path(path: str | None) -> str:
-    clean = (path or "").strip().strip("/")
-    return "/" + clean if clean else "/"
-
-def _join_webdav_path(*parts: str) -> str:
-    clean_parts = [part.strip("/") for part in parts if part and part.strip("/")]
-    return "/" + "/".join(clean_parts) if clean_parts else "/"
-
-def _root_probe_candidates() -> list[str]:
-    """
-    Kandidaten fuer Hauptordner, falls Root-Listing (/) serverseitig gesperrt ist.
-    Kann optional ueber st.secrets.webdav.root_candidates erweitert werden.
-    """
-    default = ["streamlit_youtube_extractor_storage"]
-    try:
-        cfg = st.secrets.get("webdav", {}).get("root_candidates", [])
-    except Exception:
-        cfg = []
-
-    if isinstance(cfg, str):
-        cfg = [p.strip() for p in cfg.split(",") if p.strip()]
-    if not isinstance(cfg, list):
-        cfg = []
-
-    out = []
-    for name in default + [str(x).strip() for x in cfg if str(x).strip()]:
-        clean = name.strip("/").strip()
-        if clean and clean not in out:
-            out.append(clean)
-    return out
-
-def _build_root_folder_options(client: WebDAVClient | None = None) -> list[str]:
-    """Ermittelt moegliche Hauptordner bis 2 Ebenen tief, inkl. Root '/'."""
-    if client is None:
-        if not st.session_state.webdav_connected:
-            return ["/"]
-        client = st.session_state.webdav_client
-
-    folders = ["/"]
-    ok, items = client.list_files("")
-    if ok and isinstance(items, list):
-        level_one = []
-        for item in items:
-            if item.endswith("/"):
-                folder = _join_webdav_path(item)
-                if folder not in folders:
-                    folders.append(folder)
-                    level_one.append(folder)
-
-        for folder in level_one:
-            ok2, sub = client.list_files(folder.strip("/"))
-            if not ok2 or not isinstance(sub, list):
-                continue
-            for item in sub:
-                if item.endswith("/"):
-                    subfolder = _join_webdav_path(folder, item)
-                    if subfolder not in folders:
-                        folders.append(subfolder)
-
-    # Fallback: Root kann 403 liefern, direkter Unterordnerzugriff aber funktionieren.
-    if len(folders) == 1:
-        for cand in _root_probe_candidates():
-            ok_c, _items_c = client.list_files(cand)
-            if ok_c:
-                p = _join_webdav_path(cand)
-                if p not in folders:
-                    folders.append(p)
-
-    return sorted(folders, key=lambda value: (value != "/", value.lower()))
-
 def _file_icon(name):
     ext = Path(name).suffix.lower()
     return {".mp4":"🎬",".mov":"🎬",".avi":"🎬",".mkv":"🎬",
@@ -345,7 +275,6 @@ def webdav_list(path):
     """
     if not st.session_state.webdav_connected: return []
     client = st.session_state.webdav_client
-    path = _normalize_webdav_path(path)
     # Fuer list_files: "/" und "" sind beide = Root
     list_path = path.strip("/")   # "" fuer Root, "captures" fuer Unterordner
     ok, items = client.list_files(list_path)
@@ -356,14 +285,36 @@ def webdav_list(path):
         is_dir = item.endswith("/")
         name   = item.rstrip("/")
         if not name: continue
-        full_path = _join_webdav_path(base, name)
+        full_path = (base + "/" + name) if base else ("/" + name)
         result.append({"name": name, "path": full_path, "is_dir": is_dir})
     result.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
     return result
 
 def get_root_folders():
     """Listet Ordner fuer Hauptordner-Dropdown, 2 Ebenen tief."""
-    return _build_root_folder_options()
+    if not st.session_state.webdav_connected: return ["/"]
+    client = st.session_state.webdav_client
+    # "" = Benutzer-Root (base_url)
+    ok, items = client.list_files("")
+    folders = ["/"]
+    if ok and isinstance(items, list):
+        for item in items:
+            if item.endswith("/"):
+                name = item.rstrip("/")
+                if name:
+                    folders.append("/" + name)
+    # Ebene 2
+    for folder in list(folders[1:]):
+        ok2, sub = client.list_files(folder)
+        if ok2 and isinstance(sub, list):
+            for s in sub:
+                if s.endswith("/"):
+                    sname = s.rstrip("/")
+                    if sname:
+                        full = folder.rstrip("/") + "/" + sname
+                        if full not in folders:
+                            folders.append(full)
+    return sorted(folders)
 
 
 def _load_video_from_webdav(remote_path):
@@ -481,16 +432,36 @@ with tab_cloud:
             if wdav_url and wdav_user and wdav_pass:
                 with st.spinner("Verbinde ..."):
                     _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
-                    _ok_conn, _msg_conn = _client.test_connection()
-                    _ok_root, _root_items = _client.list_files("")
-                    _opts = _build_root_folder_options(_client)
-                    _real = [o for o in _opts if o != "/"]
-
-                if _ok_conn and (_ok_root or bool(_real)):
+                    _ok, _msg = _client.test_connection()
+                if _ok:
                     # ERST client und connected setzen, DANN Ordner laden
                     st.session_state.webdav_connected = True
                     st.session_state.webdav_client    = _client
+                    # Ordner direkt mit dem neuen Client laden (nicht ueber get_root_folders
+                    # weil session_state update noch nicht geschrieben ist)
+                    _ok_r, _items_r = _client.list_files("")
+                    _opts = ["/"]
+                    if _ok_r and isinstance(_items_r, list):
+                        for _item in _items_r:
+                            if _item.endswith("/"):
+                                _n = _item.rstrip("/")
+                                if _n:
+                                    _opts.append("/" + _n)
+                        # Ebene 2
+                        for _folder in list(_opts[1:]):
+                            _ok2, _sub = _client.list_files(_folder)
+                            if _ok2 and isinstance(_sub, list):
+                                for _s in _sub:
+                                    if _s.endswith("/"):
+                                        _sn = _s.rstrip("/")
+                                        if _sn:
+                                            _full = _folder.rstrip("/") + "/" + _sn
+                                            if _full not in _opts:
+                                                _opts.append(_full)
+                    _opts = sorted(_opts)
                     st.session_state.webdav_root_options = _opts
+                    # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
+                    _real = [o for o in _opts if o != "/"]
                     if len(_real) == 1:
                         st.session_state.webdav_root = _real[0]
                         st.session_state.fb_path  = _real[0]
@@ -498,23 +469,11 @@ with tab_cloud:
                         set_status(f"Verbunden. Hauptordner automatisch gesetzt: {_real[0]}", "ok")
                     else:
                         st.session_state.fb_path  = "/"
-                        st.session_state.fb_items = webdav_list("/")
-                        set_status(f"Verbunden. {len(_real)} Ordner gefunden.", "ok")
+                        st.session_state.fb_items = webdav_list("")
+                        set_status(f"Verbunden. {len(_opts)} Ordner gefunden.", "ok")
                 else:
                     st.session_state.webdav_connected = False
-                    st.session_state.webdav_client = None
-                    st.session_state.webdav_root_options = []
-                    dbg = getattr(_client, "last_list_debug", "")
-                    if not _ok_root and not _real:
-                        set_status(
-                            "Verbindung fehlgeschlagen (Root-Zugriff).\n"
-                            f"Basis: {_client.base_url}\n"
-                            f"Root-Debug: {dbg}\n"
-                            "Pruefe Benutzername + App-Passwort in Streamlit/Secrets.",
-                            "warn",
-                        )
-                    else:
-                        set_status(f"Verbindung fehlgeschlagen: {_msg_conn}", "warn")
+                    set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
                 st.rerun()
             else:
                 set_status("Bitte alle Felder ausfullen.", "warn"); st.rerun()
@@ -546,8 +505,8 @@ with tab_cloud:
             if root_mode == "Aus Liste waehlen":
                 cur = st.session_state.webdav_root
                 idx = opts.index(cur) if cur in opts else 0
-                # key enthaelt die Optionen selbst -> Dropdown wird bei Listenwechsel sauber neu aufgebaut
-                _dd_key = "root_dd_" + "|".join(opts)
+                # key enthaelt Anzahl Optionen -> zwingt Neurender wenn Liste sich aendert
+                _dd_key = f"root_dd_{len(opts)}"
                 chosen = st.selectbox("Hauptordner", opts, index=idx,
                                        label_visibility="collapsed", key=_dd_key)
                 c1, c2 = st.columns(2)
@@ -563,7 +522,7 @@ with tab_cloud:
                                         placeholder="/mein_projekt",
                                         label_visibility="collapsed", key="root_manual")
                 if st.button("Uebernehmen", use_container_width=True, key="set_root_manual"):
-                    path = _normalize_webdav_path(manual)
+                    path = (manual.rstrip("/") or "/")
                     st.session_state.webdav_root = path
                     st.session_state.fb_path     = path
                     st.session_state.fb_items    = webdav_list(path)
