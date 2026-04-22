@@ -1,6 +1,6 @@
 ---
 title: streamlit_youtube_extractor
-emoji: "ðŸŽ¬"
+emoji: "🚀"
 colorFrom: blue
 colorTo: indigo
 sdk: streamlit
@@ -9,29 +9,28 @@ python_version: "3.11"
 app_file: app.py
 pinned: false
 ---
-
-# OCR Extractor v2 Ã¢â‚¬â€ ROI + Track-Analyse
+# OCR Extractor v2 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ROI + Track-Analyse
 
 Streamlit-App zur interaktiven ROI-Auswahl und Track-Minimap-Analyse.  
-Ergebnisse werden als **JSON und MAT** parallel gespeichert Ã¢â‚¬â€ lokal und auf **bwSyncAndShare/Nextcloud** via WebDAV.
+Ergebnisse werden als **JSON und MAT** parallel gespeichert ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â lokal und auf **bwSyncAndShare/Nextcloud** via WebDAV.
 
 ---
 
 ## Features
 
-### Tab 1 Ã¢â‚¬â€œ ROI Setup
+### Tab 1 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ ROI Setup
 - Video laden: lokal oder von WebDAV (`captures/<folder>/<folder>.mp4`)
 - Start/Ende und Frame-Position scrubben
-- ROIs definieren, bearbeiten, lÃƒÂ¶schen (alle MATLAB-ROI-Namen inkl. `track_minimap`)
-- **Speichern als JSON + MAT** (gleichzeitig) Ã¢â€ â€™ `results/results_<folder>.{json,mat}`
+- ROIs definieren, bearbeiten, lÃƒÆ’Ã‚Â¶schen (alle MATLAB-ROI-Namen inkl. `track_minimap`)
+- **Speichern als JSON + MAT** (gleichzeitig) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ `results/results_<folder>.{json,mat}`
 - Vorherige Konfiguration laden: JSON lokal, JSON von WebDAV, MAT von WebDAV
 
-### Tab 2 Ã¢â‚¬â€œ Track-Analyse
+### Tab 2 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ Track-Analyse
 - **Referenz-Track** laden (Bild lokal oder von `reference_track_siesmann/`)
 - **8-Punkte-Kalibrierung**: je 8 Punkte auf Minimap + Referenzkarte definieren
-- **Homographie-Berechnung** (RANSAC): Minimap Ã¢â€ â€™ Referenzkarte
-- **ÃƒÅ“berlagerungsvisualisierung**: transformierte Minimap auf Referenzkarte
-- **RÃƒÂ¼ckprojektionsfehler** fÃƒÂ¼r alle 8 Punkte (Abstand in Pixel)
+- **Homographie-Berechnung** (RANSAC): Minimap ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Referenzkarte
+- **ÃƒÆ’Ã…â€œberlagerungsvisualisierung**: transformierte Minimap auf Referenzkarte
+- **RÃƒÆ’Ã‚Â¼ckprojektionsfehler** fÃƒÆ’Ã‚Â¼r alle 8 Punkte (Abstand in Pixel)
 - **Bewegenden Punkt** erkennen (HSV-Farberkennung, frei konfigurierbar)
 - Verlaufstabelle der erkannten Positionen (t, x, y)
 
@@ -41,19 +40,19 @@ Ergebnisse werden als **JSON und MAT** parallel gespeichert Ã¢â‚¬â€ l
 
 ```
 <root>/
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ captures/
-Ã¢â€â€š   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ 20251104_202910/
-Ã¢â€â€š   Ã¢â€â€š   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ 20251104_202910.mp4
-Ã¢â€â€š   Ã¢â€â€š   Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ 20251104_202910.wav
-Ã¢â€â€š   Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ 20251201_143022/
-Ã¢â€â€š       Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ 20251201_143022.mp4
-Ã¢â€â€š       Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ 20251201_143022.wav
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ results/
-Ã¢â€â€š   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ results_20251104_202910.mat   Ã¢â€ Â MATLAB-kompatibel
-Ã¢â€â€š   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ results_20251104_202910.json  Ã¢â€ Â fÃƒÂ¼r Streamlit / zukÃƒÂ¼nftige Python-Pipeline
-Ã¢â€â€š   Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ ...
-Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ reference_track_siesmann/
-    Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ track.png                     Ã¢â€ Â Referenzkarte
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ captures/
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 20251104_202910/
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 20251104_202910.mp4
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 20251104_202910.wav
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 20251201_143022/
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡       ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 20251201_143022.mp4
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡       ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ 20251201_143022.wav
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ results/
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ results_20251104_202910.mat   ÃƒÂ¢Ã¢â‚¬Â Ã‚Â MATLAB-kompatibel
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ results_20251104_202910.json  ÃƒÂ¢Ã¢â‚¬Â Ã‚Â fÃƒÆ’Ã‚Â¼r Streamlit / zukÃƒÆ’Ã‚Â¼nftige Python-Pipeline
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ ...
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ reference_track_siesmann/
+    ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ track.png                     ÃƒÂ¢Ã¢â‚¬Â Ã‚Â Referenzkarte
 ```
 
 Die App legt diese Struktur automatisch an (MKCOL), wenn sie noch nicht existiert.
@@ -72,7 +71,7 @@ streamlit run app.py
 ## Deployment auf Streamlit Community Cloud
 
 1. GitHub-Repo (public oder private)
-2. https://share.streamlit.io Ã¢â€ â€™ New App Ã¢â€ â€™ `app.py`
+2. https://share.streamlit.io ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ New App ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ `app.py`
 3. Optional: Secrets hinterlegen:
 
 ```toml
@@ -130,13 +129,13 @@ rr.metadata.video             % Videoname
 
 ```
 ocr_extractor_v2/
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ app.py              Ã¢â€ Â Haupt-App (Tab1: ROI, Tab2: Track)
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ track_analysis.py   Ã¢â€ Â Homographie, Farberkennung, Overlay
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ webdav_client.py    Ã¢â€ Â WebDAV via requests
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ storage.py          Ã¢â€ Â Ordnerstruktur-Logik
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ requirements.txt
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ .streamlit/config.toml
-Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ .gitignore
-Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ README.md
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ app.py              ÃƒÂ¢Ã¢â‚¬Â Ã‚Â Haupt-App (Tab1: ROI, Tab2: Track)
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ track_analysis.py   ÃƒÂ¢Ã¢â‚¬Â Ã‚Â Homographie, Farberkennung, Overlay
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ webdav_client.py    ÃƒÂ¢Ã¢â‚¬Â Ã‚Â WebDAV via requests
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ storage.py          ÃƒÂ¢Ã¢â‚¬Â Ã‚Â Ordnerstruktur-Logik
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ requirements.txt
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ .streamlit/config.toml
+ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ .gitignore
+ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ README.md
 ```
 
