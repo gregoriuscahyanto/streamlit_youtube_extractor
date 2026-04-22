@@ -434,10 +434,31 @@ with tab_cloud:
                     _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
                     _ok, _msg = _client.test_connection()
                 if _ok:
+                    # ERST client und connected setzen, DANN Ordner laden
                     st.session_state.webdav_connected = True
                     st.session_state.webdav_client    = _client
-                    # Ordner laden
-                    _opts = get_root_folders()
+                    # Ordner direkt mit dem neuen Client laden (nicht ueber get_root_folders
+                    # weil session_state update noch nicht geschrieben ist)
+                    _ok_r, _items_r = _client.list_files("")
+                    _opts = ["/"]
+                    if _ok_r and isinstance(_items_r, list):
+                        for _item in _items_r:
+                            if _item.endswith("/"):
+                                _n = _item.rstrip("/")
+                                if _n:
+                                    _opts.append("/" + _n)
+                        # Ebene 2
+                        for _folder in list(_opts[1:]):
+                            _ok2, _sub = _client.list_files(_folder)
+                            if _ok2 and isinstance(_sub, list):
+                                for _s in _sub:
+                                    if _s.endswith("/"):
+                                        _sn = _s.rstrip("/")
+                                        if _sn:
+                                            _full = _folder.rstrip("/") + "/" + _sn
+                                            if _full not in _opts:
+                                                _opts.append(_full)
+                    _opts = sorted(_opts)
                     st.session_state.webdav_root_options = _opts
                     # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
                     _real = [o for o in _opts if o != "/"]
