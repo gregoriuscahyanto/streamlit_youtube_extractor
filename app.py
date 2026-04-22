@@ -473,7 +473,9 @@ with tab_cloud:
                         else:
                             dbg = getattr(_client, "last_list_debug", "")
                             set_status(
-                                f"Verbunden. 0 ordner gefunden. Basis: {_client.base_url} | Root-Debug: {dbg}",
+                                "Verbunden. 0 ordner gefunden.\n"
+                                f"Basis: {_client.base_url}\n"
+                                f"Root-Debug: {dbg}",
                                 "warn",
                             )
                 else:

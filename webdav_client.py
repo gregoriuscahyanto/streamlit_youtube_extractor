@@ -107,6 +107,16 @@ class WebDAVClient:
         items.sort(key=lambda x: (not x.endswith("/"), x.lower()))
         return items
 
+    def _extract_response_hrefs(self, response_text: str) -> list[str]:
+        ns = {"d": "DAV:"}
+        root_xml = ET.fromstring(response_text)
+        hrefs = []
+        for resp in root_xml.findall("d:response", ns):
+            href_el = resp.find("d:href", ns)
+            if href_el is not None and href_el.text:
+                hrefs.append(unquote(href_el.text))
+        return hrefs
+
     # ── Verbindungstest ────────────────────────────────────────────────────────
 
     def test_connection(self) -> tuple[bool, str]:
@@ -147,32 +157,62 @@ class WebDAVClient:
                 '<?xml version="1.0"?>'
                 '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
             )
-            urls_to_try = [url]
-            if remote_dir.strip("/") == "" and url.endswith("/"):
-                urls_to_try.append(url.rstrip("/"))
+            urls_to_try = []
+            for candidate in [url, url.rstrip("/"), unquote(url), unquote(url).rstrip("/")]:
+                if candidate and candidate not in urls_to_try:
+                    urls_to_try.append(candidate)
 
+            header_variants = [
+                {
+                    "Depth": "1",
+                    "Content-Type": "application/xml",
+                    "Accept": "application/xml",
+                },
+                {
+                    "Depth": "1",
+                    "Content-Type": "application/xml; charset=utf-8",
+                },
+            ]
+
+            attempt_logs = []
+            first_success_items = None
+            first_success_log = ""
             last_error = "Keine Antwort."
+
             for candidate_url in urls_to_try:
-                r = self.session.request(
-                    "PROPFIND", candidate_url,
-                    headers={
-                        "Depth": "1",
-                        "Content-Type": "application/xml",
-                        "Accept": "application/xml",
-                    },
-                    data=body,
-                    timeout=20)
+                for headers in header_variants:
+                    r = self.session.request(
+                        "PROPFIND",
+                        candidate_url,
+                        headers=headers,
+                        data=body,
+                        timeout=20,
+                    )
+                    attempt_logs.append(f"{r.status_code} {candidate_url}")
 
-                if r.status_code not in (207, 200):
-                    last_error = f"HTTP {r.status_code} @ {candidate_url}"
-                    continue
+                    if r.status_code not in (207, 200):
+                        last_error = f"HTTP {r.status_code} @ {candidate_url}"
+                        continue
 
-                items = self._parse_propfind_items(r.text, candidate_url)
-                self.last_list_debug = f"url={candidate_url} items={items!r}"
-                if items or len(urls_to_try) == 1 or candidate_url == urls_to_try[-1]:
-                    return True, items
+                    items = self._parse_propfind_items(r.text, candidate_url)
+                    hrefs = self._extract_response_hrefs(r.text)
+                    log_line = f"{r.status_code} {candidate_url} items={items!r} hrefs={hrefs!r}"
 
-            self.last_list_debug = last_error
+                    # Sofort zurueck bei echtem Treffer
+                    if items:
+                        self.last_list_debug = log_line
+                        return True, items
+
+                    # Leere, aber erfolgreiche Antwort als Fallback merken
+                    if first_success_items is None:
+                        first_success_items = items
+                        first_success_log = log_line
+
+            if first_success_items is not None:
+                self.last_list_debug = first_success_log
+                return True, first_success_items
+
+            self.last_list_debug = f"{last_error}; attempts={attempt_logs!r}"
             return False, last_error
 
         except ET.ParseError as e:
