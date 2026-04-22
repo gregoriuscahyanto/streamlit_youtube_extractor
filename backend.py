@@ -137,6 +137,61 @@ def run_webdav_diagnostic(url: str, user: str, password: str) -> list[tuple[str,
     return results
 
 
+def collect_webdav_listing_debug(client: WebDAVClient, root: str = "/", capture_folder: str = "") -> list[dict]:
+    root = root or "/"
+    root_rel = root.strip("/")
+    cap_rel = ((root_rel + "/captures") if root_rel else "captures").strip("/")
+    res_rel = ((root_rel + "/results") if root_rel else "results").strip("/")
+    cap_folder_rel = (
+        ((root_rel + "/captures/" + capture_folder) if root_rel else ("captures/" + capture_folder)).strip("/")
+        if capture_folder else ""
+    )
+
+    probes = [
+        ("base", ""),
+        ("slash", "/"),
+        ("root", root),
+        ("root_rel", root_rel),
+        ("captures", cap_rel),
+        ("results", res_rel),
+    ]
+    if cap_folder_rel:
+        probes.append(("capture_folder", cap_folder_rel))
+
+    report: list[dict] = []
+    for label, remote_dir in probes:
+        try:
+            ok, items_or_err = client.list_files(remote_dir)
+            if ok and isinstance(items_or_err, list):
+                report.append({
+                    "probe": label,
+                    "remote_dir": remote_dir,
+                    "ok": True,
+                    "count": len(items_or_err),
+                    "items": items_or_err[:100],
+                    "error": "",
+                })
+            else:
+                report.append({
+                    "probe": label,
+                    "remote_dir": remote_dir,
+                    "ok": False,
+                    "count": 0,
+                    "items": [],
+                    "error": str(items_or_err),
+                })
+        except Exception as e:
+            report.append({
+                "probe": label,
+                "remote_dir": remote_dir,
+                "ok": False,
+                "count": 0,
+                "items": [],
+                "error": f"{e.__class__.__name__}: {e}",
+            })
+    return report
+
+
 def build_result_payload(
     t_start: float,
     t_end: float,

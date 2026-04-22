@@ -6,6 +6,7 @@ from pathlib import Path
 
 from backend import (
     build_result_payload,
+    collect_webdav_listing_debug,
     config_from_json_payload,
     config_from_mat_file,
     connect_webdav_client,
@@ -160,6 +161,15 @@ def cmd_list_results(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_debug_listing(args: argparse.Namespace) -> int:
+    client = _connect_or_exit(args)
+    if client is None:
+        return 1
+    report = collect_webdav_listing_debug(client, root=args.root, capture_folder=args.capture_folder)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_json_to_mat(args: argparse.Namespace) -> int:
     in_path = Path(args.input_json)
     out_path = Path(args.output_mat)
@@ -262,6 +272,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_res.add_argument("--root", default="/", help="Project root, e.g. / or /my_project")
     p_res.add_argument("--json", action="store_true", help="Output JSON")
     p_res.set_defaults(func=cmd_list_results)
+
+    p_dbg = sub.add_parser("debug-listing", help="Run backend listing debug probe")
+    p_dbg.add_argument("--root", default="/", help="Project root, e.g. / or /my_project")
+    p_dbg.add_argument("--capture-folder", default="", help="Optional capture folder for extra probe")
+    p_dbg.set_defaults(func=cmd_debug_listing)
 
     p_j2m = sub.add_parser("json-to-mat", help="Convert result/config JSON to MAT")
     p_j2m.add_argument("--input-json", required=True, help="Input JSON path")
