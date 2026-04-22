@@ -257,31 +257,41 @@ def _apply_video(local_path, display_name):
     set_status(f"Video geladen: {display_name}", "ok")
 
 def webdav_list(path):
+    """
+    Listet Verzeichnis auf. path ist ein logischer Pfad relativ zum
+    Benutzer-Root, z.B. "/" oder "/captures" oder "/captures/20251104_202910".
+    Gibt [{"name", "path", "is_dir"}] zurück, wobei path der vollständige
+    logische Pfad für weitere Navigationsaufrufe ist.
+    """
     if not st.session_state.webdav_connected: return []
     client = st.session_state.webdav_client
     ok, items = client.list_files(path)
     if not ok or not isinstance(items, list): return []
     result = []
     for item in items:
-        p = item.rstrip("/")
-        name = p.split("/")[-1]
-        if not name: continue
+        # items sind jetzt relative Namen: "ordner/" oder "datei.txt"
         is_dir = item.endswith("/")
-        result.append({"name":name,"path":item,"is_dir":is_dir})
-    result.sort(key=lambda x:(not x["is_dir"], x["name"].lower()))
+        name   = item.rstrip("/")
+        if not name: continue
+        # Vollständiger logischer Pfad für Navigations-Klicks
+        base = path.rstrip("/")
+        full_path = (base + "/" + name).replace("//", "/")
+        result.append({"name": name, "path": full_path, "is_dir": is_dir})
+    result.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
     return result
 
 def get_root_folders():
+    """Listet Ordner im Root auf für Hauptordner-Dropdown."""
     if not st.session_state.webdav_connected: return ["/"]
     client = st.session_state.webdav_client
     ok, items = client.list_files("/")
     if not ok or not isinstance(items, list): return ["/"]
     folders = ["/"]
     for item in items:
-        p = item.rstrip("/")
-        name = p.split("/")[-1]
-        if name and item.endswith("/"):
-            folders.append("/" + name)
+        if item.endswith("/"):
+            name = item.rstrip("/")
+            if name:
+                folders.append("/" + name)
     return sorted(folders)
 
 def _load_video_from_webdav(remote_path):
@@ -493,10 +503,10 @@ with tab_cloud:
             cap_path = f"{root}/captures".replace("//", "/")
             ok_cap, cap_items = st.session_state.webdav_client.list_files(cap_path)
             if ok_cap and isinstance(cap_items, list):
+                # items sind jetzt relative Namen: "20251104_202910/"
                 cap_folders = sorted(
-                    [i.rstrip("/").split("/")[-1]
-                     for i in cap_items
-                     if i.endswith("/") and i.rstrip("/").split("/")[-1]],
+                    [i.rstrip("/") for i in cap_items
+                     if i.endswith("/") and i.rstrip("/")],
                     reverse=True)
             else:
                 cap_folders = []
