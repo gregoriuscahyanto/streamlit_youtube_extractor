@@ -13,9 +13,13 @@ import tempfile
 import io
 import scipy.io as sio
 import tomllib
+import socket
+import requests
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
+from urllib.parse import quote, urlparse
+from requests.auth import HTTPBasicAuth
 
 from webdav_client import WebDAVClient
 from storage import StorageManager
@@ -160,6 +164,7 @@ def init_state():
         webdav_user=_sec_user, webdav_pass=_sec_pass,
         webdav_connected=False, webdav_client=None,
         webdav_auto_connect_tried=False,
+        webdav_diag=[],
         webdav_root="/",
         webdav_root_options=[],
         # Datei-Browser
@@ -344,6 +349,60 @@ def get_root_folders():
                         if full not in folders:
                             folders.append(full)
     return sorted(folders)
+
+
+def run_webdav_diagnostic(url: str, user: str, password: str) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = []
+    raw_url = (url or "").strip()
+    if not raw_url:
+        return [("Fehler", "WebDAV URL ist leer.")]
+
+    parsed = urlparse(raw_url)
+    host = parsed.hostname
+    if not host:
+        return [("Fehler", f"Ungueltige URL: {raw_url}")]
+
+    results.append(("Host", host))
+
+    # 1) DNS
+    try:
+        dns_info = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        ips = sorted({entry[4][0] for entry in dns_info})
+        results.append(("DNS", f"OK ({', '.join(ips[:4])})"))
+    except Exception as e:
+        results.append(("DNS", f"Fehler: {e.__class__.__name__}: {e}"))
+        return results
+
+    # 2) TCP Connect (TLS-Port)
+    try:
+        with socket.create_connection((host, 443), timeout=8):
+            pass
+        results.append(("TCP 443", "OK"))
+    except Exception as e:
+        results.append(("TCP 443", f"Fehler: {e.__class__.__name__}: {e}"))
+        return results
+
+    # 3) HTTPS/WebDAV Probe
+    probe_url = raw_url.rstrip("/") + "/"
+    if probe_url.lower().endswith("/remote.php/dav/files/") and user:
+        probe_url = probe_url + quote(user.strip(), safe="") + "/"
+    auth = HTTPBasicAuth(user, password) if user and password else None
+    try:
+        r = requests.request(
+            "PROPFIND",
+            probe_url,
+            headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+            data='<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
+            auth=auth,
+            timeout=(8, 20),
+        )
+        results.append(("PROPFIND", f"HTTP {r.status_code}"))
+        results.append(("Probe URL", probe_url))
+    except Exception as e:
+        results.append(("PROPFIND", f"Fehler: {e.__class__.__name__}: {e}"))
+        results.append(("Probe URL", probe_url))
+
+    return results
 
 
 def connect_webdav(url: str, user: str, password: str) -> tuple[bool, str]:
@@ -540,6 +599,17 @@ with tab_cloud:
             else:
                 set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
             st.rerun()
+
+        diag_a, diag_b = st.columns(2)
+        if diag_a.button("Diagnose starten", use_container_width=True, key="diag_webdav"):
+            with st.spinner("Diagnose laeuft ..."):
+                st.session_state.webdav_diag = run_webdav_diagnostic(wdav_url, wdav_user, wdav_pass)
+        if diag_b.button("Diagnose leeren", use_container_width=True, key="diag_webdav_clear"):
+            st.session_state.webdav_diag = []
+
+        if st.session_state.webdav_diag:
+            diag_text = "\n".join([f"{k}: {v}" for k, v in st.session_state.webdav_diag])
+            st.code(diag_text, language="text")
 
         if st.session_state.webdav_connected:
             st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">' +
