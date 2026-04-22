@@ -1,8 +1,8 @@
-"""
-OCR Extractor – Streamlit App v3
-Tab ☁  : Nextcloud-Verbindung, Hauptordner wählen, Datei-Browser
-Tab 🎬  : Video laden, Start/Ende, ROI-Auswahl
-Tab 🗺  : Track-Minimap Analyse – 8-Punkte + Farberkennung
+﻿"""
+OCR Extractor â€“ Streamlit App v3
+Tab â˜  : Nextcloud-Verbindung, Hauptordner wÃ¤hlen, Datei-Browser
+Tab ðŸŽ¬  : Video laden, Start/Ende, ROI-Auswahl
+Tab ðŸ—º  : Track-Minimap Analyse â€“ 8-Punkte + Farberkennung
 """
 
 import streamlit as st
@@ -16,7 +16,15 @@ from pathlib import Path
 from datetime import datetime
 from PIL import Image
 
-from webdav_client import WebDAVClient
+from backend import (
+    build_result_payload,
+    build_mat_struct as backend_build_mat_struct,
+    config_from_json_payload,
+    config_from_mat_file,
+    connect_webdav_client,
+    list_root_folders,
+    load_webdav_credentials,
+)
 from storage import StorageManager
 from track_analysis import (
     compare_minimap_to_reference,
@@ -25,15 +33,15 @@ from track_analysis import (
     extract_minimap_crop,
 )
 
-# ── Seitenkonfiguration ───────────────────────────────────────────────────────
+# â”€â”€ Seitenkonfiguration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 st.set_page_config(
     page_title="OCR Extractor",
-    page_icon="🎬",
+    page_icon="ðŸŽ¬",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+# â”€â”€ CSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;600;800&display=swap');
@@ -95,7 +103,7 @@ hr { border-color:#1e2535 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── ROI / Format Listen ───────────────────────────────────────────────────────
+# â”€â”€ ROI / Format Listen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ROI_NAMES = [
     "_","t_s","v_Fzg_kmph","v_Fzg_mph","numgear_GET",
     "a_G","a_mps2","a_x_G","a_x_pos_G","a_x_neg_G","a_x_mps",
@@ -114,17 +122,10 @@ FMT_OPTIONS = [
     "float","alnum","custom",
 ]
 
-# ── Session-State ──────────────────────────────────────────────────────────────
+# â”€â”€ Session-State â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def init_state():
     # Secrets sofort laden bevor session_state initialisiert wird
-    _sec_url = _sec_user = _sec_pass = ""
-    try:
-        _sec = st.secrets.get("webdav", {})
-        _sec_url  = _sec.get("url", "")
-        _sec_user = _sec.get("username", "")
-        _sec_pass = _sec.get("password", "")
-    except Exception:
-        pass
+    _sec_url, _sec_user, _sec_pass = load_webdav_credentials(streamlit_secrets=st.secrets)
 
     defs = dict(
         # WebDAV
@@ -155,7 +156,7 @@ def init_state():
 
 init_state()
 
-# ── Hilfsfunktionen ───────────────────────────────────────────────────────────
+# â”€â”€ Hilfsfunktionen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @st.cache_data(show_spinner=False)
 def get_frame(video_path: str, time_s: float):
     cap = cv2.VideoCapture(video_path)
@@ -184,10 +185,10 @@ def set_status(msg, kind="info"):
 
 def _file_icon(name):
     ext = Path(name).suffix.lower()
-    return {".mp4":"🎬",".mov":"🎬",".avi":"🎬",".mkv":"🎬",
-            ".mat":"🧮",".json":"📋",".wav":"🎵",".mp3":"🎵",
-            ".png":"🖼",".jpg":"🖼",".jpeg":"🖼",
-            ".txt":"📄",".md":"📄"}.get(ext,"📄")
+    return {".mp4":"ðŸŽ¬",".mov":"ðŸŽ¬",".avi":"ðŸŽ¬",".mkv":"ðŸŽ¬",
+            ".mat":"ðŸ§®",".json":"ðŸ“‹",".wav":"ðŸŽµ",".mp3":"ðŸŽµ",
+            ".png":"ðŸ–¼",".jpg":"ðŸ–¼",".jpeg":"ðŸ–¼",
+            ".txt":"ðŸ“„",".md":"ðŸ“„"}.get(ext,"ðŸ“„")
 
 def draw_rois(frame, rois, sel, vid_w, vid_h):
     img = frame.copy()
@@ -203,56 +204,37 @@ def draw_rois(frame, rois, sel, vid_w, vid_h):
     return img
 
 def build_result_json():
-    return {
-        "params": {"start_s":st.session_state.t_start,"end_s":st.session_state.t_end},
-        "roi_table": [
-            {"name_roi":r["name"],"roi":[r["x"],r["y"],r["w"],r["h"]],
-             "fmt":r["fmt"],"pattern":r.get("pattern",""),"max_scale":r.get("max_scale",1.2)}
-            for r in st.session_state.rois
-        ],
-        "video": {"width":st.session_state.vid_width,"height":st.session_state.vid_height,
-                  "fps":st.session_state.vid_fps,"duration":st.session_state.vid_duration},
-        "track": {"ref_pts":st.session_state.ref_track_pts,
-                  "minimap_pts":st.session_state.minimap_pts,
-                  "moving_pt_color_range":st.session_state.moving_pt_color_range},
-    }
+    return build_result_payload(
+        t_start=st.session_state.t_start,
+        t_end=st.session_state.t_end,
+        rois=st.session_state.rois,
+        video={
+            "width": st.session_state.vid_width,
+            "height": st.session_state.vid_height,
+            "fps": st.session_state.vid_fps,
+            "duration": st.session_state.vid_duration,
+        },
+        track={
+            "ref_pts": st.session_state.ref_track_pts,
+            "minimap_pts": st.session_state.minimap_pts,
+            "moving_pt_color_range": st.session_state.moving_pt_color_range,
+        },
+    )
 
 def build_mat_struct(result):
-    roi_table = {}
-    for f in ["name_roi","roi","fmt","pattern","max_scale"]:
-        key = "name" if f=="name_roi" else f
-        roi_table[f] = [r.get(key,"") for r in result["roi_table"]]
-    p=result["params"]; v=result["video"]; t=result.get("track",{})
-    return {"recordResult":{
-        "ocr":{
-            "params":{"start_s":float(p["start_s"]),"end_s":float(p["end_s"]),
-                      "fps":float(v["fps"]),"duration_s":float(v["duration"]),
-                      "video_size_wh":np.array([v["width"],v["height"]])},
-            "roi_table":roi_table,
-            "trkCalSlim":{"ref_pts":np.array(t.get("ref_pts") or [],dtype=float),
-                          "minimap_pts":np.array(t.get("minimap_pts") or [],dtype=float)},
-            "created":str(datetime.now()),
-        },
-        "metadata":{"video":st.session_state.video_name}
-    }}
+    return backend_build_mat_struct(result, video_name=st.session_state.video_name)
 
 def load_json_config(data):
-    p=data.get("params",{})
-    st.session_state.t_start=float(p.get("start_s",0))
-    st.session_state.t_end=float(p.get("end_s",st.session_state.vid_duration))
-    rois=[]
-    for r in data.get("roi_table",[]):
-        pos=r.get("roi",[0,0,100,50])
-        rois.append(dict(name=r.get("name_roi","_"),
-                         x=float(pos[0]),y=float(pos[1]),w=float(pos[2]),h=float(pos[3]),
-                         fmt=r.get("fmt","any"),pattern=r.get("pattern",""),
-                         max_scale=float(r.get("max_scale",1.2))))
-    st.session_state.rois=rois
-    t=data.get("track",{})
-    if t.get("ref_pts"):     st.session_state.ref_track_pts=t["ref_pts"]
-    if t.get("minimap_pts"): st.session_state.minimap_pts=t["minimap_pts"]
-    if t.get("moving_pt_color_range"):
-        st.session_state.moving_pt_color_range=t["moving_pt_color_range"]
+    cfg = config_from_json_payload(data, vid_duration=st.session_state.vid_duration)
+    st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
+    st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
+    st.session_state.rois = cfg.get("rois", [])
+    if cfg.get("ref_track_pts"):
+        st.session_state.ref_track_pts = cfg["ref_track_pts"]
+    if cfg.get("minimap_pts"):
+        st.session_state.minimap_pts = cfg["minimap_pts"]
+    if cfg.get("moving_pt_color_range"):
+        st.session_state.moving_pt_color_range = cfg["moving_pt_color_range"]
 
 def _apply_video(local_path, display_name):
     info = get_video_info(local_path)
@@ -293,35 +275,14 @@ def webdav_list(path):
 def get_root_folders():
     """Listet Ordner fuer Hauptordner-Dropdown, 2 Ebenen tief."""
     if not st.session_state.webdav_connected: return ["/"]
-    client = st.session_state.webdav_client
-    # "" = Benutzer-Root (base_url)
-    ok, items = client.list_files("")
-    folders = ["/"]
-    if ok and isinstance(items, list):
-        for item in items:
-            if item.endswith("/"):
-                name = item.rstrip("/")
-                if name:
-                    folders.append("/" + name)
-    # Ebene 2
-    for folder in list(folders[1:]):
-        ok2, sub = client.list_files(folder)
-        if ok2 and isinstance(sub, list):
-            for s in sub:
-                if s.endswith("/"):
-                    sname = s.rstrip("/")
-                    if sname:
-                        full = folder.rstrip("/") + "/" + sname
-                        if full not in folders:
-                            folders.append(full)
-    return sorted(folders)
+    return list_root_folders(st.session_state.webdav_client, depth_levels=2)
 
 
 def _load_video_from_webdav(remote_path):
     client = st.session_state.webdav_client
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(remote_path).suffix)
     tmp.close()
-    with st.spinner(f"Lade {Path(remote_path).name} …"):
+    with st.spinner(f"Lade {Path(remote_path).name} â€¦"):
         ok, msg = client.download_file(remote_path, tmp.name)
     if ok: _apply_video(tmp.name, Path(remote_path).name)
     else:  set_status(f"Video-Download: {msg}", "warn")
@@ -333,7 +294,7 @@ def _load_json_from_webdav(remote_path):
     if ok:
         try:
             with open(tmp.name) as f: load_json_config(json.load(f))
-            set_status("JSON geladen ✓", "ok")
+            set_status("JSON geladen âœ“", "ok")
         except Exception as e: set_status(f"JSON-Parse: {e}", "warn")
     else: set_status(f"JSON-Download: {msg}", "warn")
 
@@ -343,29 +304,15 @@ def _load_mat_from_webdav(remote_path):
     ok, msg = client.download_file(remote_path, tmp.name)
     if not ok: set_status(f"MAT-Download: {msg}", "warn"); return
     try:
-        mat = sio.loadmat(tmp.name, squeeze_me=True, struct_as_record=False)
-        rr  = mat.get("recordResult")
-        if rr:
-            ocr = getattr(rr,"ocr",None)
-            if ocr:
-                prm = getattr(ocr,"params",None)
-                if prm:
-                    st.session_state.t_start=float(getattr(prm,"start_s",0))
-                    st.session_state.t_end=float(getattr(prm,"end_s",st.session_state.vid_duration))
-                roi_tbl = getattr(ocr,"roi_table",None)
-                if roi_tbl:
-                    names=list(np.atleast_1d(roi_tbl.name_roi))
-                    rois_r=list(np.atleast_1d(roi_tbl.roi))
-                    fmts=list(np.atleast_1d(roi_tbl.fmt))
-                    rois=[]
-                    for n,r,f in zip(names,rois_r,fmts):
-                        pos=np.atleast_1d(r).astype(float)
-                        if len(pos)==4:
-                            rois.append(dict(name=str(n),x=pos[0],y=pos[1],
-                                             w=pos[2],h=pos[3],fmt=str(f),
-                                             pattern="",max_scale=1.2))
-                    st.session_state.rois=rois
-        set_status("MAT geladen ✓","ok")
+        cfg = config_from_mat_file(tmp.name, vid_duration=st.session_state.vid_duration)
+        st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
+        st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
+        st.session_state.rois = cfg.get("rois", st.session_state.rois)
+        if cfg.get("ref_track_pts"):
+            st.session_state.ref_track_pts = cfg["ref_track_pts"]
+        if cfg.get("minimap_pts"):
+            st.session_state.minimap_pts = cfg["minimap_pts"]
+        set_status("MAT geladen âœ“","ok")
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
 
 def _load_ref_from_webdav(remote_path):
@@ -376,14 +323,14 @@ def _load_ref_from_webdav(remote_path):
     if ok:
         img = np.array(Image.open(tmp.name).convert("RGB"))
         st.session_state.ref_track_img=img
-        set_status("Referenz-Track geladen ✓","ok")
+        set_status("Referenz-Track geladen âœ“","ok")
     else: set_status(f"Ref-Download: {msg}","warn")
 
-# ── Header + Status ───────────────────────────────────────────────────────────
+# â”€â”€ Header + Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 st.markdown("""
 <div class="app-header">
   <h1>OCR Extractor</h1>
-  <span class="subtitle">Cloud · ROI · Track</span>
+  <span class="subtitle">Cloud Â· ROI Â· Track</span>
 </div>""", unsafe_allow_html=True)
 
 stype = st.session_state.status_type
@@ -396,24 +343,24 @@ st.markdown(
     f'<span class="status-badge status-{stype}">{st.session_state.status_msg}</span>' + _root_badge,
     unsafe_allow_html=True)
 
-# ── TABS ──────────────────────────────────────────────────────────────────────
+# â”€â”€ TABS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 tab_cloud, tab_roi, tab_track = st.tabs(
-    ["☁️  Cloud & Dateien", "🎬  ROI-Setup", "🗺  Track-Analyse"]
+    ["â˜ï¸  Cloud & Dateien", "ðŸŽ¬  ROI-Setup", "ðŸ—º  Track-Analyse"]
 )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB ☁️  – CLOUD & DATEIEN
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB â˜ï¸  â€“ CLOUD & DATEIEN
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_cloud:
 
     col_l, col_r = st.columns([1, 2], gap="large")
 
-    # ── Linke Spalte ───────────────────────────────────────────────────────────
+    # â”€â”€ Linke Spalte â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     with col_l:
 
-        # ── Verbindung ─────────────────────────────────────────────────────────
+        # â”€â”€ Verbindung â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Verbindung · bwSyncAndShare / Nextcloud</div>',
+        st.markdown('<div class="section-title">Verbindung Â· bwSyncAndShare / Nextcloud</div>',
                     unsafe_allow_html=True)
 
         # key= an session_state gebunden -> Felder sind immer befuellt
@@ -428,16 +375,15 @@ with tab_cloud:
                                    type="password",
                                    help="Nextcloud: Einstellungen > Sicherheit > App-Passwoerter")
 
-        if st.button("🔌 Verbinden", type="primary", use_container_width=True):
+        if st.button("ðŸ”Œ Verbinden", type="primary", use_container_width=True):
             if wdav_url and wdav_user and wdav_pass:
                 with st.spinner("Verbinde ..."):
-                    _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
-                    _ok, _msg = _client.test_connection()
+                    _ok, _msg, _client = connect_webdav_client(wdav_url, wdav_user, wdav_pass)
                 if _ok:
                     st.session_state.webdav_connected = True
                     st.session_state.webdav_client    = _client
                     # Ordner laden
-                    _opts = get_root_folders()
+                    _opts = list_root_folders(_client, depth_levels=2)
                     st.session_state.webdav_root_options = _opts
                     # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
                     _real = [o for o in _opts if o != "/"]
@@ -470,7 +416,7 @@ with tab_cloud:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Hauptordner ────────────────────────────────────────────────────────
+        # â”€â”€ Hauptordner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Hauptordner (Projekt-Root)</div>',
                     unsafe_allow_html=True)
@@ -528,10 +474,10 @@ with tab_cloud:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Aufnahme-Ordner ────────────────────────────────────────────────────
+        # â”€â”€ Aufnahme-Ordner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Aufnahme-Ordner</div>', unsafe_allow_html=True)
-        st.caption("Format: YYYYMMDD_HHMMSS aus captures/ — bestimmt alle Datei-Pfade.")
+        st.caption("Format: YYYYMMDD_HHMMSS aus captures/ â€” bestimmt alle Datei-Pfade.")
 
         if st.session_state.webdav_connected and st.session_state.webdav_root:
             root     = st.session_state.webdav_root
@@ -551,7 +497,7 @@ with tab_cloud:
                     "Aufnahme auswahlen",
                     cap_folders,
                     index=cf_idx,
-                    format_func=lambda x: f"📁 {x}",
+                    format_func=lambda x: f"ðŸ“ {x}",
                     label_visibility="collapsed",
                     key="cf_dd")
                 if st.button("Auswahlen", use_container_width=True, key="set_cf"):
@@ -561,7 +507,7 @@ with tab_cloud:
                     st.session_state.fb_items = webdav_list(nav)
                     set_status(f"Aufnahme: {chosen_cf}", "ok"); st.rerun()
             else:
-                st.caption("Keine Unterordner in captures/ — ggf. Hauptordner setzen.")
+                st.caption("Keine Unterordner in captures/ â€” ggf. Hauptordner setzen.")
 
         cf_manual = st.text_input("Oder manuell eingeben",
                                    value=st.session_state.capture_folder,
@@ -572,7 +518,7 @@ with tab_cloud:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Lokal laden ────────────────────────────────────────────────────────
+        # â”€â”€ Lokal laden â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Lokal laden</div>', unsafe_allow_html=True)
 
@@ -605,7 +551,7 @@ with tab_cloud:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Rechte Spalte: Datei-Browser ───────────────────────────────────────────
+    # â”€â”€ Rechte Spalte: Datei-Browser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     with col_r:
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Datei-Browser</div>', unsafe_allow_html=True)
@@ -620,7 +566,7 @@ with tab_cloud:
             # Breadcrumb + Buttons
             nav1, nav2, nav3 = st.columns([4, 1, 1])
             with nav1:
-                st.markdown(f'<div class="breadcrumb">📂 {cur}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="breadcrumb">ðŸ“‚ {cur}</div>', unsafe_allow_html=True)
             with nav2:
                 if st.button("Hoch", use_container_width=True, key="fb_up"):
                     parts = cur.rstrip("/").split("/")
@@ -645,7 +591,7 @@ with tab_cloud:
                 ("captures/",  _p(_r, "captures")),
                 ("results/",   _p(_r, "results")),
                 ("reference/", _p(_r, "reference_track_siesmann")),
-                (f"{cf[:8]}.." if len(cf) > 8 else (cf or "—"),
+                (f"{cf[:8]}.." if len(cf) > 8 else (cf or "â€”"),
                  _p(_r, "captures", cf) if cf else None),
             ]
             for i, (label, path) in enumerate(shortcuts):
@@ -669,7 +615,7 @@ with tab_cloud:
                             'Leer oder kein Zugriff.</div>', unsafe_allow_html=True)
             else:
                 for entry in items:
-                    icon = "📁" if entry["is_dir"] else _file_icon(entry["name"])
+                    icon = "ðŸ“" if entry["is_dir"] else _file_icon(entry["name"])
                     c_name, c_btn = st.columns([5, 1])
                     with c_name:
                         if st.button(f"{icon}  {entry['name']}",
@@ -736,19 +682,19 @@ with tab_cloud:
             st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 🎬 – ROI-SETUP
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB ðŸŽ¬ â€“ ROI-SETUP
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_roi:
     if not st.session_state.video_path:
         st.markdown("""
         <div style="text-align:center;padding:3rem 2rem;color:#4a5060;">
-          <div style="font-size:2.5rem;margin-bottom:.8rem">🎬</div>
+          <div style="font-size:2.5rem;margin-bottom:.8rem">ðŸŽ¬</div>
           <div style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:600">
             Kein Video geladen</div>
           <div style="font-family:'JetBrains Mono',monospace;font-size:.72rem;
                margin-top:.4rem;color:#2e3545">
-            → Tab ☁️  öffnen → Video laden oder von WebDAV laden</div>
+            â†’ Tab â˜ï¸  Ã¶ffnen â†’ Video laden oder von WebDAV laden</div>
         </div>""", unsafe_allow_html=True)
     else:
         dur=st.session_state.vid_duration; fps=st.session_state.vid_fps
@@ -783,13 +729,13 @@ with tab_roi:
                 st.image(draw_rois(frame,st.session_state.rois,
                                    st.session_state.selected_roi,fw,fh),
                          use_container_width=True,
-                         caption=f"t={t_cur:.3f}s  |  {fw}×{fh}  |  {fps:.1f}fps")
+                         caption=f"t={t_cur:.3f}s  |  {fw}Ã—{fh}  |  {fps:.1f}fps")
             else:
-                st.warning("Frame nicht verfügbar.")
+                st.warning("Frame nicht verfÃ¼gbar.")
             st.markdown('</div>',unsafe_allow_html=True)
 
             st.markdown('<div class="section-card">',unsafe_allow_html=True)
-            st.markdown('<div class="section-title">ROI hinzufügen</div>',unsafe_allow_html=True)
+            st.markdown('<div class="section-title">ROI hinzufÃ¼gen</div>',unsafe_allow_html=True)
             rc=st.columns(4)
             rx=rc[0].number_input("X",0,fw or 9999,0,1,key="rx")
             ry=rc[1].number_input("Y",0,fh or 9999,0,1,key="ry")
@@ -805,13 +751,13 @@ with tab_roi:
             roi_pat=rn[2].text_input("Pattern","",key="rn_pat",placeholder="Regex")
             roi_sc=rn[3].number_input("max_scale",1.2,step=0.1,key="rn_sc")
             if roi_name=="track_minimap":
-                st.info("ℹ️ Danach in Tab 🗺 Track-Analyse weiterarbeiten.")
-            if st.button("➕ ROI hinzufügen",type="primary",use_container_width=True):
+                st.info("â„¹ï¸ Danach in Tab ðŸ—º Track-Analyse weiterarbeiten.")
+            if st.button("âž• ROI hinzufÃ¼gen",type="primary",use_container_width=True):
                 st.session_state.rois.append(dict(name=roi_name,
                     x=float(rx),y=float(ry),w=float(rw),h=float(rh),
                     fmt=roi_fmt,pattern=roi_pat,max_scale=roi_sc))
                 st.session_state.selected_roi=len(st.session_state.rois)-1
-                get_frame.clear(); set_status(f"ROI '{roi_name}' hinzugefügt.","ok"); st.rerun()
+                get_frame.clear(); set_status(f"ROI '{roi_name}' hinzugefÃ¼gt.","ok"); st.rerun()
             st.markdown('</div>',unsafe_allow_html=True)
 
         with col_r:
@@ -824,7 +770,7 @@ with tab_roi:
             for i,roi in enumerate(st.session_state.rois):
                 is_track=roi["name"]=="track_minimap"; is_sel=i==st.session_state.selected_roi
                 pos=f'[{int(roi["x"])},{int(roi["y"])},{int(roi["w"])},{int(roi["h"])}]'
-                if st.button(("▶ " if is_sel else "")+roi["name"],
+                if st.button(("â–¶ " if is_sel else "")+roi["name"],
                               key=f"rsel_{i}",use_container_width=True):
                     st.session_state.selected_roi=i; st.rerun()
                 tag_cls="roi-tag-track" if is_track else ("roi-tag-sel" if is_sel else "roi-tag")
@@ -855,13 +801,13 @@ with tab_roi:
                 esc=st.number_input("max_scale",float(roi.get("max_scale",1.2)),
                                      step=0.1,min_value=0.5,key=f"esc_{sel}")
                 ca,cb=st.columns(2)
-                if ca.button("💾",use_container_width=True,key=f"sv_{sel}"):
+                if ca.button("ðŸ’¾",use_container_width=True,key=f"sv_{sel}"):
                     st.session_state.rois[sel]=dict(name=en,x=float(ex),y=float(ey),
                         w=float(ew),h=float(eh),fmt=ef,pattern=ep,max_scale=esc)
                     get_frame.clear(); set_status("ROI gespeichert.","ok"); st.rerun()
-                if cb.button("🗑",use_container_width=True,key=f"dl_{sel}"):
+                if cb.button("ðŸ—‘",use_container_width=True,key=f"dl_{sel}"):
                     st.session_state.rois.pop(sel); st.session_state.selected_roi=None
-                    get_frame.clear(); set_status("ROI gelöscht.","info"); st.rerun()
+                    get_frame.clear(); set_status("ROI gelÃ¶scht.","info"); st.rerun()
                 st.markdown('</div>',unsafe_allow_html=True)
 
             st.markdown('<div class="section-card">',unsafe_allow_html=True)
@@ -869,10 +815,10 @@ with tab_roi:
             cf=st.session_state.capture_folder or "output"
             result=build_result_json()
             result_str=json.dumps(result,indent=2,ensure_ascii=False)
-            st.download_button("⬇ JSON",result_str,f"results_{cf}.json",
+            st.download_button("â¬‡ JSON",result_str,f"results_{cf}.json",
                                "application/json",use_container_width=True)
             mat_buf=io.BytesIO(); sio.savemat(mat_buf,build_mat_struct(result))
-            st.download_button("⬇ MAT",mat_buf.getvalue(),f"results_{cf}.mat",
+            st.download_button("â¬‡ MAT",mat_buf.getvalue(),f"results_{cf}.mat",
                                "application/octet-stream",use_container_width=True)
             st.markdown('</div>',unsafe_allow_html=True)
 
@@ -882,17 +828,17 @@ with tab_roi:
             st.markdown(f"""
             <div style="font-family:'JetBrains Mono',monospace;font-size:.67rem;
                  color:#8892a4;line-height:2.0;">
-            <b style="color:#e8eaf0">Video</b> {fw}×{fh} @ {fps:.1f}fps<br>
+            <b style="color:#e8eaf0">Video</b> {fw}Ã—{fh} @ {fps:.1f}fps<br>
             <b style="color:#e8eaf0">Dauer</b> {dur:.2f}s<br>
-            <b style="color:#e8eaf0">Bereich</b> {t_start:.2f}→{st.session_state.t_end:.2f}s<br>
+            <b style="color:#e8eaf0">Bereich</b> {t_start:.2f}â†’{st.session_state.t_end:.2f}s<br>
             <b style="color:#e8eaf0">ROIs</b> {len(st.session_state.rois)} ({n_t} track)
             </div>""",unsafe_allow_html=True)
             st.markdown('</div>',unsafe_allow_html=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 🗺 – TRACK-ANALYSE
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB ðŸ—º â€“ TRACK-ANALYSE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_track:
     has_ref   = st.session_state.ref_track_img is not None
     track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
@@ -900,9 +846,9 @@ with tab_track:
     fw=st.session_state.vid_width; fh=st.session_state.vid_height
 
     if not has_ref:
-        st.info("ℹ️  Referenz-Track fehlt → Tab ☁️  → Bild laden.")
+        st.info("â„¹ï¸  Referenz-Track fehlt â†’ Tab â˜ï¸  â†’ Bild laden.")
     if not track_roi:
-        st.info("ℹ️  Keine track_minimap ROI → Tab 🎬  → ROI anlegen.")
+        st.info("â„¹ï¸  Keine track_minimap ROI â†’ Tab ðŸŽ¬  â†’ ROI anlegen.")
 
     col_a,col_b=st.columns(2,gap="medium")
     clrs=[(255,80,80),(255,160,0),(255,255,0),(80,255,80),
@@ -910,7 +856,7 @@ with tab_track:
 
     with col_a:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Referenz-Track · 8 Kalibrierpunkte</div>',
+        st.markdown('<div class="section-title">Referenz-Track Â· 8 Kalibrierpunkte</div>',
                     unsafe_allow_html=True)
         if has_ref:
             ref_pts=st.session_state.ref_track_pts or [[0,0]]*8
@@ -927,7 +873,7 @@ with tab_track:
                 py=c3.number_input(f"RY{pi}",value=int(pt[1]),step=1,
                                     label_visibility="collapsed",key=f"rp_y_{pi}")
                 pt_data.append([px,py])
-            if st.button("💾 Referenzpunkte speichern",use_container_width=True):
+            if st.button("ðŸ’¾ Referenzpunkte speichern",use_container_width=True):
                 st.session_state.ref_track_pts=pt_data
                 set_status("Referenzpunkte gespeichert.","ok"); st.rerun()
             vis=st.session_state.ref_track_img.copy()
@@ -944,7 +890,7 @@ with tab_track:
 
     with col_b:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Minimap · 8 Punkte + Bewegungserkennung</div>',
+        st.markdown('<div class="section-title">Minimap Â· 8 Punkte + Bewegungserkennung</div>',
                     unsafe_allow_html=True)
         if has_vid and track_roi:
             frame=get_frame(st.session_state.video_path,st.session_state.t_current)
@@ -967,7 +913,7 @@ with tab_track:
                                         max_value=max(1,ch),step=1,
                                         label_visibility="collapsed",key=f"mp_y_{pi}")
                     mm_data.append([px,py])
-                if st.button("💾 Minimap-Punkte speichern",use_container_width=True):
+                if st.button("ðŸ’¾ Minimap-Punkte speichern",use_container_width=True):
                     st.session_state.minimap_pts=mm_data
                     set_status("Minimap-Punkte gespeichert.","ok"); st.rerun()
                 vis_c=crop.copy()
@@ -976,14 +922,14 @@ with tab_track:
                         cv2.circle(vis_c,(int(pt[0]),int(pt[1])),6,clrs[pi%8],-1)
                         cv2.putText(vis_c,f"P{pi+1}",(int(pt[0])+7,int(pt[1])),
                                     cv2.FONT_HERSHEY_SIMPLEX,.4,clrs[pi%8],1)
-                st.image(vis_c,use_container_width=True,caption=f"Minimap ({cw}×{ch}px)")
+                st.image(vis_c,use_container_width=True,caption=f"Minimap ({cw}Ã—{ch}px)")
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
-                        'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
+                        'Video + track_minimap ROI benÃ¶tigt</div>',unsafe_allow_html=True)
         st.markdown('</div>',unsafe_allow_html=True)
 
     st.markdown('<div class="section-card">',unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Vergleich · Überlagerung · Bewegende Punkte</div>',
+    st.markdown('<div class="section-title">Vergleich Â· Ãœberlagerung Â· Bewegende Punkte</div>',
                 unsafe_allow_html=True)
     cv1,cv2_,cv3=st.columns([2,2,1])
     with cv3:
@@ -1005,7 +951,7 @@ with tab_track:
     can_cmp=(has_ref and track_roi and has_vid and
              st.session_state.ref_track_pts and st.session_state.minimap_pts)
     with cv1:
-        if can_cmp and st.button("▶ Vergleich",type="primary",use_container_width=True):
+        if can_cmp and st.button("â–¶ Vergleich",type="primary",use_container_width=True):
             frame=get_frame(st.session_state.video_path,st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
@@ -1016,11 +962,11 @@ with tab_track:
                 if mp:
                     st.session_state.moving_pt_history.append(
                         {"t":st.session_state.t_current,"x":mp["x"],"y":mp["y"]})
-                set_status("Vergleich durchgeführt.","ok"); st.rerun()
+                set_status("Vergleich durchgefÃ¼hrt.","ok"); st.rerun()
         cmp=st.session_state.track_comparison
         if cmp:
             m1,m2,m3=st.columns(3)
-            for col,val,lbl in [(m1,cmp["mean_dist_px"],"Ø px"),
+            for col,val,lbl in [(m1,cmp["mean_dist_px"],"Ã˜ px"),
                                  (m2,cmp["max_dist_px"],"Max px"),
                                  (m3,cmp["homography_err"],"H-Err")]:
                 col.markdown(f'<div class="metric-box"><div class="metric-val">'
@@ -1036,7 +982,7 @@ with tab_track:
                     st.session_state.minimap_pts,st.session_state.ref_track_pts,
                     cmp,st.session_state.moving_pt_color_range)
                 st.image(overlay,use_container_width=True,
-                         caption="Minimap (blau) vs. Referenz (grün)")
+                         caption="Minimap (blau) vs. Referenz (grÃ¼n)")
     st.markdown('</div>',unsafe_allow_html=True)
 
     if st.session_state.moving_pt_history:
@@ -1051,3 +997,5 @@ with tab_track:
         df=pd.DataFrame(st.session_state.moving_pt_history[-100:])
         c2.dataframe(df,use_container_width=True,height=180)
         st.markdown('</div>',unsafe_allow_html=True)
+
+
