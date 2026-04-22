@@ -44,6 +44,21 @@ class WebDAVClient:
             return "/"
         return path.rstrip("/") or "/"
 
+    def _relative_href_name(self, href: str, requested_path: str) -> str:
+        """Extrahiert den direkten Kindnamen relativ zum angefragten Verzeichnis."""
+        href_path = self._normalize_href_path(href)
+        if href_path == requested_path:
+            return ""
+
+        prefix = requested_path.rstrip("/") + "/"
+        if not href_path.startswith(prefix):
+            return ""
+
+        relative = href_path[len(prefix):].strip("/")
+        if not relative or "/" in relative:
+            return ""
+        return relative
+
     # ── Verbindungstest ────────────────────────────────────────────────────────
 
     def test_connection(self) -> tuple[bool, str]:
@@ -96,19 +111,25 @@ class WebDAVClient:
             responses = root_xml.findall("d:response", ns)
             items     = []
             requested_path = self._normalize_href_path(url)
+            seen = set()
 
             for resp in responses:
                 href_el = resp.find("d:href", ns)
                 if href_el is None or not href_el.text:
                     continue
-                href = self._normalize_href_path(href_el.text)
-                if href == requested_path:
-                    continue
-                name = href.rstrip("/").split("/")[-1]
+                raw_href = unquote(href_el.text)
+                name = self._relative_href_name(raw_href, requested_path)
                 if not name:
                     continue
-                is_dir = resp.find(".//d:resourcetype/d:collection", ns) is not None
-                items.append(name + "/" if is_dir else name)
+                is_dir = (
+                    resp.find(".//d:resourcetype/d:collection", ns) is not None
+                    or raw_href.rstrip().endswith("/")
+                )
+                item_name = name + "/" if is_dir else name
+                if item_name in seen:
+                    continue
+                seen.add(item_name)
+                items.append(item_name)
 
             # Ordner zuerst, dann Dateien, alphabetisch
             items.sort(key=lambda x: (not x.endswith("/"), x.lower()))
