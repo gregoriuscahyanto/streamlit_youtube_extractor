@@ -1,51 +1,49 @@
 """
 storage.py
-Verwaltet die Ordnerstruktur auf Nextcloud/bwSyncAndShare:
+Manages the folder structure in Cloudflare R2:
 
-  <root>/
-  ├── captures/
+  <bucket>/
+  ├── [prefix/]captures/
   │   └── 20251104_202910/
   │       ├── 20251104_202910.mp4
   │       └── 20251104_202910.wav
-  └── results/
+  └── [prefix/]results/
       ├── results_20251104_202910.mat
       └── results_20251104_202910.json
 """
-
 from __future__ import annotations
-from pathlib import PurePosixPath
-from webdav_client import WebDAVClient
+from r2_client import R2Client
 
 
 class StorageManager:
-    """Kapselt alle Dateipfad-Logik für die Nextcloud-Struktur."""
 
-    def __init__(self, client: WebDAVClient, root: str = "/"):
+    def __init__(self, client: R2Client, prefix: str = ""):
         self.client = client
-        self.root   = root.rstrip("/")  # z.B. "" oder "/mein_projekt"
+        self.prefix = prefix.strip("/")
 
-    # ── Pfad-Helfer ────────────────────────────────────────────────────────────
+    def _key(self, *parts: str) -> str:
+        segs = ([self.prefix] if self.prefix else []) + [p.strip("/") for p in parts if p.strip("/")]
+        return "/".join(segs)
+
+    # ── Path helpers ───────────────────────────────────────────────────────────
 
     def captures_dir(self, folder: str) -> str:
-        """z.B. /captures/20251104_202910"""
-        return f"{self.root}/captures/{folder}"
+        return self._key("captures", folder)
 
     def video_path(self, folder: str) -> str:
-        """z.B. /captures/20251104_202910/20251104_202910.mp4"""
-        return f"{self.captures_dir(folder)}/{folder}.mp4"
+        return self._key("captures", folder, f"{folder}.mp4")
 
     def audio_path(self, folder: str) -> str:
-        """z.B. /captures/20251104_202910/20251104_202910.wav"""
-        return f"{self.captures_dir(folder)}/{folder}.wav"
+        return self._key("captures", folder, f"{folder}.wav")
 
     def results_dir(self) -> str:
-        return f"{self.root}/results"
+        return self._key("results")
 
     def result_json_path(self, folder: str) -> str:
-        return f"{self.results_dir()}/results_{folder}.json"
+        return self._key("results", f"results_{folder}.json")
 
     def result_mat_path(self, folder: str) -> str:
-        return f"{self.results_dir()}/results_{folder}.mat"
+        return self._key("results", f"results_{folder}.mat")
 
     # ── Upload ─────────────────────────────────────────────────────────────────
 
@@ -53,8 +51,7 @@ class StorageManager:
         return self.client.upload_string(json_str, self.result_json_path(folder))
 
     def upload_result_mat(self, folder: str, mat_bytes: bytes) -> tuple[bool, str]:
-        return self.client.upload_bytes(mat_bytes, self.result_mat_path(folder),
-                                        content_type="application/octet-stream")
+        return self.client.upload_bytes(mat_bytes, self.result_mat_path(folder))
 
     # ── Download ───────────────────────────────────────────────────────────────
 
@@ -70,25 +67,16 @@ class StorageManager:
     def download_result_mat(self, folder: str, local_path: str) -> tuple[bool, str]:
         return self.client.download_file(self.result_mat_path(folder), local_path)
 
-    # ── Ordner auflisten ───────────────────────────────────────────────────────
+    # ── List ───────────────────────────────────────────────────────────────────
 
     def list_capture_folders(self) -> tuple[bool, list[str] | str]:
-        """Gibt alle Unterordner in captures/ zurück."""
-        ok, items = self.client.list_files(f"{self.root}/captures/")
+        ok, items = self.client.list_files(self._key("captures"))
         if not ok:
             return False, items
-        folders = []
-        for item in items:
-            # Nur direkte Unterordner (kein Slash am Ende → keine Dateien)
-            p = item.rstrip("/").split("/")[-1]
-            if p and p != "captures":
-                folders.append(p)
-        return True, sorted(folders, reverse=True)  # neueste zuerst
+        return True, sorted([i.rstrip("/") for i in items if i.endswith("/")], reverse=True)
 
     def list_results(self) -> tuple[bool, list[str] | str]:
-        """Gibt alle Dateien in results/ zurück."""
-        ok, items = self.client.list_files(f"{self.root}/results/")
+        ok, items = self.client.list_files(self._key("results"))
         if not ok:
             return False, items
-        files = [item.split("/")[-1] for item in items if item.split("/")[-1]]
-        return True, sorted(files, reverse=True)
+        return True, sorted([i for i in items if not i.endswith("/")], reverse=True)

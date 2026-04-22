@@ -3,192 +3,115 @@ Backend helpers shared by Streamlit GUI (app.py) and CLI (cli.py).
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from urllib.parse import quote, urlparse
-import socket
 import io
 from datetime import datetime
 import tomllib
-import requests
-from requests.auth import HTTPBasicAuth
 import numpy as np
 import scipy.io as sio
 
-from webdav_client import WebDAVClient
+from r2_client import R2Client
 
 
-def load_webdav_credentials(streamlit_secrets=None, secrets_path: str = ".streamlit/secrets.toml") -> tuple[str, str, str]:
+def load_r2_credentials(
+    streamlit_secrets=None,
+    secrets_path: str = ".streamlit/secrets.toml",
+) -> tuple[str, str, str, str]:
     """
-    Load WebDAV credentials.
+    Returns (account_id, access_key_id, secret_access_key, bucket).
     Priority:
-    1) streamlit_secrets["webdav"] if available
-    2) local secrets.toml fallback
+    1) streamlit_secrets["r2"]
+    2) env vars R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET
+    3) local secrets.toml [r2]
     """
-    sec_url = sec_user = sec_pass = ""
-
     if streamlit_secrets is not None:
         try:
-            sec = streamlit_secrets.get("webdav", {})
-            sec_url = sec.get("url", "") or ""
-            sec_user = sec.get("username", "") or ""
-            sec_pass = sec.get("password", "") or ""
-            if sec_url or sec_user or sec_pass:
-                return sec_url, sec_user, sec_pass
+            sec = streamlit_secrets.get("r2", {})
+            vals = (
+                sec.get("account_id", "") or "",
+                sec.get("access_key_id", "") or "",
+                sec.get("secret_access_key", "") or "",
+                sec.get("bucket", "") or "",
+            )
+            if any(vals):
+                return vals
         except Exception:
             pass
+
+    env_vals = (
+        os.environ.get("R2_ACCOUNT_ID", ""),
+        os.environ.get("R2_ACCESS_KEY_ID", ""),
+        os.environ.get("R2_SECRET_ACCESS_KEY", ""),
+        os.environ.get("R2_BUCKET", ""),
+    )
+    if any(env_vals):
+        return env_vals
 
     try:
         path = Path(secrets_path)
         if path.exists():
             with open(path, "rb") as f:
                 data = tomllib.load(f)
-            sec = data.get("webdav", {})
-            sec_url = sec.get("url", "") or ""
-            sec_user = sec.get("username", "") or ""
-            sec_pass = sec.get("password", "") or ""
+            sec = data.get("r2", {})
+            return (
+                sec.get("account_id", "") or "",
+                sec.get("access_key_id", "") or "",
+                sec.get("secret_access_key", "") or "",
+                sec.get("bucket", "") or "",
+            )
     except Exception:
         pass
 
-    return sec_url, sec_user, sec_pass
+    return ("", "", "", "")
 
 
-def connect_webdav_client(url: str, user: str, password: str) -> tuple[bool, str, WebDAVClient | None]:
-    if not (url and user and password):
-        return False, "Bitte alle Felder ausfullen.", None
-    client = WebDAVClient(url, user, password)
+def connect_r2_client(
+    account_id: str, access_key_id: str, secret_access_key: str, bucket: str
+) -> tuple[bool, str, R2Client | None]:
+    if not all([account_id, access_key_id, secret_access_key, bucket]):
+        return False, "Bitte alle Felder ausfüllen.", None
+    client = R2Client(account_id, access_key_id, secret_access_key, bucket)
     ok, msg = client.test_connection()
     return ok, msg, client if ok else None
 
 
-def list_root_folders(client: WebDAVClient, depth_levels: int = 2) -> list[str]:
-    folders = ["/"]
+def list_root_prefixes(client: R2Client) -> list[str]:
+    """Lists top-level 'folders' (key prefixes) in the bucket."""
+    prefixes = [""]
     ok, items = client.list_files("")
     if ok and isinstance(items, list):
         for item in items:
             if item.endswith("/"):
                 name = item.rstrip("/")
                 if name:
-                    folders.append("/" + name)
-    if depth_levels >= 2:
-        for folder in list(folders[1:]):
-            ok2, sub = client.list_files(folder)
-            if ok2 and isinstance(sub, list):
-                for s in sub:
-                    if s.endswith("/"):
-                        sname = s.rstrip("/")
-                        if sname:
-                            full = folder.rstrip("/") + "/" + sname
-                            if full not in folders:
-                                folders.append(full)
-    return sorted(folders)
+                    prefixes.append(name)
+    return sorted(prefixes)
 
 
-def run_webdav_diagnostic(url: str, user: str, password: str) -> list[tuple[str, str]]:
-    results: list[tuple[str, str]] = []
-    raw_url = (url or "").strip()
-    if not raw_url:
-        return [("Fehler", "WebDAV URL ist leer.")]
-
-    parsed = urlparse(raw_url)
-    host = parsed.hostname
-    if not host:
-        return [("Fehler", f"Ungueltige URL: {raw_url}")]
-
-    results.append(("Host", host))
-
-    # DNS
-    try:
-        dns_info = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-        ips = sorted({entry[4][0] for entry in dns_info})
-        results.append(("DNS", f"OK ({', '.join(ips[:4])})"))
-    except Exception as e:
-        results.append(("DNS", f"Fehler: {e.__class__.__name__}: {e}"))
-        return results
-
-    # TCP
-    try:
-        with socket.create_connection((host, 443), timeout=8):
-            pass
-        results.append(("TCP 443", "OK"))
-    except Exception as e:
-        results.append(("TCP 443", f"Fehler: {e.__class__.__name__}: {e}"))
-        return results
-
-    # PROPFIND
-    probe_url = raw_url.rstrip("/") + "/"
-    if probe_url.lower().endswith("/remote.php/dav/files/") and user:
-        probe_url = probe_url + quote(user.strip(), safe="") + "/"
-    auth = HTTPBasicAuth(user, password) if user and password else None
-    try:
-        r = requests.request(
-            "PROPFIND",
-            probe_url,
-            headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
-            data='<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
-            auth=auth,
-            timeout=(8, 20),
-        )
-        results.append(("PROPFIND", f"HTTP {r.status_code}"))
-        results.append(("Probe URL", probe_url))
-    except Exception as e:
-        results.append(("PROPFIND", f"Fehler: {e.__class__.__name__}: {e}"))
-        results.append(("Probe URL", probe_url))
-
-    return results
-
-
-def collect_webdav_listing_debug(client: WebDAVClient, root: str = "/", capture_folder: str = "") -> list[dict]:
-    root = root or "/"
-    root_rel = root.strip("/")
-    cap_rel = ((root_rel + "/captures") if root_rel else "captures").strip("/")
-    res_rel = ((root_rel + "/results") if root_rel else "results").strip("/")
-    cap_folder_rel = (
-        ((root_rel + "/captures/" + capture_folder) if root_rel else ("captures/" + capture_folder)).strip("/")
-        if capture_folder else ""
-    )
-
-    probes = [
-        ("base", ""),
-        ("slash", "/"),
-        ("root", root),
-        ("root_rel", root_rel),
-        ("captures", cap_rel),
-        ("results", res_rel),
-    ]
-    if cap_folder_rel:
-        probes.append(("capture_folder", cap_folder_rel))
+def collect_r2_listing_debug(
+    client: R2Client, prefix: str = "", capture_folder: str = ""
+) -> list[dict]:
+    pfx = prefix.strip("/")
+    cap = (pfx + "/captures").strip("/") if pfx else "captures"
+    res = (pfx + "/results").strip("/") if pfx else "results"
+    probes = [("root", ""), ("prefix", pfx), ("captures", cap), ("results", res)]
+    if capture_folder:
+        probes.append(("capture_folder", (cap + "/" + capture_folder).strip("/")))
 
     report: list[dict] = []
     for label, remote_dir in probes:
         try:
             ok, items_or_err = client.list_files(remote_dir)
             if ok and isinstance(items_or_err, list):
-                report.append({
-                    "probe": label,
-                    "remote_dir": remote_dir,
-                    "ok": True,
-                    "count": len(items_or_err),
-                    "items": items_or_err[:100],
-                    "error": "",
-                })
+                report.append({"probe": label, "prefix": remote_dir, "ok": True,
+                               "count": len(items_or_err), "items": items_or_err[:100], "error": ""})
             else:
-                report.append({
-                    "probe": label,
-                    "remote_dir": remote_dir,
-                    "ok": False,
-                    "count": 0,
-                    "items": [],
-                    "error": str(items_or_err),
-                })
+                report.append({"probe": label, "prefix": remote_dir, "ok": False,
+                               "count": 0, "items": [], "error": str(items_or_err)})
         except Exception as e:
-            report.append({
-                "probe": label,
-                "remote_dir": remote_dir,
-                "ok": False,
-                "count": 0,
-                "items": [],
-                "error": f"{e.__class__.__name__}: {e}",
-            })
+            report.append({"probe": label, "prefix": remote_dir, "ok": False,
+                           "count": 0, "items": [], "error": f"{e.__class__.__name__}: {e}"})
     return report
 
 
@@ -204,7 +127,8 @@ def build_result_payload(
         "roi_table": [
             {
                 "name_roi": r.get("name", "_"),
-                "roi": [float(r.get("x", 0)), float(r.get("y", 0)), float(r.get("w", 0)), float(r.get("h", 0))],
+                "roi": [float(r.get("x", 0)), float(r.get("y", 0)),
+                        float(r.get("w", 0)), float(r.get("h", 0))],
                 "fmt": r.get("fmt", "any"),
                 "pattern": r.get("pattern", ""),
                 "max_scale": float(r.get("max_scale", 1.2)),
@@ -269,10 +193,8 @@ def config_from_json_payload(data: dict, vid_duration: float = 0.0) -> dict:
         rois.append(
             dict(
                 name=r.get("name_roi", "_"),
-                x=float(pos[0]),
-                y=float(pos[1]),
-                w=float(pos[2]),
-                h=float(pos[3]),
+                x=float(pos[0]), y=float(pos[1]),
+                w=float(pos[2]), h=float(pos[3]),
                 fmt=r.get("fmt", "any"),
                 pattern=r.get("pattern", ""),
                 max_scale=float(r.get("max_scale", 1.2)),
@@ -315,18 +237,11 @@ def config_from_mat_file(mat_path: str, vid_duration: float = 0.0) -> dict:
         for n, r, f in zip(names, rois_r, fmts):
             pos = np.atleast_1d(r).astype(float)
             if len(pos) == 4:
-                rois.append(
-                    dict(
-                        name=str(n),
-                        x=float(pos[0]),
-                        y=float(pos[1]),
-                        w=float(pos[2]),
-                        h=float(pos[3]),
-                        fmt=str(f),
-                        pattern="",
-                        max_scale=1.2,
-                    )
-                )
+                rois.append(dict(
+                    name=str(n), x=float(pos[0]), y=float(pos[1]),
+                    w=float(pos[2]), h=float(pos[3]),
+                    fmt=str(f), pattern="", max_scale=1.2,
+                ))
         out["rois"] = rois
     trk = getattr(ocr, "trkCalSlim", None)
     if trk:
