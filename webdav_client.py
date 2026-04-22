@@ -63,6 +63,33 @@ class WebDAVClient:
             kwargs["timeout"] = self._timeout
         return self.session.request(method, url, **kwargs)
 
+    def _connection_probe_payload(self) -> str:
+        return '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+
+    def _candidate_base_urls(self) -> list[str]:
+        """
+        Erzeuge moegliche URL-Varianten fuer den Fall, dass Server je nach
+        Pfadkodierung unterschiedlich antwortet.
+        """
+        candidates: list[str] = []
+
+        def _add(u: str | None):
+            if not u:
+                return
+            url = u.rstrip("/") + "/"
+            if url not in candidates:
+                candidates.append(url)
+
+        _add(self.base_url)
+
+        # Variante mit dekodiertem Pfad (z. B. %40 -> @)
+        _add(unquote(self.base_url))
+
+        # Variante mit kodiertem Pfad (z. B. @ -> %40)
+        _add(quote(unquote(self.base_url), safe=":/._-"))
+
+        return candidates
+
     def _build_url(self, remote_path: str) -> str:
         """
         Haengt remote_path an base_url.
@@ -83,19 +110,29 @@ class WebDAVClient:
     def test_connection(self) -> tuple[bool, str]:
         """Verbindungstest per PROPFIND (entspricht typischer Nextcloud-WebDAV-Pruefung)."""
         try:
-            r = self._request(
-                "PROPFIND",
-                self.base_url,
-                headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
-                data='<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
-            )
-            if r.status_code in (200, 207):
-                return True, ""
-            if r.status_code == 401:
-                return False, "Authentifizierung fehlgeschlagen (401)."
-            if r.status_code == 403:
-                return False, "Zugriff verweigert (403)."
-            return False, f"HTTP {r.status_code}"
+            last_status = None
+            saw_403 = False
+
+            for url in self._candidate_base_urls():
+                r = self._request(
+                    "PROPFIND",
+                    url,
+                    headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+                    data=self._connection_probe_payload(),
+                )
+                last_status = r.status_code
+                if r.status_code in (200, 207):
+                    self.base_url = url
+                    return True, ""
+                if r.status_code == 401:
+                    return False, "Authentifizierung fehlgeschlagen (401)."
+                if r.status_code == 403:
+                    saw_403 = True
+                    continue
+
+            if saw_403:
+                return False, "Zugriff verweigert (403). Bitte WebDAV-URL inkl. Benutzerpfad pruefen."
+            return False, f"HTTP {last_status}" if last_status else "Unbekannter Fehler."
         except requests.exceptions.ConnectionError as e:
             return False, f"Verbindungsfehler: {e}"
         except requests.exceptions.Timeout:
