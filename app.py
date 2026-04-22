@@ -190,6 +190,29 @@ def _join_webdav_path(*parts: str) -> str:
     clean_parts = [part.strip("/") for part in parts if part and part.strip("/")]
     return "/" + "/".join(clean_parts) if clean_parts else "/"
 
+def _root_probe_candidates() -> list[str]:
+    """
+    Kandidaten fuer Hauptordner, falls Root-Listing (/) serverseitig gesperrt ist.
+    Kann optional ueber st.secrets.webdav.root_candidates erweitert werden.
+    """
+    default = ["streamlit_youtube_extractor_storage"]
+    try:
+        cfg = st.secrets.get("webdav", {}).get("root_candidates", [])
+    except Exception:
+        cfg = []
+
+    if isinstance(cfg, str):
+        cfg = [p.strip() for p in cfg.split(",") if p.strip()]
+    if not isinstance(cfg, list):
+        cfg = []
+
+    out = []
+    for name in default + [str(x).strip() for x in cfg if str(x).strip()]:
+        clean = name.strip("/").strip()
+        if clean and clean not in out:
+            out.append(clean)
+    return out
+
 def _build_root_folder_options(client: WebDAVClient | None = None) -> list[str]:
     """Ermittelt moegliche Hauptordner bis 2 Ebenen tief, inkl. Root '/'."""
     if client is None:
@@ -199,26 +222,33 @@ def _build_root_folder_options(client: WebDAVClient | None = None) -> list[str]:
 
     folders = ["/"]
     ok, items = client.list_files("")
-    if not ok or not isinstance(items, list):
-        return folders
-
-    level_one = []
-    for item in items:
-        if item.endswith("/"):
-            folder = _join_webdav_path(item)
-            if folder not in folders:
-                folders.append(folder)
-                level_one.append(folder)
-
-    for folder in level_one:
-        ok2, sub = client.list_files(folder.strip("/"))
-        if not ok2 or not isinstance(sub, list):
-            continue
-        for item in sub:
+    if ok and isinstance(items, list):
+        level_one = []
+        for item in items:
             if item.endswith("/"):
-                subfolder = _join_webdav_path(folder, item)
-                if subfolder not in folders:
-                    folders.append(subfolder)
+                folder = _join_webdav_path(item)
+                if folder not in folders:
+                    folders.append(folder)
+                    level_one.append(folder)
+
+        for folder in level_one:
+            ok2, sub = client.list_files(folder.strip("/"))
+            if not ok2 or not isinstance(sub, list):
+                continue
+            for item in sub:
+                if item.endswith("/"):
+                    subfolder = _join_webdav_path(folder, item)
+                    if subfolder not in folders:
+                        folders.append(subfolder)
+
+    # Fallback: Root kann 403 liefern, direkter Unterordnerzugriff aber funktionieren.
+    if len(folders) == 1:
+        for cand in _root_probe_candidates():
+            ok_c, _items_c = client.list_files(cand)
+            if ok_c:
+                p = _join_webdav_path(cand)
+                if p not in folders:
+                    folders.append(p)
 
     return sorted(folders, key=lambda value: (value != "/", value.lower()))
 
@@ -451,15 +481,16 @@ with tab_cloud:
             if wdav_url and wdav_user and wdav_pass:
                 with st.spinner("Verbinde ..."):
                     _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
-                    _ok, _msg = _client.test_connection()
-                if _ok:
+                    _ok_conn, _msg_conn = _client.test_connection()
+                    _ok_root, _root_items = _client.list_files("")
+                    _opts = _build_root_folder_options(_client)
+                    _real = [o for o in _opts if o != "/"]
+
+                if _ok_conn and (_ok_root or bool(_real)):
                     # ERST client und connected setzen, DANN Ordner laden
                     st.session_state.webdav_connected = True
                     st.session_state.webdav_client    = _client
-                    _opts = _build_root_folder_options(_client)
                     st.session_state.webdav_root_options = _opts
-                    # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
-                    _real = [o for o in _opts if o != "/"]
                     if len(_real) == 1:
                         st.session_state.webdav_root = _real[0]
                         st.session_state.fb_path  = _real[0]
@@ -468,19 +499,22 @@ with tab_cloud:
                     else:
                         st.session_state.fb_path  = "/"
                         st.session_state.fb_items = webdav_list("/")
-                        if _real:
-                            set_status(f"Verbunden. {len(_real)} Ordner gefunden.", "ok")
-                        else:
-                            dbg = getattr(_client, "last_list_debug", "")
-                            set_status(
-                                "Verbunden. 0 ordner gefunden.\n"
-                                f"Basis: {_client.base_url}\n"
-                                f"Root-Debug: {dbg}",
-                                "warn",
-                            )
+                        set_status(f"Verbunden. {len(_real)} Ordner gefunden.", "ok")
                 else:
                     st.session_state.webdav_connected = False
-                    set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
+                    st.session_state.webdav_client = None
+                    st.session_state.webdav_root_options = []
+                    dbg = getattr(_client, "last_list_debug", "")
+                    if not _ok_root and not _real:
+                        set_status(
+                            "Verbindung fehlgeschlagen (Root-Zugriff).\n"
+                            f"Basis: {_client.base_url}\n"
+                            f"Root-Debug: {dbg}\n"
+                            "Pruefe Benutzername + App-Passwort in Streamlit/Secrets.",
+                            "warn",
+                        )
+                    else:
+                        set_status(f"Verbindung fehlgeschlagen: {_msg_conn}", "warn")
                 st.rerun()
             else:
                 set_status("Bitte alle Felder ausfullen.", "warn"); st.rerun()
