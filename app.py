@@ -12,14 +12,9 @@ import json
 import tempfile
 import io
 import scipy.io as sio
-import tomllib
-import socket
-import requests
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
-from urllib.parse import quote, urlparse
-from requests.auth import HTTPBasicAuth
 
 from webdav_client import WebDAVClient
 from storage import StorageManager
@@ -120,51 +115,22 @@ FMT_OPTIONS = [
 ]
 
 # ── Session-State ──────────────────────────────────────────────────────────────
-def _load_webdav_secrets() -> tuple[str, str, str]:
-    """
-    Einheitliches Verhalten:
-    1) Bevorzugt st.secrets (Cloud + lokal bei vorhandenem secrets.toml).
-    2) Fallback auf lokale .streamlit/secrets.toml nur wenn st.secrets nicht verfuegbar ist.
-    """
-    sec_url = sec_user = sec_pass = ""
-
-    # Primary: Streamlit-Secrets
-    try:
-        sec = st.secrets.get("webdav", {})
-        sec_url = sec.get("url", "")
-        sec_user = sec.get("username", "")
-        sec_pass = sec.get("password", "")
-        return sec_url, sec_user, sec_pass
-    except Exception:
-        pass
-
-    # Fallback: lokale Datei
-    try:
-        secrets_path = Path(".streamlit") / "secrets.toml"
-        if secrets_path.exists():
-            with open(secrets_path, "rb") as f:
-                data = tomllib.load(f)
-            sec = data.get("webdav", {})
-            sec_url = sec.get("url", "")
-            sec_user = sec.get("username", "")
-            sec_pass = sec.get("password", "")
-    except Exception:
-        pass
-
-    return sec_url, sec_user, sec_pass
-
-
 def init_state():
     # Secrets sofort laden bevor session_state initialisiert wird
-    _sec_url, _sec_user, _sec_pass = _load_webdav_secrets()
+    _sec_url = _sec_user = _sec_pass = ""
+    try:
+        _sec = st.secrets.get("webdav", {})
+        _sec_url  = _sec.get("url", "")
+        _sec_user = _sec.get("username", "")
+        _sec_pass = _sec.get("password", "")
+    except Exception:
+        pass
 
     defs = dict(
         # WebDAV
         webdav_url=_sec_url or "https://bwsyncandshare.kit.edu/remote.php/dav/files/",
         webdav_user=_sec_user, webdav_pass=_sec_pass,
         webdav_connected=False, webdav_client=None,
-        webdav_auto_connect_tried=False,
-        webdav_diag=[],
         webdav_root="/",
         webdav_root_options=[],
         # Datei-Browser
@@ -351,133 +317,6 @@ def get_root_folders():
     return sorted(folders)
 
 
-def run_webdav_diagnostic(url: str, user: str, password: str) -> list[tuple[str, str]]:
-    results: list[tuple[str, str]] = []
-    raw_url = (url or "").strip()
-    if not raw_url:
-        return [("Fehler", "WebDAV URL ist leer.")]
-
-    parsed = urlparse(raw_url)
-    host = parsed.hostname
-    if not host:
-        return [("Fehler", f"Ungueltige URL: {raw_url}")]
-
-    results.append(("Host", host))
-
-    # 1) DNS
-    try:
-        dns_info = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-        ips = sorted({entry[4][0] for entry in dns_info})
-        results.append(("DNS", f"OK ({', '.join(ips[:4])})"))
-    except Exception as e:
-        results.append(("DNS", f"Fehler: {e.__class__.__name__}: {e}"))
-        return results
-
-    # 2) TCP Connect (TLS-Port)
-    try:
-        with socket.create_connection((host, 443), timeout=8):
-            pass
-        results.append(("TCP 443", "OK"))
-    except Exception as e:
-        results.append(("TCP 443", f"Fehler: {e.__class__.__name__}: {e}"))
-        return results
-
-    # 3) HTTPS/WebDAV Probe
-    probe_url = raw_url.rstrip("/") + "/"
-    if probe_url.lower().endswith("/remote.php/dav/files/") and user:
-        probe_url = probe_url + quote(user.strip(), safe="") + "/"
-    auth = HTTPBasicAuth(user, password) if user and password else None
-    try:
-        r = requests.request(
-            "PROPFIND",
-            probe_url,
-            headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
-            data='<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
-            auth=auth,
-            timeout=(8, 20),
-        )
-        results.append(("PROPFIND", f"HTTP {r.status_code}"))
-        results.append(("Probe URL", probe_url))
-    except Exception as e:
-        results.append(("PROPFIND", f"Fehler: {e.__class__.__name__}: {e}"))
-        results.append(("Probe URL", probe_url))
-
-    return results
-
-
-def connect_webdav(url: str, user: str, password: str) -> tuple[bool, str]:
-    if not (url and user and password):
-        return False, "Bitte alle Felder ausfullen."
-
-    client = WebDAVClient(url, user, password)
-    ok, msg = client.test_connection()
-    if not ok:
-        st.session_state.webdav_connected = False
-        st.session_state.webdav_client = None
-        return False, msg
-
-    # ERST client und connected setzen, DANN Ordner laden
-    st.session_state.webdav_connected = True
-    st.session_state.webdav_client = client
-
-    # Ordner direkt mit dem neuen Client laden
-    ok_r, items_r = client.list_files("")
-    opts = ["/"]
-    if ok_r and isinstance(items_r, list):
-        for item in items_r:
-            if item.endswith("/"):
-                name = item.rstrip("/")
-                if name:
-                    opts.append("/" + name)
-        # Ebene 2
-        for folder in list(opts[1:]):
-            ok2, sub = client.list_files(folder)
-            if ok2 and isinstance(sub, list):
-                for entry in sub:
-                    if entry.endswith("/"):
-                        sub_name = entry.rstrip("/")
-                        if sub_name:
-                            full = folder.rstrip("/") + "/" + sub_name
-                            if full not in opts:
-                                opts.append(full)
-    opts = sorted(opts)
-    st.session_state.webdav_root_options = opts
-
-    # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
-    real = [o for o in opts if o != "/"]
-    if len(real) == 1:
-        st.session_state.webdav_root = real[0]
-        st.session_state.fb_path = real[0]
-        st.session_state.fb_items = webdav_list(real[0])
-        return True, f"Verbunden. Hauptordner automatisch gesetzt: {real[0]}"
-
-    st.session_state.fb_path = "/"
-    st.session_state.fb_items = webdav_list("")
-    return True, f"Verbunden. {len(opts)} Ordner gefunden."
-
-
-def try_auto_connect_webdav_once() -> None:
-    if st.session_state.webdav_connected:
-        return
-    if st.session_state.webdav_auto_connect_tried:
-        return
-
-    st.session_state.webdav_auto_connect_tried = True
-    wdav_url = (st.session_state.webdav_url or "").strip()
-    wdav_user = (st.session_state.webdav_user or "").strip()
-    wdav_pass = st.session_state.webdav_pass or ""
-    if not (wdav_url and wdav_user and wdav_pass):
-        return
-
-    ok, msg = connect_webdav(wdav_url, wdav_user, wdav_pass)
-    if ok:
-        set_status("Automatisch verbunden (secrets.toml).", "ok")
-        st.rerun()
-    else:
-        # Nur Info, damit die App auch offline ohne blockierenden Warnstatus startet.
-        set_status(f"Auto-Connect nicht moeglich: {msg}", "info")
-
-
 def _load_video_from_webdav(remote_path):
     client = st.session_state.webdav_client
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(remote_path).suffix)
@@ -540,8 +379,6 @@ def _load_ref_from_webdav(remote_path):
         set_status("Referenz-Track geladen ✓","ok")
     else: set_status(f"Ref-Download: {msg}","warn")
 
-try_auto_connect_webdav_once()
-
 # ── Header + Status ───────────────────────────────────────────────────────────
 st.markdown("""
 <div class="app-header">
@@ -592,24 +429,33 @@ with tab_cloud:
                                    help="Nextcloud: Einstellungen > Sicherheit > App-Passwoerter")
 
         if st.button("🔌 Verbinden", type="primary", use_container_width=True):
-            with st.spinner("Verbinde ..."):
-                _ok, _msg = connect_webdav(wdav_url, wdav_user, wdav_pass)
-            if _ok:
-                set_status(_msg, "ok")
+            if wdav_url and wdav_user and wdav_pass:
+                with st.spinner("Verbinde ..."):
+                    _client = WebDAVClient(wdav_url, wdav_user, wdav_pass)
+                    _ok, _msg = _client.test_connection()
+                if _ok:
+                    st.session_state.webdav_connected = True
+                    st.session_state.webdav_client    = _client
+                    # Ordner laden
+                    _opts = get_root_folders()
+                    st.session_state.webdav_root_options = _opts
+                    # Wenn es nur "/" und einen weiteren Ordner gibt -> auto-select
+                    _real = [o for o in _opts if o != "/"]
+                    if len(_real) == 1:
+                        st.session_state.webdav_root = _real[0]
+                        st.session_state.fb_path  = _real[0]
+                        st.session_state.fb_items = webdav_list(_real[0])
+                        set_status(f"Verbunden. Hauptordner automatisch gesetzt: {_real[0]}", "ok")
+                    else:
+                        st.session_state.fb_path  = "/"
+                        st.session_state.fb_items = webdav_list("")
+                        set_status(f"Verbunden. {len(_opts)} Ordner gefunden.", "ok")
+                else:
+                    st.session_state.webdav_connected = False
+                    set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
+                st.rerun()
             else:
-                set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
-            st.rerun()
-
-        diag_a, diag_b = st.columns(2)
-        if diag_a.button("Diagnose starten", use_container_width=True, key="diag_webdav"):
-            with st.spinner("Diagnose laeuft ..."):
-                st.session_state.webdav_diag = run_webdav_diagnostic(wdav_url, wdav_user, wdav_pass)
-        if diag_b.button("Diagnose leeren", use_container_width=True, key="diag_webdav_clear"):
-            st.session_state.webdav_diag = []
-
-        if st.session_state.webdav_diag:
-            diag_text = "\n".join([f"{k}: {v}" for k, v in st.session_state.webdav_diag])
-            st.code(diag_text, language="text")
+                set_status("Bitte alle Felder ausfullen.", "warn"); st.rerun()
 
         if st.session_state.webdav_connected:
             st.markdown('<div style="display:flex;align-items:center;margin-top:.4rem;">' +
