@@ -1062,12 +1062,28 @@ def _get_mat_summary_from_r2(remote_key: str):
         if ok_list and isinstance(items, list):
             files = [n for n in items if not n.endswith("/")]
             lower_files = [n.lower() for n in files]
-            summary["video_file_exists"] = any(
+            has_full_or_proxy_video = any(
                 n.endswith((".mp4", ".mov", ".avi", ".mkv")) for n in lower_files
             )
-            summary["audio_file_exists"] = any(
-                n.endswith((".wav", ".mp3", ".m4a", ".aac")) for n in lower_files
+            has_audio_file = any(
+                n.endswith((".wav", ".mp3", ".m4a", ".aac", ".flac")) for n in lower_files
             )
+
+            # Reduced cloud media support:
+            # - video equivalent can be frame-pack in captures/<folder>/frames_1fps/
+            # - audio equivalent can be audio proxy file
+            has_framepack = False
+            if "frames_1fps/" in items:
+                ok_fp, fp_items = st.session_state.r2_client.list_files(f"{cap_dir}/frames_1fps")
+                if ok_fp and isinstance(fp_items, list):
+                    has_framepack = any(
+                        x.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) for x in fp_items
+                    )
+
+            has_audio_proxy = any(n == AUDIO_PROXY_NAME.lower() for n in lower_files)
+
+            summary["video_file_exists"] = bool(has_full_or_proxy_video or has_framepack)
+            summary["audio_file_exists"] = bool(has_audio_file or has_audio_proxy)
     return summary
 
 
