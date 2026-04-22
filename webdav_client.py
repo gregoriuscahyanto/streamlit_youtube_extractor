@@ -8,7 +8,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from pathlib import PurePosixPath
 import xml.etree.ElementTree as ET
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 
 class WebDAVClient:
@@ -35,6 +35,14 @@ class WebDAVClient:
         last = clean.split("/")[-1]
         is_file = "." in last and not last.startswith(".")
         return self.base_url + clean + ("" if is_file else "/")
+
+    def _normalize_href_path(self, href: str) -> str:
+        """Normalisiert HREF/URL auf einen vergleichbaren Pfad ohne abschliessenden Slash."""
+        parsed = urlsplit(href)
+        path = unquote(parsed.path or href).strip()
+        if not path:
+            return "/"
+        return path.rstrip("/") or "/"
 
     # ── Verbindungstest ────────────────────────────────────────────────────────
 
@@ -87,14 +95,16 @@ class WebDAVClient:
             ns        = {"d": "DAV:"}
             responses = root_xml.findall("d:response", ns)
             items     = []
+            requested_path = self._normalize_href_path(url)
 
-            # Ersten Eintrag ueberspringen = das Verzeichnis selbst
-            for resp in responses[1:]:
+            for resp in responses:
                 href_el = resp.find("d:href", ns)
                 if href_el is None or not href_el.text:
                     continue
-                href   = unquote(href_el.text)          # %40 -> @, %20 -> Leerzeichen
-                name   = href.rstrip("/").split("/")[-1]
+                href = self._normalize_href_path(href_el.text)
+                if href == requested_path:
+                    continue
+                name = href.rstrip("/").split("/")[-1]
                 if not name:
                     continue
                 is_dir = resp.find(".//d:resourcetype/d:collection", ns) is not None

@@ -468,7 +468,7 @@ with tab_cloud:
                     else:
                         st.session_state.fb_path  = "/"
                         st.session_state.fb_items = webdav_list("/")
-                        set_status(f"Verbunden. {len(_opts)} Ordner gefunden.", "ok")
+                        set_status(f"Verbunden. {len(_real)} Ordner gefunden.", "ok")
                 else:
                     st.session_state.webdav_connected = False
                     set_status(f"Verbindung fehlgeschlagen: {_msg}", "warn")
