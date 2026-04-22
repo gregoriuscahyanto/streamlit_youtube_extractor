@@ -116,10 +116,20 @@ FMT_OPTIONS = [
 
 # ── Session-State ──────────────────────────────────────────────────────────────
 def init_state():
+    # Secrets sofort laden bevor session_state initialisiert wird
+    _sec_url = _sec_user = _sec_pass = ""
+    try:
+        _sec = st.secrets.get("webdav", {})
+        _sec_url  = _sec.get("url", "")
+        _sec_user = _sec.get("username", "")
+        _sec_pass = _sec.get("password", "")
+    except Exception:
+        pass
+
     defs = dict(
         # WebDAV
-        webdav_url="https://bwsyncandshare.kit.edu/remote.php/dav/files/",
-        webdav_user="", webdav_pass="",
+        webdav_url=_sec_url or "https://bwsyncandshare.kit.edu/remote.php/dav/files/",
+        webdav_user=_sec_user, webdav_pass=_sec_pass,
         webdav_connected=False, webdav_client=None,
         webdav_root="/",
         webdav_root_options=[],
@@ -281,22 +291,19 @@ def webdav_list(path):
     return result
 
 def get_root_folders():
-    """
-    Listet Ordner für Hauptordner-Dropdown.
-    Gibt "/" plus alle Unterordner der ersten Ebene zurück,
-    damit der Nutzer z.B. /streamlit_youtube_extractor_storage waehlen kann.
-    """
+    """Listet Ordner fuer Hauptordner-Dropdown, 2 Ebenen tief."""
     if not st.session_state.webdav_connected: return ["/"]
     client = st.session_state.webdav_client
-    ok, items = client.list_files("/")
-    if not ok or not isinstance(items, list): return ["/"]
+    # "" = Benutzer-Root (base_url)
+    ok, items = client.list_files("")
     folders = ["/"]
-    for item in items:
-        if item.endswith("/"):
-            name = item.rstrip("/")
-            if name:
-                folders.append("/" + name)
-    # Auch eine Ebene tiefer schauen (für verschachtelte Projekte)
+    if ok and isinstance(items, list):
+        for item in items:
+            if item.endswith("/"):
+                name = item.rstrip("/")
+                if name:
+                    folders.append("/" + name)
+    # Ebene 2
     for folder in list(folders[1:]):
         ok2, sub = client.list_files(folder)
         if ok2 and isinstance(sub, list):
@@ -308,6 +315,7 @@ def get_root_folders():
                         if full not in folders:
                             folders.append(full)
     return sorted(folders)
+
 
 def _load_video_from_webdav(remote_path):
     client = st.session_state.webdav_client
@@ -398,18 +406,6 @@ tab_cloud, tab_roi, tab_track = st.tabs(
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_cloud:
 
-    # Secrets VOR dem Rendern laden (damit Felder befüllt sind)
-    try:
-        sec = st.secrets.get("webdav", {})
-        if sec.get("url")      and not st.session_state.webdav_url:
-            st.session_state.webdav_url  = sec["url"]
-        if sec.get("username") and not st.session_state.webdav_user:
-            st.session_state.webdav_user = sec["username"]
-        if sec.get("password") and not st.session_state.webdav_pass:
-            st.session_state.webdav_pass = sec["password"]
-    except Exception:
-        pass
-
     col_l, col_r = st.columns([1, 2], gap="large")
 
     # ── Linke Spalte ───────────────────────────────────────────────────────────
@@ -420,14 +416,15 @@ with tab_cloud:
         st.markdown('<div class="section-title">Verbindung · bwSyncAndShare / Nextcloud</div>',
                     unsafe_allow_html=True)
 
+        # key= an session_state gebunden -> Felder sind immer befuellt
         wdav_url  = st.text_input("WebDAV URL",
-                                   value=st.session_state.webdav_url,
+                                   key="webdav_url",
                                    help="Vollstaendige URL inkl. UUID-Ordner, z.B. .../dav/files/UUID%40bwidm.../")
         wdav_user = st.text_input("Benutzername",
-                                   value=st.session_state.webdav_user,
+                                   key="webdav_user",
                                    placeholder="UUID@bwidm.scc.kit.edu")
         wdav_pass = st.text_input("App-Passwort",
-                                   value=st.session_state.webdav_pass,
+                                   key="webdav_pass",
                                    type="password",
                                    help="Nextcloud: Einstellungen > Sicherheit > App-Passwoerter")
 
