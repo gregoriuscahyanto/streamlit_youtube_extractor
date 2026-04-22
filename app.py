@@ -11,12 +11,18 @@ import numpy as np
 import json
 import tempfile
 import io
+import time
+import subprocess
+import shutil
 import scipy.io as sio
+from scipy import signal
+from scipy.io import wavfile
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
 
+from local_storage import LocalStorageAdapter
 from backend import (
     build_result_payload,
     build_mat_struct as backend_build_mat_struct,
@@ -98,7 +104,7 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 
 .conn-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
 .conn-dot.ok  { background:#3ddc84; box-shadow:0 0 6px #3ddc8466; }
-.conn-dot.off { background:#4a5060; }
+.conn-dot.off { background:#ff5c5c; box-shadow:0 0 6px #ff5c5c66; }
 
 .roi-tag { background:#1e2535; color:#4a90a4; padding:1px 6px; border-radius:3px;
   font-size:.65rem; font-family:'JetBrains Mono',monospace; white-space:nowrap; }
@@ -162,6 +168,14 @@ MAT_OVERVIEW_COLCFG = {
     "fehler": st.column_config.TextColumn("Fehler", width="large"),
 }
 MAT_TABLE_HEIGHT = 430
+VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv")
+AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".aac", ".flac")
+FRAMEPACK_JPEG_QUALITY = 15
+FRAMEPACK_MAX_WIDTH = 0  # keep original resolution; 0 disables resize
+AUDIO_PROXY_ENABLED = True
+AUDIO_LOWPASS_HZ = 1000
+AUDIO_TARGET_SR = 4000
+AUDIO_PROXY_NAME = "audio_proxy_1k.wav"
 
 # â”€â”€ Session-State â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def init_state():
@@ -183,8 +197,25 @@ def init_state():
         local_base_path=str(Path.cwd()),
         local_base_path_input=str(Path.cwd()),
         local_connected=False,
+        local_client=None,
         local_root="",
         local_root_options=[],
+        sync_overview_rows=[],
+        sync_queue_rows=[],
+        sync_status_map={},
+        sync_running=False,
+        sync_stop_requested=False,
+        sync_run_queue=[],
+        sync_run_idx=0,
+        sync_run_total=0,
+        sync_run_started_ts=0.0,
+        sync_run_selected_folders=[],
+        sync_selected_folders=[],
+        sync_refresh_running=False,
+        sync_refresh_idx=0,
+        sync_refresh_total=0,
+        sync_refresh_folders=[],
+        sync_refresh_rows=[],
         mat_files=[],
         mat_scan_prefix=None,
         mat_selected_key="",
@@ -203,6 +234,10 @@ def init_state():
         capture_folder="",
         # Video / ROI
         video_path=None, video_name="",
+        media_source="none",
+        framepack_remote_prefix="",
+        framepack_files=[],
+        framepack_cache={},
         vid_duration=0.0, vid_fps=25.0, vid_width=0, vid_height=0,
         t_start=0.0, t_end=0.0, t_current=0.0,
         rois=[], selected_roi=None,
@@ -286,6 +321,430 @@ def _pick_local_folder_dialog(initial_dir: str = "") -> tuple[bool, str]:
         return False, ""
     except Exception as e:
         return False, str(e)
+
+
+def _get_cloud_capture_folders() -> list[str]:
+    if not st.session_state.r2_connected or st.session_state.r2_client is None:
+        return []
+    pfx = st.session_state.r2_prefix.strip("/")
+    cap_dir = f"{pfx}/captures" if pfx else "captures"
+    ok, items = st.session_state.r2_client.list_files(cap_dir)
+    if not ok or not isinstance(items, list):
+        return []
+    out = [i.rstrip("/") for i in items if i.endswith("/")]
+    out.sort()
+    return out
+
+
+def _get_local_capture_folders() -> list[str]:
+    client = st.session_state.local_client
+    if not st.session_state.local_connected or client is None:
+        return []
+    ok, items = client.list_files("captures")
+    if not ok or not isinstance(items, list):
+        return []
+    out = [i.rstrip("/") for i in items if i.endswith("/")]
+    out.sort()
+    return out
+
+
+def _has_local_fullfps_video(folder: str) -> tuple[bool, int]:
+    client = st.session_state.local_client
+    if not st.session_state.local_connected or client is None:
+        return False, 0
+    ok, items = client.list_files(f"captures/{folder}")
+    if not ok or not isinstance(items, list):
+        return False, 0
+    vids = [
+        n for n in items
+        if (not n.endswith("/")) and n.lower().endswith((".mp4", ".mov", ".avi", ".mkv"))
+    ]
+    fullfps = [n for n in vids if "_1fps" not in n.lower()]
+    return len(fullfps) > 0, len(fullfps)
+
+
+def _has_cloud_proxy_video(folder: str) -> tuple[bool, int]:
+    if not st.session_state.r2_connected or st.session_state.r2_client is None:
+        return False, 0
+    pfx = st.session_state.r2_prefix.strip("/")
+    remote = f"{pfx}/captures/{folder}" if pfx else f"captures/{folder}"
+    ok, items = st.session_state.r2_client.list_files(remote)
+    if not ok or not isinstance(items, list):
+        return False, 0
+    vids = [
+        n for n in items
+        if (not n.endswith("/")) and n.lower().endswith((".mp4", ".mov", ".avi", ".mkv"))
+    ]
+    proxy = [n for n in vids if "_1fps" in n.lower()]
+
+    # Frame-pack support: captures/<folder>/frames_1fps/{000001.jpg, ..., index.json}
+    frame_count = 0
+    if "frames_1fps/" in items:
+        ok_fp, fp_items = st.session_state.r2_client.list_files(f"{remote}/frames_1fps")
+        if ok_fp and isinstance(fp_items, list):
+            frame_count = len([x for x in fp_items if x.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))])
+
+    total_count = len(proxy) + frame_count
+    return total_count > 0, total_count
+
+
+def _build_sync_overview_rows() -> tuple[list[dict], list[dict]]:
+    local_folders = sorted(set(_get_local_capture_folders()))
+
+    overview_rows: list[dict] = []
+    queue_rows: list[dict] = []
+
+    for folder in local_folders:
+        local_ok, _local_count = _has_local_fullfps_video(folder)
+        if not local_ok:
+            continue
+        cloud_ok, cloud_count = _has_cloud_proxy_video(folder)
+        state = "OK" if cloud_ok else "Queue"
+        row = {
+            "auswaehlen": False,
+            "capture_folder": folder,
+            "reduziert_in_cloud": "Ja" if cloud_ok else "Nein",
+            "status": state,
+            "cloud_framepack_anzahl": int(cloud_count),  # internal/debug
+        }
+        overview_rows.append(row)
+        if not cloud_ok:
+            queue_rows.append(row)
+
+    return overview_rows, queue_rows
+
+
+def _local_capture_folder_path(folder: str) -> Path | None:
+    if not st.session_state.local_connected:
+        return None
+    try:
+        base = Path(st.session_state.local_base_path).expanduser().resolve()
+        p = (base / "captures" / folder).resolve()
+        if base != p and base not in p.parents:
+            return None
+        return p
+    except Exception:
+        return None
+
+
+def _find_local_fullfps_video(folder: str) -> Path | None:
+    cap_dir = _local_capture_folder_path(folder)
+    if cap_dir is None or (not cap_dir.exists()) or (not cap_dir.is_dir()):
+        return None
+    candidates_by_ext: dict[str, list[Path]] = {".avi": [], ".mp4": [], ".mov": [], ".mkv": []}
+    for p in cap_dir.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in VIDEO_EXTS:
+            continue
+        if "_1fps" in p.name.lower():
+            continue
+        candidates_by_ext[p.suffix.lower()].append(p)
+    for ext in [".avi", ".mp4", ".mov", ".mkv"]:
+        cands = candidates_by_ext.get(ext) or []
+        if cands:
+            return max(cands, key=lambda x: x.stat().st_size)
+    return None
+
+
+def _find_local_audio_file(folder: str) -> Path | None:
+    cap_dir = _local_capture_folder_path(folder)
+    if cap_dir is None or (not cap_dir.exists()) or (not cap_dir.is_dir()):
+        return None
+    candidates_by_ext: dict[str, list[Path]] = {e: [] for e in AUDIO_EXTS}
+    for p in cap_dir.iterdir():
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext in candidates_by_ext:
+            candidates_by_ext[ext].append(p)
+    # Prefer WAV because scipy wav reader is robust and fast.
+    for ext in [".wav", ".flac", ".m4a", ".mp3", ".aac"]:
+        cands = candidates_by_ext.get(ext) or []
+        if cands:
+            return max(cands, key=lambda x: x.stat().st_size)
+    return None
+
+
+def _build_audio_proxy_wav(src_audio: Path, out_wav: Path) -> tuple[bool, str]:
+    """
+    Build compact mono WAV with lowpass + downsampling for WAV/MP3 sources.
+    Uses ffmpeg if available (system ffmpeg or imageio-ffmpeg bundled binary).
+    """
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if not ffmpeg_exe:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_exe = None
+
+    if ffmpeg_exe:
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i", str(src_audio),
+            "-vn",
+            "-ac", "1",
+            "-ar", str(int(AUDIO_TARGET_SR)),
+            "-af", f"lowpass=f={int(AUDIO_LOWPASS_HZ)}",
+            str(out_wav),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and out_wav.exists() and out_wav.stat().st_size > 0:
+                return True, ""
+            err = (proc.stderr or proc.stdout or "").strip()
+            return False, f"ffmpeg fehlgeschlagen: {err[-240:]}"
+        except Exception as e:
+            return False, f"ffmpeg Aufruf fehlgeschlagen: {e}"
+
+    # Minimal fallback for plain WAV without ffmpeg.
+    if src_audio.suffix.lower() != ".wav":
+        return False, "Kein ffmpeg verfuegbar (fuer MP3 benoetigt)."
+    try:
+        sr, data = wavfile.read(str(src_audio))
+        x = data.astype(np.float32, copy=False)
+        if x.ndim > 1:
+            x = np.mean(x, axis=1)
+        if np.issubdtype(data.dtype, np.integer):
+            max_abs = float(np.iinfo(data.dtype).max)
+            if max_abs > 0:
+                x = x / max_abs
+        cutoff = min(float(AUDIO_LOWPASS_HZ), 0.45 * float(sr))
+        if cutoff > 10.0 and sr > 2 * cutoff:
+            b, a = signal.butter(4, cutoff / (0.5 * float(sr)), btype="low")
+            x = signal.filtfilt(b, a, x).astype(np.float32)
+        target_sr = int(min(max(2000, int(AUDIO_TARGET_SR)), int(sr)))
+        if target_sr != int(sr):
+            x = signal.resample_poly(x, target_sr, int(sr)).astype(np.float32)
+        x = np.clip(x, -1.0, 1.0)
+        y = (x * 32767.0).astype(np.int16)
+        wavfile.write(str(out_wav), int(target_sr), y)
+        return True, ""
+    except Exception as e:
+        return False, f"Audio-Proxy Build fehlgeschlagen: {e}"
+
+
+def _upload_audio_proxy_1k(folder: str) -> tuple[bool, str]:
+    src_audio = _find_local_audio_file(folder)
+    if src_audio is None:
+        return False, "Keine lokale Audiodatei gefunden."
+    tmp_out = Path(tempfile.gettempdir()) / f"{folder}_{AUDIO_PROXY_NAME}"
+    ok_build, msg_build = _build_audio_proxy_wav(src_audio, tmp_out)
+    if not ok_build:
+        return False, msg_build
+    pfx = st.session_state.r2_prefix.strip("/")
+    key = f"{pfx}/captures/{folder}/{AUDIO_PROXY_NAME}" if pfx else f"captures/{folder}/{AUDIO_PROXY_NAME}"
+    ok_up, msg_up = st.session_state.r2_client.upload_file(str(tmp_out), key)
+    try:
+        if tmp_out.exists():
+            tmp_out.unlink()
+    except Exception:
+        pass
+    if not ok_up:
+        return False, f"Upload fehlgeschlagen: {msg_up}"
+    return True, ""
+
+
+def _cloud_framepack_prefix(folder: str) -> str:
+    pfx = st.session_state.r2_prefix.strip("/")
+    return f"{pfx}/captures/{folder}/frames_1fps" if pfx else f"captures/{folder}/frames_1fps"
+
+
+def _upload_framepack_1fps(src_video: Path, folder: str, progress_cb=None) -> tuple[bool, str, int, str]:
+    """
+    Extract 1 fps frames and upload as frame-pack:
+      captures/<folder>/frames_1fps/000000.jpg
+      captures/<folder>/frames_1fps/index.json
+    """
+    if st.session_state.r2_client is None:
+        return False, "Cloud Client nicht verbunden.", 0
+
+    cap = cv2.VideoCapture(str(src_video))
+    if not cap.isOpened():
+        return False, f"Video kann nicht geoeffnet werden: {src_video.name}", 0
+
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if fps <= 0:
+            fps = 25.0
+        duration_s = (frame_count / fps) if frame_count > 0 else 0.0
+        seconds = max(1, int(np.ceil(duration_s)))
+        prefix = _cloud_framepack_prefix(folder)
+        uploaded = 0
+        entries = []
+
+        for sec in range(seconds):
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(sec) * 1000.0)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+
+            # Optional downscale (biggest size lever) while keeping aspect ratio.
+            if FRAMEPACK_MAX_WIDTH and FRAMEPACK_MAX_WIDTH > 0:
+                h0, w0 = frame.shape[:2]
+                if w0 > FRAMEPACK_MAX_WIDTH:
+                    new_w = int(FRAMEPACK_MAX_WIDTH)
+                    new_h = max(1, int(round(h0 * (new_w / float(w0)))))
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            ok_enc, use_buf = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), int(FRAMEPACK_JPEG_QUALITY)],
+            )
+            if not ok_enc:
+                continue
+            use_size = len(use_buf)
+            use_q = int(FRAMEPACK_JPEG_QUALITY)
+
+            fname = f"{sec:06d}.jpg"
+            key = f"{prefix}/{fname}"
+            ok_up, msg_up = st.session_state.r2_client.upload_bytes(
+                use_buf.tobytes(), key, content_type="image/jpeg"
+            )
+            if not ok_up:
+                return False, f"Upload fehlgeschlagen ({fname}): {msg_up}", uploaded
+            uploaded += 1
+            entries.append({"sec": sec, "file": fname, "bytes": int(use_size), "quality": int(use_q)})
+            if progress_cb:
+                progress_cb((sec + 1) / seconds, f"Frames: {sec + 1}/{seconds}")
+
+        index_payload = {
+            "type": "frame_pack",
+            "sample_rate_hz": 1.0,
+            "source_video": src_video.name,
+            "source_fps": fps,
+            "duration_s": duration_s,
+            "frame_count": uploaded,
+            "frames": entries,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        }
+        ok_idx, msg_idx = st.session_state.r2_client.upload_string(
+            json.dumps(index_payload, ensure_ascii=False, indent=2),
+            f"{prefix}/index.json",
+        )
+        if not ok_idx:
+            return False, f"index.json Upload fehlgeschlagen: {msg_idx}", uploaded, ""
+
+        audio_note = ""
+        if AUDIO_PROXY_ENABLED:
+            ok_a, msg_a = _upload_audio_proxy_1k(folder)
+            if ok_a:
+                audio_note = " + AudioProxy"
+            else:
+                audio_note = f" | AudioProxy: {msg_a}"
+        return True, "", uploaded, audio_note
+    except Exception as e:
+        return False, str(e), 0, ""
+    finally:
+        cap.release()
+
+
+def _start_sync_run(selected_folders: list[str]):
+    queue_rows = st.session_state.sync_queue_rows or []
+    if selected_folders:
+        selected_set = set(selected_folders)
+        run_queue = [r for r in queue_rows if str(r.get("capture_folder", "")) in selected_set]
+    else:
+        run_queue = list(queue_rows)
+    st.session_state.sync_run_queue = run_queue
+    st.session_state.sync_run_total = len(run_queue)
+    st.session_state.sync_run_idx = 0
+    st.session_state.sync_run_started_ts = time.time()
+    st.session_state.sync_run_selected_folders = list(selected_folders or [])
+    st.session_state.sync_running = len(run_queue) > 0
+    st.session_state.sync_stop_requested = False
+
+
+def _refresh_sync_overview_live(table_slot=None, progress_slot=None):
+    st.session_state.sync_refresh_running = True
+    folders = sorted(set(_get_local_capture_folders()))
+    rows = [
+        {
+            "auswaehlen": False,
+            "capture_folder": f,
+            "reduziert_in_cloud": "...",
+            "status": "Pruefung...",
+            "cloud_framepack_anzahl": 0,
+        }
+        for f in folders
+    ]
+    st.session_state.sync_overview_rows = list(rows)
+    st.session_state.sync_queue_rows = []
+    total = len(folders)
+
+    if table_slot is not None:
+        table_slot.dataframe(
+            pd.DataFrame(rows)[["capture_folder", "reduziert_in_cloud", "status"]],
+            width="stretch",
+            hide_index=True,
+            height=340,
+            column_config={
+                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
+                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
+                "status": st.column_config.TextColumn("Status", width="medium"),
+            },
+        )
+
+    prog = None
+    if progress_slot is not None and total > 0:
+        prog = progress_slot.progress(0.0, text=f"Sync-Uebersicht: 0/{total} geprueft (0%)")
+
+    for idx, folder in enumerate(folders):
+        local_ok, _ = _has_local_fullfps_video(folder)
+        if local_ok:
+            cloud_ok, cloud_count = _has_cloud_proxy_video(folder)
+            rows[idx]["reduziert_in_cloud"] = "Ja" if cloud_ok else "Nein"
+            rows[idx]["status"] = "OK" if cloud_ok else "Queue"
+            rows[idx]["cloud_framepack_anzahl"] = int(cloud_count)
+        else:
+            rows[idx]["reduziert_in_cloud"] = "-"
+            rows[idx]["status"] = "Ohne Video"
+            rows[idx]["cloud_framepack_anzahl"] = 0
+
+        st.session_state.sync_overview_rows = list(rows)
+        st.session_state.sync_queue_rows = [r for r in rows if str(r.get("status", "")) == "Queue"]
+
+        # Reduce redraw frequency to avoid table jitter.
+        should_redraw = (idx == total - 1) or (idx % 3 == 0)
+        if table_slot is not None and should_redraw:
+            table_slot.dataframe(
+                pd.DataFrame(rows)[["capture_folder", "reduziert_in_cloud", "status"]],
+                width="stretch",
+                hide_index=True,
+                height=340,
+                column_config={
+                    "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
+                    "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
+                    "status": st.column_config.TextColumn("Status", width="medium"),
+                },
+            )
+        if prog is not None:
+            done = idx + 1
+            prog.progress(done / total, text=f"Sync-Uebersicht: {done}/{total} geprueft ({int((done/total)*100)}%)")
+
+    final_rows = [r for r in rows if str(r.get("status", "")) in ("Queue", "OK")]
+    st.session_state.sync_overview_rows = final_rows
+    st.session_state.sync_queue_rows = [r for r in final_rows if str(r.get("status", "")) == "Queue"]
+    st.session_state.sync_refresh_running = False
+
+
+def _finish_sync_run(final_msg: str, kind: str):
+    st.session_state.sync_running = False
+    st.session_state.sync_stop_requested = False
+    set_status(final_msg, kind)
+
+
+def _format_eta_seconds(sec: float) -> str:
+    sec = max(0, int(sec))
+    mm, ss = divmod(sec, 60)
+    hh, mm = divmod(mm, 60)
+    if hh > 0:
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
+    return f"{mm:02d}:{ss:02d}"
 
 
 def _has_valid_8_points(points):
@@ -402,6 +861,10 @@ def _apply_video(local_path, display_name):
     info = get_video_info(local_path)
     st.session_state.update(
         video_path=local_path, video_name=display_name,
+        media_source="video",
+        framepack_remote_prefix="",
+        framepack_files=[],
+        framepack_cache={},
         vid_fps=info["fps"], vid_width=info["width"],
         vid_height=info["height"], vid_duration=info["duration"],
         t_start=0.0, t_end=info["duration"], t_current=0.0, rois=[])
@@ -409,6 +872,109 @@ def _apply_video(local_path, display_name):
         st.session_state.capture_folder = Path(display_name).stem
     get_frame.clear(); get_video_info.clear()
     set_status(f"Video geladen: {display_name}", "ok")
+
+
+def _has_media_source() -> bool:
+    src = str(st.session_state.media_source or "none")
+    if src == "video":
+        return bool(st.session_state.video_path)
+    if src == "framepack":
+        return bool(st.session_state.framepack_remote_prefix) and bool(st.session_state.framepack_files)
+    return False
+
+
+def _load_framepack_from_r2(capture_folder: str) -> bool:
+    if not capture_folder or st.session_state.r2_client is None:
+        return False
+    pfx = st.session_state.r2_prefix.strip("/")
+    remote_prefix = f"{pfx}/captures/{capture_folder}/frames_1fps" if pfx else f"captures/{capture_folder}/frames_1fps"
+    ok, items = st.session_state.r2_client.list_files(remote_prefix)
+    if not ok or not isinstance(items, list):
+        return False
+
+    frame_files = sorted([n for n in items if n.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))])
+    if not frame_files:
+        return False
+
+    first_key = f"{remote_prefix}/{frame_files[0]}"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(frame_files[0]).suffix or ".jpg")
+    tmp.close()
+    ok_dl, msg_dl = st.session_state.r2_client.download_file(first_key, tmp.name)
+    if not ok_dl:
+        set_status(f"Frame-Pack Download: {msg_dl}", "warn")
+        return False
+    try:
+        img = np.array(Image.open(tmp.name).convert("RGB"))
+    except Exception as e:
+        set_status(f"Frame-Pack Parse: {e}", "warn")
+        return False
+    finally:
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    h, w = img.shape[:2]
+    fps = 1.0
+    duration = max(1.0, float(len(frame_files)))
+    st.session_state.update(
+        video_path=None,
+        video_name=f"{capture_folder} [frames_1fps]",
+        media_source="framepack",
+        framepack_remote_prefix=remote_prefix,
+        framepack_files=frame_files,
+        framepack_cache={0: img},
+        vid_fps=fps,
+        vid_width=w,
+        vid_height=h,
+        vid_duration=duration,
+        t_start=0.0,
+        t_end=duration,
+        t_current=0.0,
+        rois=[],
+    )
+    set_status(f"Frame-Pack geladen: {capture_folder} ({len(frame_files)} Frames)", "ok")
+    return True
+
+
+def _get_media_frame(time_s: float):
+    src = str(st.session_state.media_source or "none")
+    if src == "video" and st.session_state.video_path:
+        return get_frame(st.session_state.video_path, time_s)
+    if src != "framepack":
+        return None
+    files = st.session_state.framepack_files or []
+    if not files:
+        return None
+    idx = int(max(0, min(len(files) - 1, np.floor(float(time_s)))))
+    cache = st.session_state.framepack_cache or {}
+    if idx in cache:
+        return cache[idx]
+    remote_prefix = st.session_state.framepack_remote_prefix
+    key = f"{remote_prefix}/{files[idx]}"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(files[idx]).suffix or ".jpg")
+    tmp.close()
+    ok, msg = st.session_state.r2_client.download_file(key, tmp.name)
+    if not ok:
+        set_status(f"Frame-Pack Download: {msg}", "warn")
+        return None
+    try:
+        frame = np.array(Image.open(tmp.name).convert("RGB"))
+    except Exception as e:
+        set_status(f"Frame-Pack Parse: {e}", "warn")
+        return None
+    finally:
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    cache[idx] = frame
+    if len(cache) > 20:
+        oldest = sorted(cache.keys())[:-20]
+        for k in oldest:
+            cache.pop(k, None)
+    st.session_state.framepack_cache = cache
+    return frame
 
 def r2_list(prefix):
     """Lists objects under prefix. Returns [{"name", "path", "is_dir"}]."""
@@ -645,23 +1211,10 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
 def _try_load_video_for_capture_folder(capture_folder: str) -> bool:
     if not capture_folder:
         return False
-    client = st.session_state.r2_client
-    if client is None:
+    if st.session_state.r2_client is None:
         return False
-    pfx = st.session_state.r2_prefix.strip("/")
-    cap_dir = f"{pfx}/captures/{capture_folder}" if pfx else f"captures/{capture_folder}"
-    ok_list, items = client.list_files(cap_dir)
-    if not ok_list or not isinstance(items, list):
-        return False
-    preferred_name = f"{capture_folder}.mp4".lower()
-    if preferred_name in [n.lower() for n in items if not n.endswith("/")]:
-        _load_video_from_r2(f"{cap_dir}/{capture_folder}.mp4".strip("/"))
-        return True
-    for name in items:
-        if name.lower().endswith((".mp4", ".mov", ".avi", ".mkv")) and not name.endswith("/"):
-            _load_video_from_r2(f"{cap_dir}/{name}".strip("/"))
-            return True
-    return False
+    # Cloud workflow: always use reduced frame-pack.
+    return _load_framepack_from_r2(capture_folder)
 
 def _load_video_from_r2(remote_key):
     client = st.session_state.r2_client
@@ -734,8 +1287,8 @@ st.markdown(
     unsafe_allow_html=True)
 
 # â”€â”€ TABS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-tab_setup, tab_mat, tab_roi, tab_track = st.tabs(
-    ["Cloud Connection & Root", "MAT Selection", "ROI Setup", "Track Analysis"]
+tab_setup, tab_sync, tab_mat, tab_roi, tab_track = st.tabs(
+    ["Cloud Connection & Root", "Sync", "MAT Selection", "ROI Setup", "Track Analysis"]
 )
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -757,7 +1310,7 @@ with tab_setup:
               <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;">Cloud DB Status</div>
               <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
                 <span class="conn-dot {'ok' if cloud_ok else 'off'}" style="width:13px;height:13px;"></span>
-                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if cloud_ok else '#a0a7b4'};">
+                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if cloud_ok else '#ff5c5c'};">
                   {'Verbunden' if cloud_ok else 'Nicht verbunden'}
                 </span>
               </div>
@@ -851,7 +1404,7 @@ with tab_setup:
               <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#9fbe9f;text-transform:uppercase;letter-spacing:.08em;">Lokale DB Status</div>
               <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
                 <span class="conn-dot {'ok' if local_ok else 'off'}" style="width:13px;height:13px;"></span>
-                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if local_ok else '#a0a7b4'};">
+                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if local_ok else '#ff5c5c'};">
                   {'Verbunden' if local_ok else 'Nicht verbunden'}
                 </span>
               </div>
@@ -876,27 +1429,206 @@ with tab_setup:
             )
 
             if st.button("Ordner waehlen (lokal)", use_container_width=True, key="local_pick_btn"):
-                ok_pick, picked = _pick_local_folder_dialog(st.session_state.local_base_path_input)
-                if ok_pick and picked:
-                    st.session_state.local_base_path_input = picked
-                    lp = Path(picked).expanduser().resolve()
-                    captures_dir = lp / "captures"
-                    if captures_dir.exists() and captures_dir.is_dir():
-                        st.session_state.local_connected = True
-                        st.session_state.local_base_path = str(lp)
-                        st.session_state.local_root = ""
-                        set_status(f"Lokale DB verbunden: {lp}", "ok")
-                    else:
-                        st.session_state.local_connected = False
-                        set_status("Lokale DB nicht verbunden: Unterordner 'captures' fehlt.", "warn")
-                    st.rerun()
-                elif picked:
-                    set_status(f"Ordnerdialog nicht verfuegbar: {picked}", "warn")
+                try:
+                    ok_pick, picked = _pick_local_folder_dialog(st.session_state.local_base_path_input)
+                    if ok_pick and picked:
+                        st.session_state.local_base_path_input = picked
+                        lp = Path(picked).expanduser().resolve()
+                        captures_dir = lp / "captures"
+                        if captures_dir.exists() and captures_dir.is_dir():
+                            local_client = LocalStorageAdapter(str(lp))
+                            ok_local, msg_local = local_client.test_connection()
+                            if ok_local:
+                                st.session_state.local_connected = True
+                                st.session_state.local_client = local_client
+                                st.session_state.local_base_path = str(lp)
+                                st.session_state.local_root = ""
+                                set_status(f"Lokale DB verbunden: {lp}", "ok")
+                            else:
+                                st.session_state.local_connected = False
+                                st.session_state.local_client = None
+                                set_status(f"Lokale DB Verbindung fehlgeschlagen: {msg_local}", "warn")
+                        else:
+                            st.session_state.local_connected = False
+                            st.session_state.local_client = None
+                            set_status("Lokale DB nicht verbunden: Unterordner 'captures' fehlt.", "warn")
+                        st.rerun()
+                    elif picked:
+                        set_status(f"Ordnerdialog nicht verfuegbar: {picked}", "warn")
+                except Exception as e:
+                    set_status(f"Lokale DB Verbindung fehlgeschlagen: {e}", "warn")
             st.markdown(
                 f'<div class="breadcrumb">Lokaler Basispfad: {st.session_state.local_base_path if st.session_state.local_connected else "(noch nicht gesetzt)"}</div>',
                 unsafe_allow_html=True,
             )
         st.markdown('</div>', unsafe_allow_html=True)
+
+
+# Sync Tab
+with tab_sync:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Sync Uebersicht (Lokal vs. Cloud)</div>', unsafe_allow_html=True)
+
+    can_sync_compare = bool(st.session_state.r2_connected and st.session_state.local_connected)
+    c_sync_refresh, c_sync_start_stop, c_sync_info = st.columns([1, 1, 2])
+    refresh_sync = c_sync_refresh.button(
+        "Sync Uebersicht aktualisieren",
+        use_container_width=True,
+        disabled=not can_sync_compare,
+        key="sync_refresh_btn",
+    )
+    sync_btn_label = "Stop" if st.session_state.sync_running else "Sync starten (Frame-Pack 1fps)"
+    sync_btn_kind = "secondary" if st.session_state.sync_running else "primary"
+    sync_btn_clicked = c_sync_start_stop.button(
+        sync_btn_label,
+        type=sync_btn_kind,
+        use_container_width=True,
+        disabled=(not can_sync_compare),
+        key="sync_start_btn",
+    )
+    if not can_sync_compare:
+        c_sync_info.caption("Cloud DB und lokale DB muessen beide verbunden sein.")
+    else:
+        c_sync_info.caption("Vergleich: lokale Full-FPS Videos vs. Cloud Frame-Packs (1 fps). Sync extrahiert lokal und laedt Frames hoch.")
+
+    overall_progress_slot = st.empty()
+    file_progress_slot = st.empty()
+    stage_slot = st.empty()
+    table_slot = st.empty()
+
+    if refresh_sync:
+        try:
+            _refresh_sync_overview_live(table_slot=table_slot, progress_slot=overall_progress_slot)
+            st.rerun()
+        except Exception as e:
+            set_status(f"Sync-Uebersicht Fehler: {e}", "warn")
+
+    # Single table with checkbox selection.
+    selected_queue_folders = []
+    if st.session_state.sync_overview_rows:
+        rows = []
+        selected_set = set(st.session_state.sync_selected_folders or [])
+        for r in st.session_state.sync_overview_rows:
+            rr = dict(r)
+            folder = str(rr.get("capture_folder", ""))
+            rr["auswaehlen"] = folder in selected_set
+            rows.append(rr)
+        df_sync_editor = pd.DataFrame(rows)
+        edited = table_slot.data_editor(
+            df_sync_editor[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
+            width="stretch",
+            hide_index=True,
+            height=340,
+            disabled=st.session_state.sync_running or st.session_state.sync_refresh_running,
+            column_config={
+                "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
+                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
+                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
+                "status": st.column_config.TextColumn("Status", width="medium"),
+            },
+            key="sync_single_table",
+        )
+        if isinstance(edited, pd.DataFrame):
+            selected_queue_folders = [
+                str(row["capture_folder"])
+                for _, row in edited.iterrows()
+                if bool(row.get("auswaehlen")) and str(row.get("status", "")) == "Queue"
+            ]
+            st.session_state.sync_selected_folders = selected_queue_folders
+    else:
+        table_slot.caption("Keine lokalen Quellvideos gefunden.")
+
+    if sync_btn_clicked:
+        if st.session_state.sync_running:
+            st.session_state.sync_stop_requested = True
+            set_status("Stop angefordert: Sync stoppt nach aktueller Datei.", "warn")
+        else:
+            if not st.session_state.sync_queue_rows:
+                set_status("Sync-Queue ist leer.", "warn")
+            else:
+                _start_sync_run(selected_queue_folders)
+                if st.session_state.sync_running:
+                    set_status(f"Sync gestartet ({st.session_state.sync_run_total} Datei(en)).", "info")
+                    st.rerun()
+                else:
+                    set_status("Keine gueltigen Queue-Dateien fuer Sync ausgewaehlt.", "warn")
+
+    if st.session_state.sync_running:
+        idx = int(st.session_state.sync_run_idx)
+        total = int(st.session_state.sync_run_total)
+        run_queue = st.session_state.sync_run_queue or []
+        status_map = dict(st.session_state.sync_status_map or {})
+
+        completed = max(0, idx)
+        elapsed = max(0.0, time.time() - float(st.session_state.sync_run_started_ts or time.time()))
+        eta = ((elapsed / completed) * (total - completed)) if completed > 0 else 0.0
+        overall_progress_slot.progress(
+            min(1.0, completed / max(1, total)),
+            text=f"Gesamt: {completed}/{total} ({int((completed/max(1,total))*100)}%) | ETA { _format_eta_seconds(eta) }",
+        )
+
+        if st.session_state.sync_stop_requested:
+            _finish_sync_run("Sync gestoppt.", "warn")
+            st.rerun()
+
+        if idx >= total:
+            ok_count = sum(1 for v in status_map.values() if str(v).startswith("OK"))
+            err_count = sum(1 for v in status_map.values() if str(v).startswith("Fehler"))
+            st.session_state.sync_status_map = status_map
+            overview_rows, queue_rows = _build_sync_overview_rows()
+            st.session_state.sync_overview_rows = overview_rows
+            st.session_state.sync_queue_rows = queue_rows
+            stage_slot.success(f"Sync abgeschlossen: {ok_count} erfolgreich, {err_count} Fehler.")
+            _finish_sync_run(
+                f"Sync abgeschlossen ({ok_count} OK / {err_count} Fehler).",
+                "warn" if err_count > 0 else "ok",
+            )
+            st.rerun()
+
+        qrow = run_queue[idx]
+        folder = str(qrow.get("capture_folder", "")).strip()
+        if not folder:
+            st.session_state.sync_run_idx = idx + 1
+            st.rerun()
+
+        status_map[folder] = "Konvertierung gestartet"
+        st.session_state.sync_status_map = status_map
+        src_video = _find_local_fullfps_video(folder)
+        if src_video is None:
+            status_map[folder] = "Fehler: keine lokale Full-FPS Datei"
+            st.session_state.sync_status_map = status_map
+            st.session_state.sync_run_idx = idx + 1
+            st.rerun()
+
+        stage_slot.info(f"[{idx + 1}/{total}] {folder}: erzeuge Frame-Pack (1 fps) aus '{src_video.name}' ...")
+
+        def _cb(pct: float, txt: str):
+            pct = max(0.0, min(1.0, float(pct)))
+            file_progress_slot.progress(pct, text=f"Datei: {folder} | {txt} ({int(pct * 100)}%)")
+            overall_pct = (idx + (pct * 0.8)) / max(1, total)
+            done = int(overall_pct * 100)
+            elapsed_l = max(0.0, time.time() - float(st.session_state.sync_run_started_ts or time.time()))
+            completed_l = idx + max(0.01, pct)
+            eta_l = (elapsed_l / completed_l) * max(0.0, total - completed_l)
+            overall_progress_slot.progress(overall_pct, text=f"Gesamt: {idx}/{total} ({done}%) | ETA { _format_eta_seconds(eta_l) }")
+
+        ok_pack, msg_pack, n_frames, audio_note = _upload_framepack_1fps(src_video, folder, progress_cb=_cb)
+        if not ok_pack:
+            status_map[folder] = f"Fehler Frame-Pack: {msg_pack}"
+            st.session_state.sync_status_map = status_map
+            st.session_state.sync_run_idx = idx + 1
+            st.rerun()
+        status_map[folder] = f"OK ({n_frames} Frames{audio_note})"
+        file_progress_slot.progress(1.0, text=f"Datei: {folder} | Frame-Pack hochgeladen ({n_frames} Frames)")
+
+        st.session_state.sync_status_map = status_map
+        st.session_state.sync_run_idx = idx + 1
+        st.rerun()
+
+    st.markdown("---")
+    st.caption("Hinweis: Stop wirkt zwischen Dateien (nicht mitten in einer laufenden Konvertierung).")
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1034,7 +1766,7 @@ with tab_mat:
 # TAB ðŸŽ¬ â€“ ROI-SETUP
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_roi:
-    if not st.session_state.video_path:
+    if not _has_media_source():
         st.markdown("""
         <div style="text-align:center;padding:3rem 2rem;color:#4a5060;">
           <div style="font-size:2.5rem;margin-bottom:.8rem">VIDEO</div>
@@ -1072,7 +1804,7 @@ with tab_roi:
             t_cur=st.slider("Position [s]",0.0,float(dur),float(st.session_state.t_current),
                              step=round(1/fps,4),format="%.3f s",key="sl_cur")
             st.session_state.t_current=t_cur
-            frame=get_frame(st.session_state.video_path,t_cur)
+            frame=_get_media_frame(t_cur)
             if frame is not None:
                 st.image(draw_rois(frame,st.session_state.rois,
                                    st.session_state.selected_roi,fw,fh),
@@ -1109,7 +1841,9 @@ with tab_roi:
                     x=cx,y=cy,w=cw_roi,h=ch_roi,
                     fmt=roi_fmt,pattern=roi_pat,max_scale=roi_sc))
                 st.session_state.selected_roi=len(st.session_state.rois)-1
-                get_frame.clear(); set_status(f"ROI '{roi_name}' hinzugefuegt.","ok"); st.rerun()
+                if st.session_state.media_source == "video":
+                    get_frame.clear()
+                set_status(f"ROI '{roi_name}' hinzugefuegt.","ok"); st.rerun()
             st.markdown('</div>',unsafe_allow_html=True)
 
         with col_r:
@@ -1164,10 +1898,14 @@ with tab_roi:
                     st.session_state.rois[sel]=dict(name=en,x=float(ex),y=float(ey),
                         w=float(ew),h=float(eh),fmt=ef,pattern=ep,max_scale=esc)
                     st.session_state.rois[sel].update(dict(x=cx, y=cy, w=cw_roi, h=ch_roi))
-                    get_frame.clear(); set_status("ROI gespeichert.","ok"); st.rerun()
+                    if st.session_state.media_source == "video":
+                        get_frame.clear()
+                    set_status("ROI gespeichert.","ok"); st.rerun()
                 if cb.button("Delete",use_container_width=True,key=f"dl_{sel}"):
                     st.session_state.rois.pop(sel); st.session_state.selected_roi=None
-                    get_frame.clear(); set_status("ROI geloescht.","info"); st.rerun()
+                    if st.session_state.media_source == "video":
+                        get_frame.clear()
+                    set_status("ROI geloescht.","info"); st.rerun()
                 st.markdown('</div>',unsafe_allow_html=True)
 
             st.markdown('<div class="section-card">',unsafe_allow_html=True)
@@ -1202,7 +1940,7 @@ with tab_roi:
 with tab_track:
     has_ref   = st.session_state.ref_track_img is not None
     track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
-    has_vid   = st.session_state.video_path is not None
+    has_vid   = _has_media_source()
     fw=st.session_state.vid_width; fh=st.session_state.vid_height
 
     if not has_ref:
@@ -1253,7 +1991,7 @@ with tab_track:
         st.markdown('<div class="section-title">Minimap | 8 Punkte + Bewegungserkennung</div>',
                     unsafe_allow_html=True)
         if has_vid and track_roi:
-            frame=get_frame(st.session_state.video_path,st.session_state.t_current)
+            frame=_get_media_frame(st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
                 ch,cw=crop.shape[:2]
@@ -1313,7 +2051,7 @@ with tab_track:
              _has_valid_8_points(st.session_state.minimap_pts))
     with cv1:
         if can_cmp and st.button("> Vergleich",type="primary",use_container_width=True):
-            frame=get_frame(st.session_state.video_path,st.session_state.t_current)
+            frame=_get_media_frame(st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
                 cmp=compare_minimap_to_reference(crop,st.session_state.ref_track_img,
@@ -1348,7 +2086,7 @@ with tab_track:
     with cv2_:
         cmp=st.session_state.track_comparison
         if cmp and has_ref and track_roi and has_vid:
-            frame=get_frame(st.session_state.video_path,st.session_state.t_current)
+            frame=_get_media_frame(st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
                 overlay=draw_comparison_overlay(crop,st.session_state.ref_track_img,
@@ -1370,4 +2108,3 @@ with tab_track:
         df=pd.DataFrame(st.session_state.moving_pt_history[-100:])
         c2.dataframe(df, width="stretch", height=180)
         st.markdown('</div>',unsafe_allow_html=True)
-
