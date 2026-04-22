@@ -5,90 +5,21 @@ base_url = vollstaendige URL zum Benutzerordner, z.B.:
 """
 from __future__ import annotations
 import requests
-from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
-from urllib3.util.retry import Retry
 from pathlib import PurePosixPath
 import xml.etree.ElementTree as ET
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 
 class WebDAVClient:
 
     def __init__(self, base_url: str, username: str, password: str):
         # base_url endet immer mit /
-        self.base_url = self._normalize_base_url(base_url, username)
+        self.base_url = base_url.rstrip("/") + "/"
         self.auth     = HTTPBasicAuth(username, password)
         self.session  = requests.Session()
         self.session.auth = self.auth
         self.session.headers.update({"User-Agent": "OCR-Extractor/1.0"})
-        self._timeout = (20, 120)  # connect/read timeout in Sekunden
-
-        retry = Retry(
-            total=3,
-            connect=3,
-            read=3,
-            backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset({"GET", "PUT", "DELETE", "PROPFIND", "MKCOL", "OPTIONS"}),
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-
-    @staticmethod
-    def _normalize_base_url(base_url: str, username: str) -> str:
-        """
-        Akzeptiert beide Formen:
-        1) .../remote.php/dav/files/
-        2) .../remote.php/dav/files/<user>/
-        Falls nur /files angegeben ist, wird <user> automatisch angehaengt.
-        """
-        base = (base_url or "").strip()
-        if not base:
-            return "/"
-
-        trimmed = base.rstrip("/")
-        low = trimmed.lower()
-        if low.endswith("/remote.php/dav/files"):
-            # Path-Segment kodieren (u.a. @ -> %40), wie bei funktionierendem curl.
-            user_seg = quote((username or "").strip(), safe="")
-            if user_seg:
-                return f"{trimmed}/{user_seg}/"
-        return trimmed + "/"
-
-    def _request(self, method: str, url: str, **kwargs):
-        if "timeout" not in kwargs:
-            kwargs["timeout"] = self._timeout
-        return self.session.request(method, url, **kwargs)
-
-    def _connection_probe_payload(self) -> str:
-        return '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
-
-    def _candidate_base_urls(self) -> list[str]:
-        """
-        Erzeuge moegliche URL-Varianten fuer den Fall, dass Server je nach
-        Pfadkodierung unterschiedlich antwortet.
-        """
-        candidates: list[str] = []
-
-        def _add(u: str | None):
-            if not u:
-                return
-            url = u.rstrip("/") + "/"
-            if url not in candidates:
-                candidates.append(url)
-
-        _add(self.base_url)
-
-        # Variante mit dekodiertem Pfad (z. B. %40 -> @)
-        _add(unquote(self.base_url))
-
-        # Variante mit kodiertem Pfad (z. B. @ -> %40)
-        _add(quote(unquote(self.base_url), safe=":/._-"))
-
-        return candidates
 
     def _build_url(self, remote_path: str) -> str:
         """
@@ -108,31 +39,21 @@ class WebDAVClient:
     # ── Verbindungstest ────────────────────────────────────────────────────────
 
     def test_connection(self) -> tuple[bool, str]:
-        """Verbindungstest per PROPFIND (entspricht typischer Nextcloud-WebDAV-Pruefung)."""
+        """OPTIONS auf base_url — immer erlaubt, kein 403 Risiko."""
         try:
-            last_status = None
-            saw_403 = False
-
-            for url in self._candidate_base_urls():
-                r = self._request(
-                    "PROPFIND",
-                    url,
-                    headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
-                    data=self._connection_probe_payload(),
-                )
-                last_status = r.status_code
-                if r.status_code in (200, 207):
-                    self.base_url = url
-                    return True, ""
-                if r.status_code == 401:
-                    return False, "Authentifizierung fehlgeschlagen (401)."
-                if r.status_code == 403:
-                    saw_403 = True
-                    continue
-
-            if saw_403:
-                return False, "Zugriff verweigert (403). Bitte WebDAV-URL inkl. Benutzerpfad pruefen."
-            return False, f"HTTP {last_status}" if last_status else "Unbekannter Fehler."
+            r = self.session.options(self.base_url, timeout=10)
+            if r.status_code in (200, 204, 207):
+                return True, ""
+            # Fallback PROPFIND
+            r2 = self.session.request(
+                "PROPFIND", self.base_url,
+                headers={"Depth": "0", "Content-Type": "application/xml"},
+                data='<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
+                timeout=10)
+            if r2.status_code in (200, 207): return True, ""
+            if r2.status_code == 401: return False, "Authentifizierung fehlgeschlagen (401)."
+            if r2.status_code == 403: return False, "Zugriff verweigert (403)."
+            return False, f"HTTP {r2.status_code}"
         except requests.exceptions.ConnectionError as e:
             return False, f"Verbindungsfehler: {e}"
         except requests.exceptions.Timeout:
@@ -150,14 +71,14 @@ class WebDAVClient:
         """
         try:
             url = self._build_url(remote_dir)
-            r = self._request(
+            r = self.session.request(
                 "PROPFIND", url,
                 headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
                 data="""<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop><d:resourcetype/><d:displayname/></d:prop>
 </d:propfind>""",
-            )
+                timeout=20)
 
             if r.status_code not in (207, 200):
                 return False, f"HTTP {r.status_code}"
@@ -192,7 +113,7 @@ class WebDAVClient:
 
     def download_file(self, remote_path: str, local_path: str) -> tuple[bool, str]:
         try:
-            r = self.session.get(self._build_url(remote_path), stream=True, timeout=self._timeout)
+            r = self.session.get(self._build_url(remote_path), stream=True, timeout=120)
             if r.status_code == 200:
                 with open(local_path, "wb") as f:
                     for chunk in r.iter_content(65536):
@@ -212,7 +133,7 @@ class WebDAVClient:
                 self._build_url(remote_path),
                 data=content.encode(encoding),
                 headers={"Content-Type": "application/json; charset=utf-8"},
-                timeout=self._timeout)
+                timeout=30)
             if r.status_code in (200, 201, 204): return True, ""
             return False, f"HTTP {r.status_code}: {r.text[:200]}"
         except Exception as e:
@@ -226,7 +147,7 @@ class WebDAVClient:
                 self._build_url(remote_path),
                 data=data,
                 headers={"Content-Type": content_type},
-                timeout=self._timeout)
+                timeout=120)
             if r.status_code in (200, 201, 204): return True, ""
             return False, f"HTTP {r.status_code}: {r.text[:200]}"
         except Exception as e:
@@ -236,7 +157,7 @@ class WebDAVClient:
         self._ensure_dirs(remote_path)
         try:
             with open(local_path, "rb") as f:
-                r = self.session.put(self._build_url(remote_path), data=f, timeout=self._timeout)
+                r = self.session.put(self._build_url(remote_path), data=f, timeout=120)
             if r.status_code in (200, 201, 204): return True, ""
             return False, f"HTTP {r.status_code}: {r.text[:200]}"
         except Exception as e:
@@ -244,7 +165,7 @@ class WebDAVClient:
 
     def delete_file(self, remote_path: str) -> tuple[bool, str]:
         try:
-            r = self.session.delete(self._build_url(remote_path), timeout=self._timeout)
+            r = self.session.delete(self._build_url(remote_path), timeout=15)
             if r.status_code in (200, 204, 404): return True, ""
             return False, f"HTTP {r.status_code}"
         except Exception as e:
@@ -260,6 +181,6 @@ class WebDAVClient:
         for part in parts[:-1]:
             path += "/" + part
             try:
-                self._request("MKCOL", self._build_url(path))
+                self.session.request("MKCOL", self._build_url(path), timeout=10)
             except Exception:
                 pass

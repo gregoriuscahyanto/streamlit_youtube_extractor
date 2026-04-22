@@ -412,7 +412,7 @@ with tab_cloud:
     with col_l:
 
         # ── Verbindung ─────────────────────────────────────────────────────────
-        # --- section ---
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Verbindung · bwSyncAndShare / Nextcloud</div>',
                     unsafe_allow_html=True)
 
@@ -489,9 +489,10 @@ with tab_cloud:
                         '<span style="font-family:JetBrains Mono,monospace;font-size:.72rem;' +
                         'color:#4a5060">Nicht verbunden</span></div>', unsafe_allow_html=True)
 
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # ── Hauptordner ────────────────────────────────────────────────────────
-        # --- section ---
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Hauptordner (Projekt-Root)</div>',
                     unsafe_allow_html=True)
         st.caption("Dieser Ordner enthaelt captures/, results/, reference_track_siesmann/ usw.")
@@ -505,10 +506,8 @@ with tab_cloud:
             if root_mode == "Aus Liste waehlen":
                 cur = st.session_state.webdav_root
                 idx = opts.index(cur) if cur in opts else 0
-                # key enthaelt Anzahl Optionen -> zwingt Neurender wenn Liste sich aendert
-                _dd_key = f"root_dd_{len(opts)}"
                 chosen = st.selectbox("Hauptordner", opts, index=idx,
-                                       label_visibility="collapsed", key=_dd_key)
+                                       label_visibility="collapsed", key="root_dd")
                 c1, c2 = st.columns(2)
                 if c1.button("Uebernehmen", use_container_width=True, key="set_root_dd"):
                     st.session_state.webdav_root = chosen
@@ -548,10 +547,11 @@ with tab_cloud:
                         'color:#2e3545;padding:.5rem 0;">Erst verbinden.</div>',
                         unsafe_allow_html=True)
 
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # ── Aufnahme-Ordner ────────────────────────────────────────────────────
-        with st.container(border=True):
-            st.markdown('**Aufnahme-Ordner**')
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Aufnahme-Ordner</div>', unsafe_allow_html=True)
         st.caption("Format: YYYYMMDD_HHMMSS aus captures/ — bestimmt alle Datei-Pfade.")
 
         if st.session_state.webdav_connected and st.session_state.webdav_root:
@@ -591,10 +591,11 @@ with tab_cloud:
         if cf_manual != st.session_state.capture_folder:
             st.session_state.capture_folder = cf_manual
 
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # ── Lokal laden ────────────────────────────────────────────────────────
-        with st.container(border=True):
-            st.markdown('**Lokal laden**')
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Lokal laden</div>', unsafe_allow_html=True)
 
         up_v = st.file_uploader("Video (MP4/MOV/AVI)",
                                  type=["mp4","mov","avi","mkv"],
@@ -623,11 +624,12 @@ with tab_cloud:
             except Exception as e:
                 set_status(f"JSON-Fehler: {e}", "warn")
 
+        st.markdown('</div>', unsafe_allow_html=True)
 
     # ── Rechte Spalte: Datei-Browser ───────────────────────────────────────────
     with col_r:
-        with st.container(border=True):
-            st.markdown('**Datei-Browser**')
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Datei-Browser</div>', unsafe_allow_html=True)
 
         if not st.session_state.webdav_connected:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:3rem;' +
@@ -722,10 +724,11 @@ with tab_cloud:
                                              help="Als Referenz-Track laden", use_container_width=True):
                                     _load_ref_from_webdav(entry["path"]); st.rerun()
 
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # Ergebnis hochladen
         if st.session_state.webdav_connected and st.session_state.rois:
-            # --- section ---
+            st.markdown('<div class="section-card">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Ergebnis hochladen (JSON + MAT)</div>',
                         unsafe_allow_html=True)
             cf   = st.session_state.capture_folder or "output"
@@ -751,6 +754,7 @@ with tab_cloud:
                 else:
                     set_status(f"Upload: JSON={'OK' if _ok1 else _m1}  MAT={'OK' if _ok2 else _m2}", "warn")
                 st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -774,8 +778,8 @@ with tab_roi:
 
         col_v, col_r = st.columns([3,1], gap="medium")
         with col_v:
-            with st.container(border=True):
-                st.markdown('**Zeitbereich**',unsafe_allow_html=True)
+            st.markdown('<div class="section-card">',unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Zeitbereich</div>',unsafe_allow_html=True)
             c1,c2=st.columns([5,1])
             t_start=c1.slider("Start [s]",0.0,float(dur),float(st.session_state.t_start),
                                step=round(1/fps,4),format="%.2f s",key="sl_start")
@@ -788,9 +792,10 @@ with tab_roi:
                         unsafe_allow_html=True)
             st.session_state.t_start=t_start
             st.session_state.t_end=max(t_end,t_start+1.0/fps)
+            st.markdown('</div>',unsafe_allow_html=True)
 
-            with st.container(border=True):
-                st.markdown('**Video-Frame**',unsafe_allow_html=True)
+            st.markdown('<div class="section-card">',unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Video-Frame</div>',unsafe_allow_html=True)
             t_cur=st.slider("Position [s]",0.0,float(dur),float(st.session_state.t_current),
                              step=round(1/fps,4),format="%.3f s",key="sl_cur")
             st.session_state.t_current=t_cur
@@ -802,9 +807,10 @@ with tab_roi:
                          caption=f"t={t_cur:.3f}s  |  {fw}×{fh}  |  {fps:.1f}fps")
             else:
                 st.warning("Frame nicht verfügbar.")
+            st.markdown('</div>',unsafe_allow_html=True)
 
-            with st.container(border=True):
-                st.markdown('**ROI hinzufügen**',unsafe_allow_html=True)
+            st.markdown('<div class="section-card">',unsafe_allow_html=True)
+            st.markdown('<div class="section-title">ROI hinzufügen</div>',unsafe_allow_html=True)
             rc=st.columns(4)
             rx=rc[0].number_input("X",0,fw or 9999,0,1,key="rx")
             ry=rc[1].number_input("Y",0,fh or 9999,0,1,key="ry")
@@ -827,10 +833,11 @@ with tab_roi:
                     fmt=roi_fmt,pattern=roi_pat,max_scale=roi_sc))
                 st.session_state.selected_roi=len(st.session_state.rois)-1
                 get_frame.clear(); set_status(f"ROI '{roi_name}' hinzugefügt.","ok"); st.rerun()
+            st.markdown('</div>',unsafe_allow_html=True)
 
         with col_r:
-            with st.container(border=True):
-                st.markdown('**ROI-Liste**',unsafe_allow_html=True)
+            st.markdown('<div class="section-card">',unsafe_allow_html=True)
+            st.markdown('<div class="section-title">ROI-Liste</div>',unsafe_allow_html=True)
             if not st.session_state.rois:
                 st.markdown('<div style="font-family:\'JetBrains Mono\',monospace;'
                             'font-size:.72rem;color:#2e3545;text-align:center;padding:1rem;">'
@@ -846,12 +853,13 @@ with tab_roi:
                             f'<span style="font-family:\'JetBrains Mono\',monospace;'
                             f'font-size:.62rem;color:#4a5060">{roi["fmt"]}</span><br>',
                             unsafe_allow_html=True)
+            st.markdown('</div>',unsafe_allow_html=True)
 
             sel=st.session_state.selected_roi
             if sel is not None and sel<len(st.session_state.rois):
                 roi=st.session_state.rois[sel]
-                with st.container(border=True):
-                    st.markdown('**ROI #{sel} bearbeiten**',
+                st.markdown('<div class="section-card">',unsafe_allow_html=True)
+                st.markdown(f'<div class="section-title">ROI #{sel} bearbeiten</div>',
                             unsafe_allow_html=True)
                 en=st.selectbox("Name",ROI_NAMES,
                     index=ROI_NAMES.index(roi["name"]) if roi["name"] in ROI_NAMES else 0,
@@ -875,9 +883,10 @@ with tab_roi:
                 if cb.button("🗑",use_container_width=True,key=f"dl_{sel}"):
                     st.session_state.rois.pop(sel); st.session_state.selected_roi=None
                     get_frame.clear(); set_status("ROI gelöscht.","info"); st.rerun()
+                st.markdown('</div>',unsafe_allow_html=True)
 
-            with st.container(border=True):
-                st.markdown('**Lokal speichern**',unsafe_allow_html=True)
+            st.markdown('<div class="section-card">',unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Lokal speichern</div>',unsafe_allow_html=True)
             cf=st.session_state.capture_folder or "output"
             result=build_result_json()
             result_str=json.dumps(result,indent=2,ensure_ascii=False)
@@ -886,9 +895,10 @@ with tab_roi:
             mat_buf=io.BytesIO(); sio.savemat(mat_buf,build_mat_struct(result))
             st.download_button("⬇ MAT",mat_buf.getvalue(),f"results_{cf}.mat",
                                "application/octet-stream",use_container_width=True)
+            st.markdown('</div>',unsafe_allow_html=True)
 
-            with st.container(border=True):
-                st.markdown('**Info**',unsafe_allow_html=True)
+            st.markdown('<div class="section-card">',unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Info</div>',unsafe_allow_html=True)
             n_t=sum(1 for r in st.session_state.rois if r["name"]=="track_minimap")
             st.markdown(f"""
             <div style="font-family:'JetBrains Mono',monospace;font-size:.67rem;
@@ -898,6 +908,7 @@ with tab_roi:
             <b style="color:#e8eaf0">Bereich</b> {t_start:.2f}→{st.session_state.t_end:.2f}s<br>
             <b style="color:#e8eaf0">ROIs</b> {len(st.session_state.rois)} ({n_t} track)
             </div>""",unsafe_allow_html=True)
+            st.markdown('</div>',unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -919,8 +930,8 @@ with tab_track:
           (0,200,255),(100,100,255),(200,80,255),(255,80,200)]
 
     with col_a:
-        with st.container(border=True):
-            st.markdown('**Referenz-Track · 8 Kalibrierpunkte**',
+        st.markdown('<div class="section-card">',unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Referenz-Track · 8 Kalibrierpunkte</div>',
                     unsafe_allow_html=True)
         if has_ref:
             ref_pts=st.session_state.ref_track_pts or [[0,0]]*8
@@ -950,10 +961,11 @@ with tab_track:
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
                         'Kein Referenzbild</div>',unsafe_allow_html=True)
+        st.markdown('</div>',unsafe_allow_html=True)
 
     with col_b:
-        with st.container(border=True):
-            st.markdown('**Minimap · 8 Punkte + Bewegungserkennung**',
+        st.markdown('<div class="section-card">',unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Minimap · 8 Punkte + Bewegungserkennung</div>',
                     unsafe_allow_html=True)
         if has_vid and track_roi:
             frame=get_frame(st.session_state.video_path,st.session_state.t_current)
@@ -989,9 +1001,10 @@ with tab_track:
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
                         'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
+        st.markdown('</div>',unsafe_allow_html=True)
 
-    with st.container(border=True):
-        st.markdown('**Vergleich · Überlagerung · Bewegende Punkte**',
+    st.markdown('<div class="section-card">',unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Vergleich · Überlagerung · Bewegende Punkte</div>',
                 unsafe_allow_html=True)
     cv1,cv2_,cv3=st.columns([2,2,1])
     with cv3:
@@ -1045,10 +1058,11 @@ with tab_track:
                     cmp,st.session_state.moving_pt_color_range)
                 st.image(overlay,use_container_width=True,
                          caption="Minimap (blau) vs. Referenz (grün)")
+    st.markdown('</div>',unsafe_allow_html=True)
 
     if st.session_state.moving_pt_history:
-        with st.container(border=True):
-            st.markdown('**Verlauf bewegender Punkt**',
+        st.markdown('<div class="section-card">',unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Verlauf bewegender Punkt</div>',
                     unsafe_allow_html=True)
         import pandas as pd
         c1,c2=st.columns([1,4])
@@ -1057,3 +1071,4 @@ with tab_track:
             st.session_state.moving_pt_history=[]; st.rerun()
         df=pd.DataFrame(st.session_state.moving_pt_history[-100:])
         c2.dataframe(df,use_container_width=True,height=180)
+        st.markdown('</div>',unsafe_allow_html=True)
