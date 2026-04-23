@@ -449,7 +449,7 @@ def _build_sync_overview_rows() -> tuple[list[dict], list[dict]]:
             continue
         src_video = _find_local_fullfps_video(folder)
         cloud_complete, cloud_count, expected_count, cloud_text = _cloud_reduced_completeness(folder, src_video)
-        state = "OK" if cloud_complete else "Queue"
+        state = "OK" if cloud_complete else ""
         row = {
             "auswaehlen": False,
             "capture_folder": folder,
@@ -754,7 +754,7 @@ def _refresh_sync_overview_live(table_slot=None, progress_slot=None):
             src_video = _find_local_fullfps_video(folder)
             cloud_complete, cloud_count, expected_count, cloud_text = _cloud_reduced_completeness(folder, src_video)
             rows[idx]["reduziert_in_cloud"] = cloud_text
-            rows[idx]["status"] = "OK" if cloud_complete else "Queue"
+            rows[idx]["status"] = "OK" if cloud_complete else ""
             rows[idx]["cloud_framepack_anzahl"] = int(cloud_count)
             rows[idx]["expected_framepack_anzahl"] = int(expected_count)
         else:
@@ -764,7 +764,9 @@ def _refresh_sync_overview_live(table_slot=None, progress_slot=None):
             rows[idx]["expected_framepack_anzahl"] = 0
 
         st.session_state.sync_overview_rows = list(rows)
-        st.session_state.sync_queue_rows = [r for r in rows if str(r.get("status", "")) == "Queue"]
+        st.session_state.sync_queue_rows = [
+            r for r in rows if str(r.get("reduziert_in_cloud", "")).startswith("Nein")
+        ]
 
         # Reduce redraw frequency to avoid table jitter.
         should_redraw = (idx == total - 1) or (idx % 3 == 0)
@@ -784,15 +786,34 @@ def _refresh_sync_overview_live(table_slot=None, progress_slot=None):
             done = idx + 1
             prog.progress(done / total, text=f"Sync-Uebersicht: {done}/{total} geprueft ({int((done/total)*100)}%)")
 
-    final_rows = [r for r in rows if str(r.get("status", "")) in ("Queue", "OK")]
+    final_rows = [r for r in rows if str(r.get("status", "")) != "Ohne Video"]
     st.session_state.sync_overview_rows = final_rows
-    st.session_state.sync_queue_rows = [r for r in final_rows if str(r.get("status", "")) == "Queue"]
+    st.session_state.sync_queue_rows = [
+        r for r in final_rows if str(r.get("reduziert_in_cloud", "")).startswith("Nein")
+    ]
     st.session_state.sync_editor_value = pd.DataFrame(final_rows)[
         ["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
     ].copy() if final_rows else pd.DataFrame(
         columns=["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
     )
     st.session_state.sync_refresh_running = False
+
+
+def _set_sync_row_status(folder: str, text: str):
+    rows = list(st.session_state.sync_overview_rows or [])
+    for r in rows:
+        if str(r.get("capture_folder", "")) == str(folder):
+            r["status"] = text
+            break
+    st.session_state.sync_overview_rows = rows
+
+    df = st.session_state.get("sync_editor_value")
+    if isinstance(df, pd.DataFrame) and (not df.empty):
+        if "capture_folder" in df.columns and "status" in df.columns:
+            mask = df["capture_folder"].astype(str) == str(folder)
+            if mask.any():
+                df.loc[mask, "status"] = text
+                st.session_state.sync_editor_value = df
 
 
 def _finish_sync_run(final_msg: str, kind: str):
@@ -1548,109 +1569,159 @@ with tab_sync:
     st.markdown('<div class="section-title">Sync Uebersicht (Lokal vs. Cloud)</div>', unsafe_allow_html=True)
 
     can_sync_compare = bool(st.session_state.r2_connected and st.session_state.local_connected)
-    c_sync_refresh, c_sync_start, c_sync_stop, c_sync_info = st.columns([1, 1, 1, 2])
-    refresh_sync = c_sync_refresh.button(
-        "Sync Uebersicht aktualisieren",
-        use_container_width=True,
-        disabled=not can_sync_compare,
-        key="sync_refresh_btn",
-    )
-    sync_start_clicked = c_sync_start.button(
-        "Auswahl uebernehmen + Sync starten",
-        type="primary",
-        use_container_width=True,
-        disabled=(not can_sync_compare) or st.session_state.sync_running,
-        key="sync_start_btn",
-    )
-    sync_stop_clicked = c_sync_stop.button(
-        "Stop",
-        type="secondary",
-        use_container_width=True,
-        disabled=not st.session_state.sync_running,
-        key="sync_stop_btn",
-    )
-    if not can_sync_compare:
-        c_sync_info.caption("Cloud DB und lokale DB muessen beide verbunden sein.")
-    else:
-        c_sync_info.caption("Vergleich: lokale Full-FPS Videos vs. Cloud Frame-Packs (1 fps). Sync extrahiert lokal und laedt Frames hoch.")
-
     overall_progress_slot = st.empty()
-    file_progress_slot = st.empty()
     stage_slot = st.empty()
     table_slot = st.empty()
+    sync_refresh_clicked = False
+    sync_start_clicked = False
+    sync_stop_clicked = False
+    selected_queue_folders = list(st.session_state.sync_selected_folders or [])
+    edited = None
 
-    if refresh_sync:
+    def _render_sync_table(df_table: pd.DataFrame):
+        table_slot.dataframe(
+            df_table[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
+            width="stretch",
+            hide_index=True,
+            height=340,
+            column_config={
+                "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
+                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
+                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
+                "status": st.column_config.TextColumn("Status", width="medium"),
+            },
+        )
+
+    if not can_sync_compare:
+        st.caption("Cloud DB und lokale DB muessen beide verbunden sein.")
+    else:
+        st.caption("Vergleich: lokale Full-FPS Videos vs. Cloud Frame-Packs (1 fps). Sync extrahiert lokal und laedt Frames hoch.")
+
+    if st.session_state.sync_running:
+        c_sync_refresh, c_sync_start, c_sync_stop = st.columns([1, 1, 1])
+        sync_refresh_clicked = c_sync_refresh.button(
+            "Sync Uebersicht aktualisieren",
+            use_container_width=True,
+            disabled=True,
+            key="sync_refresh_btn_running",
+        )
+        c_sync_start.button(
+            "Auswahl uebernehmen + Sync starten",
+            type="primary",
+            use_container_width=True,
+            disabled=True,
+            key="sync_start_btn_running",
+        )
+        sync_stop_clicked = c_sync_stop.button(
+            "Stop",
+            type="secondary",
+            use_container_width=True,
+            key="sync_stop_btn_running",
+        )
+
+        df_live = st.session_state.get("sync_editor_value")
+        if not isinstance(df_live, pd.DataFrame) or df_live.empty:
+            df_live = pd.DataFrame(st.session_state.sync_overview_rows or [])
+            if not df_live.empty:
+                cols = ["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
+                for c in cols:
+                    if c not in df_live.columns:
+                        df_live[c] = False if c == "auswaehlen" else ""
+                df_live = df_live[cols]
+        if isinstance(df_live, pd.DataFrame) and not df_live.empty:
+            _render_sync_table(df_live)
+        else:
+            _render_sync_table(
+                pd.DataFrame(columns=["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]),
+            )
+    else:
+        cached_editor_df = st.session_state.get("sync_single_table")
+        if not isinstance(cached_editor_df, pd.DataFrame):
+            cached_editor_df = st.session_state.get("sync_editor_value")
+        if not isinstance(cached_editor_df, pd.DataFrame) or cached_editor_df.empty:
+            if st.session_state.sync_overview_rows:
+                df_sync_editor = pd.DataFrame(st.session_state.sync_overview_rows)[
+                    ["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
+                ].copy()
+                if "auswaehlen" not in df_sync_editor.columns:
+                    df_sync_editor["auswaehlen"] = False
+            else:
+                df_sync_editor = pd.DataFrame(columns=["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"])
+            st.session_state.sync_editor_value = df_sync_editor.copy()
+        else:
+            df_sync_editor = cached_editor_df.copy()
+
+        with st.form("sync_form_controls", clear_on_submit=False):
+            c_sync_refresh, c_sync_start, c_sync_stop = st.columns([1, 1, 1])
+            sync_refresh_clicked = c_sync_refresh.form_submit_button(
+                "Sync Uebersicht aktualisieren",
+                use_container_width=True,
+                disabled=not can_sync_compare,
+            )
+            sync_start_clicked = c_sync_start.form_submit_button(
+                "Auswahl uebernehmen + Sync starten",
+                use_container_width=True,
+                type="primary",
+                disabled=not can_sync_compare,
+            )
+            c_sync_stop.form_submit_button(
+                "Stop",
+                use_container_width=True,
+                disabled=True,
+            )
+
+            edited = st.data_editor(
+                df_sync_editor[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
+                width="stretch",
+                hide_index=True,
+                height=340,
+                disabled=False,
+                column_config={
+                    "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
+                    "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
+                    "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
+                    "status": st.column_config.TextColumn("Status", width="medium"),
+                },
+                key="sync_single_table",
+            )
+            if isinstance(edited, pd.DataFrame):
+                st.session_state.sync_editor_value = edited.copy()
+
+    if sync_refresh_clicked:
         try:
             _refresh_sync_overview_live(table_slot=table_slot, progress_slot=overall_progress_slot)
             st.rerun()
         except Exception as e:
             set_status(f"Sync-Uebersicht Fehler: {e}", "warn")
 
-    # Single table with checkbox selection.
-    selected_queue_folders = list(st.session_state.sync_selected_folders or [])
-    if st.session_state.sync_overview_rows:
-        # Persistent editor dataframe as source-of-truth across reruns.
-        cached_editor_df = st.session_state.get("sync_editor_value")
-        if not isinstance(cached_editor_df, pd.DataFrame):
-            cached_editor_df = None
-
-        if cached_editor_df is None or cached_editor_df.empty:
-            df_sync_editor = pd.DataFrame(st.session_state.sync_overview_rows)[
-                ["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
-            ].copy()
-            if "auswaehlen" not in df_sync_editor.columns:
-                df_sync_editor["auswaehlen"] = False
-            st.session_state.sync_editor_value = df_sync_editor.copy()
-        else:
-            df_sync_editor = cached_editor_df.copy()
-
-        edited = table_slot.data_editor(
-            df_sync_editor[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
-            width="stretch",
-            hide_index=True,
-            height=340,
-            disabled=st.session_state.sync_running or st.session_state.sync_refresh_running,
-            column_config={
-                "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
-                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
-                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
-                "status": st.column_config.TextColumn("Status", width="medium"),
-            },
-            key="sync_single_table",
-        )
-
-        if isinstance(edited, pd.DataFrame):
-            # Keep latest edited buffer; selection is committed only on submit.
-            st.session_state.sync_editor_value = edited.copy()
-            selected_queue_folders = [
-                str(row["capture_folder"])
-                for _, row in edited.iterrows()
-                if bool(row.get("auswaehlen"))
-            ]
-            st.session_state.sync_selected_folders = selected_queue_folders
-    else:
-        table_slot.dataframe(
-            pd.DataFrame(columns=["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]),
-            width="stretch",
-            hide_index=True,
-            height=340,
-            column_config={
-                "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
-                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
-                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
-                "status": st.column_config.TextColumn("Status", width="medium"),
-            },
-        )
-
     if sync_stop_clicked:
         st.session_state.sync_stop_requested = True
         set_status("Stop angefordert: Sync stoppt nach aktueller Datei.", "warn")
 
     if sync_start_clicked:
-        if (not selected_queue_folders) and (not st.session_state.sync_queue_rows):
+        selected_from_editor = []
+        edited_df = edited if isinstance(edited, pd.DataFrame) else st.session_state.get("sync_single_table")
+        if not isinstance(edited_df, pd.DataFrame):
+            edited_df = st.session_state.get("sync_editor_value")
+        if isinstance(edited_df, pd.DataFrame) and (not edited_df.empty):
+            selected_from_editor = [
+                str(row["capture_folder"])
+                for _, row in edited_df.iterrows()
+                if bool(row.get("auswaehlen"))
+            ]
+        st.session_state.sync_selected_folders = selected_from_editor
+
+        if (not selected_from_editor) and (not st.session_state.sync_queue_rows):
             set_status("Sync-Queue ist leer.", "warn")
         else:
-            _start_sync_run(selected_queue_folders)
+            target_folders = selected_from_editor if selected_from_editor else [
+                str(r.get("capture_folder", ""))
+                for r in (st.session_state.sync_queue_rows or [])
+            ]
+            for f in target_folders:
+                _set_sync_row_status(f, "Queue")
+
+            _start_sync_run(target_folders)
             if st.session_state.sync_running:
                 set_status(f"Sync gestartet ({st.session_state.sync_run_total} Datei(en)).", "info")
                 st.rerun()
@@ -1698,18 +1769,23 @@ with tab_sync:
 
         status_map[folder] = "Konvertierung gestartet"
         st.session_state.sync_status_map = status_map
+        _set_sync_row_status(folder, "0%")
         src_video = _find_local_fullfps_video(folder)
         if src_video is None:
             status_map[folder] = "Fehler: keine lokale Full-FPS Datei"
             st.session_state.sync_status_map = status_map
+            _set_sync_row_status(folder, "Fehler")
             st.session_state.sync_run_idx = idx + 1
             st.rerun()
 
-        stage_slot.info(f"[{idx + 1}/{total}] {folder}: erzeuge Frame-Pack (1 fps) aus '{src_video.name}' ...")
+        stage_slot.empty()
 
         def _cb(pct: float, txt: str):
             pct = max(0.0, min(1.0, float(pct)))
-            file_progress_slot.progress(pct, text=f"Datei: {folder} | {txt} ({int(pct * 100)}%)")
+            _set_sync_row_status(folder, f"{int(pct * 100)}%")
+            df_live_cb = st.session_state.get("sync_editor_value")
+            if isinstance(df_live_cb, pd.DataFrame) and not df_live_cb.empty:
+                _render_sync_table(df_live_cb)
             overall_pct = (idx + (pct * 0.8)) / max(1, total)
             done = int(overall_pct * 100)
             elapsed_l = max(0.0, time.time() - float(st.session_state.sync_run_started_ts or time.time()))
@@ -1721,10 +1797,11 @@ with tab_sync:
         if not ok_pack:
             status_map[folder] = f"Fehler Frame-Pack: {msg_pack}"
             st.session_state.sync_status_map = status_map
+            _set_sync_row_status(folder, "Fehler")
             st.session_state.sync_run_idx = idx + 1
             st.rerun()
         status_map[folder] = f"OK ({n_frames} Frames{audio_note})"
-        file_progress_slot.progress(1.0, text=f"Datei: {folder} | Frame-Pack hochgeladen ({n_frames} Frames)")
+        _set_sync_row_status(folder, "OK")
 
         st.session_state.sync_status_map = status_map
         st.session_state.sync_run_idx = idx + 1
