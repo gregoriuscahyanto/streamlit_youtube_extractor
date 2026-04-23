@@ -211,6 +211,7 @@ def init_state():
         sync_run_started_ts=0.0,
         sync_run_selected_folders=[],
         sync_selected_folders=[],
+        sync_editor_value=None,
         sync_refresh_running=False,
         sync_refresh_idx=0,
         sync_refresh_total=0,
@@ -388,6 +389,54 @@ def _has_cloud_proxy_video(folder: str) -> tuple[bool, int]:
     return total_count > 0, total_count
 
 
+def _expected_reduced_frame_count_for_video(src_video: Path) -> int:
+    cap = cv2.VideoCapture(str(src_video))
+    if not cap.isOpened():
+        return 0
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if fps <= 0:
+            fps = 25.0
+        duration_s = (frame_count / fps) if frame_count > 0 else 0.0
+        return max(1, int(np.ceil(duration_s)))
+    except Exception:
+        return 0
+    finally:
+        cap.release()
+
+
+def _cloud_reduced_completeness(folder: str, src_video: Path | None) -> tuple[bool, int, int, str]:
+    """
+    Returns (is_complete, cloud_count, expected_count, status_text).
+    """
+    _exists, cloud_count = _has_cloud_proxy_video(folder)
+    expected_count = 0
+    if src_video is not None:
+        expected_count = _expected_reduced_frame_count_for_video(src_video)
+    if expected_count <= 0:
+        return False, int(cloud_count), int(expected_count), "Nein (Erwartete Frames unbekannt)"
+
+    pfx = st.session_state.r2_prefix.strip("/")
+    cap_dir = f"{pfx}/captures/{folder}" if pfx else f"captures/{folder}"
+    audio_ok = False
+    if st.session_state.r2_connected and st.session_state.r2_client is not None:
+        ok_cap, cap_items = st.session_state.r2_client.list_files(cap_dir)
+        if ok_cap and isinstance(cap_items, list):
+            lowered = [x.lower() for x in cap_items if not x.endswith("/")]
+            audio_ok = AUDIO_PROXY_NAME.lower() in lowered
+
+    complete_frames = int(cloud_count) >= int(expected_count)
+    if complete_frames and audio_ok:
+        text = "Ja"
+    else:
+        parts = [f"Frames {int(cloud_count)}/{int(expected_count)}"]
+        if not audio_ok:
+            parts.append("Audio fehlt")
+        text = f"Nein ({', '.join(parts)})"
+    return bool(complete_frames and audio_ok), int(cloud_count), int(expected_count), text
+
+
 def _build_sync_overview_rows() -> tuple[list[dict], list[dict]]:
     local_folders = sorted(set(_get_local_capture_folders()))
 
@@ -398,17 +447,19 @@ def _build_sync_overview_rows() -> tuple[list[dict], list[dict]]:
         local_ok, _local_count = _has_local_fullfps_video(folder)
         if not local_ok:
             continue
-        cloud_ok, cloud_count = _has_cloud_proxy_video(folder)
-        state = "OK" if cloud_ok else "Queue"
+        src_video = _find_local_fullfps_video(folder)
+        cloud_complete, cloud_count, expected_count, cloud_text = _cloud_reduced_completeness(folder, src_video)
+        state = "OK" if cloud_complete else "Queue"
         row = {
             "auswaehlen": False,
             "capture_folder": folder,
-            "reduziert_in_cloud": "Ja" if cloud_ok else "Nein",
+            "reduziert_in_cloud": cloud_text,
             "status": state,
             "cloud_framepack_anzahl": int(cloud_count),  # internal/debug
+            "expected_framepack_anzahl": int(expected_count),  # internal/debug
         }
         overview_rows.append(row)
-        if not cloud_ok:
+        if not cloud_complete:
             queue_rows.append(row)
 
     return overview_rows, queue_rows
@@ -559,11 +610,11 @@ def _upload_framepack_1fps(src_video: Path, folder: str, progress_cb=None) -> tu
       captures/<folder>/frames_1fps/index.json
     """
     if st.session_state.r2_client is None:
-        return False, "Cloud Client nicht verbunden.", 0
+        return False, "Cloud Client nicht verbunden.", 0, ""
 
     cap = cv2.VideoCapture(str(src_video))
     if not cap.isOpened():
-        return False, f"Video kann nicht geoeffnet werden: {src_video.name}", 0
+        return False, f"Video kann nicht geoeffnet werden: {src_video.name}", 0, ""
 
     try:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -606,7 +657,7 @@ def _upload_framepack_1fps(src_video: Path, folder: str, progress_cb=None) -> tu
                 use_buf.tobytes(), key, content_type="image/jpeg"
             )
             if not ok_up:
-                return False, f"Upload fehlgeschlagen ({fname}): {msg_up}", uploaded
+                return False, f"Upload fehlgeschlagen ({fname}): {msg_up}", uploaded, ""
             uploaded += 1
             entries.append({"sec": sec, "file": fname, "bytes": int(use_size), "quality": int(use_q)})
             if progress_cb:
@@ -645,9 +696,11 @@ def _upload_framepack_1fps(src_video: Path, folder: str, progress_cb=None) -> tu
 
 def _start_sync_run(selected_folders: list[str]):
     queue_rows = st.session_state.sync_queue_rows or []
+    overview_rows = st.session_state.sync_overview_rows or []
     if selected_folders:
         selected_set = set(selected_folders)
-        run_queue = [r for r in queue_rows if str(r.get("capture_folder", "")) in selected_set]
+        # Explicit user selection should be honored independent of current status.
+        run_queue = [r for r in overview_rows if str(r.get("capture_folder", "")) in selected_set]
     else:
         run_queue = list(queue_rows)
     st.session_state.sync_run_queue = run_queue
@@ -661,6 +714,8 @@ def _start_sync_run(selected_folders: list[str]):
 
 def _refresh_sync_overview_live(table_slot=None, progress_slot=None):
     st.session_state.sync_refresh_running = True
+    st.session_state.sync_editor_value = None
+    st.session_state.sync_selected_folders = []
     folders = sorted(set(_get_local_capture_folders()))
     rows = [
         {
@@ -696,14 +751,17 @@ def _refresh_sync_overview_live(table_slot=None, progress_slot=None):
     for idx, folder in enumerate(folders):
         local_ok, _ = _has_local_fullfps_video(folder)
         if local_ok:
-            cloud_ok, cloud_count = _has_cloud_proxy_video(folder)
-            rows[idx]["reduziert_in_cloud"] = "Ja" if cloud_ok else "Nein"
-            rows[idx]["status"] = "OK" if cloud_ok else "Queue"
+            src_video = _find_local_fullfps_video(folder)
+            cloud_complete, cloud_count, expected_count, cloud_text = _cloud_reduced_completeness(folder, src_video)
+            rows[idx]["reduziert_in_cloud"] = cloud_text
+            rows[idx]["status"] = "OK" if cloud_complete else "Queue"
             rows[idx]["cloud_framepack_anzahl"] = int(cloud_count)
+            rows[idx]["expected_framepack_anzahl"] = int(expected_count)
         else:
             rows[idx]["reduziert_in_cloud"] = "-"
             rows[idx]["status"] = "Ohne Video"
             rows[idx]["cloud_framepack_anzahl"] = 0
+            rows[idx]["expected_framepack_anzahl"] = 0
 
         st.session_state.sync_overview_rows = list(rows)
         st.session_state.sync_queue_rows = [r for r in rows if str(r.get("status", "")) == "Queue"]
@@ -729,6 +787,11 @@ def _refresh_sync_overview_live(table_slot=None, progress_slot=None):
     final_rows = [r for r in rows if str(r.get("status", "")) in ("Queue", "OK")]
     st.session_state.sync_overview_rows = final_rows
     st.session_state.sync_queue_rows = [r for r in final_rows if str(r.get("status", "")) == "Queue"]
+    st.session_state.sync_editor_value = pd.DataFrame(final_rows)[
+        ["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
+    ].copy() if final_rows else pd.DataFrame(
+        columns=["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
+    )
     st.session_state.sync_refresh_running = False
 
 
@@ -1482,25 +1545,29 @@ with tab_setup:
 
 # Sync Tab
 with tab_sync:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Sync Uebersicht (Lokal vs. Cloud)</div>', unsafe_allow_html=True)
 
     can_sync_compare = bool(st.session_state.r2_connected and st.session_state.local_connected)
-    c_sync_refresh, c_sync_start_stop, c_sync_info = st.columns([1, 1, 2])
+    c_sync_refresh, c_sync_start, c_sync_stop, c_sync_info = st.columns([1, 1, 1, 2])
     refresh_sync = c_sync_refresh.button(
         "Sync Uebersicht aktualisieren",
         use_container_width=True,
         disabled=not can_sync_compare,
         key="sync_refresh_btn",
     )
-    sync_btn_label = "Stop" if st.session_state.sync_running else "Sync starten (Frame-Pack 1fps)"
-    sync_btn_kind = "secondary" if st.session_state.sync_running else "primary"
-    sync_btn_clicked = c_sync_start_stop.button(
-        sync_btn_label,
-        type=sync_btn_kind,
+    sync_start_clicked = c_sync_start.button(
+        "Auswahl uebernehmen + Sync starten",
+        type="primary",
         use_container_width=True,
-        disabled=(not can_sync_compare),
+        disabled=(not can_sync_compare) or st.session_state.sync_running,
         key="sync_start_btn",
+    )
+    sync_stop_clicked = c_sync_stop.button(
+        "Stop",
+        type="secondary",
+        use_container_width=True,
+        disabled=not st.session_state.sync_running,
+        key="sync_stop_btn",
     )
     if not can_sync_compare:
         c_sync_info.caption("Cloud DB und lokale DB muessen beide verbunden sein.")
@@ -1520,16 +1587,23 @@ with tab_sync:
             set_status(f"Sync-Uebersicht Fehler: {e}", "warn")
 
     # Single table with checkbox selection.
-    selected_queue_folders = []
+    selected_queue_folders = list(st.session_state.sync_selected_folders or [])
     if st.session_state.sync_overview_rows:
-        rows = []
-        selected_set = set(st.session_state.sync_selected_folders or [])
-        for r in st.session_state.sync_overview_rows:
-            rr = dict(r)
-            folder = str(rr.get("capture_folder", ""))
-            rr["auswaehlen"] = folder in selected_set
-            rows.append(rr)
-        df_sync_editor = pd.DataFrame(rows)
+        # Persistent editor dataframe as source-of-truth across reruns.
+        cached_editor_df = st.session_state.get("sync_editor_value")
+        if not isinstance(cached_editor_df, pd.DataFrame):
+            cached_editor_df = None
+
+        if cached_editor_df is None or cached_editor_df.empty:
+            df_sync_editor = pd.DataFrame(st.session_state.sync_overview_rows)[
+                ["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
+            ].copy()
+            if "auswaehlen" not in df_sync_editor.columns:
+                df_sync_editor["auswaehlen"] = False
+            st.session_state.sync_editor_value = df_sync_editor.copy()
+        else:
+            df_sync_editor = cached_editor_df.copy()
+
         edited = table_slot.data_editor(
             df_sync_editor[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
             width="stretch",
@@ -1544,30 +1618,44 @@ with tab_sync:
             },
             key="sync_single_table",
         )
+
         if isinstance(edited, pd.DataFrame):
+            # Keep latest edited buffer; selection is committed only on submit.
+            st.session_state.sync_editor_value = edited.copy()
             selected_queue_folders = [
                 str(row["capture_folder"])
                 for _, row in edited.iterrows()
-                if bool(row.get("auswaehlen")) and str(row.get("status", "")) == "Queue"
+                if bool(row.get("auswaehlen"))
             ]
             st.session_state.sync_selected_folders = selected_queue_folders
     else:
-        table_slot.caption("Keine lokalen Quellvideos gefunden.")
+        table_slot.dataframe(
+            pd.DataFrame(columns=["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]),
+            width="stretch",
+            hide_index=True,
+            height=340,
+            column_config={
+                "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
+                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
+                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
+                "status": st.column_config.TextColumn("Status", width="medium"),
+            },
+        )
 
-    if sync_btn_clicked:
-        if st.session_state.sync_running:
-            st.session_state.sync_stop_requested = True
-            set_status("Stop angefordert: Sync stoppt nach aktueller Datei.", "warn")
+    if sync_stop_clicked:
+        st.session_state.sync_stop_requested = True
+        set_status("Stop angefordert: Sync stoppt nach aktueller Datei.", "warn")
+
+    if sync_start_clicked:
+        if (not selected_queue_folders) and (not st.session_state.sync_queue_rows):
+            set_status("Sync-Queue ist leer.", "warn")
         else:
-            if not st.session_state.sync_queue_rows:
-                set_status("Sync-Queue ist leer.", "warn")
+            _start_sync_run(selected_queue_folders)
+            if st.session_state.sync_running:
+                set_status(f"Sync gestartet ({st.session_state.sync_run_total} Datei(en)).", "info")
+                st.rerun()
             else:
-                _start_sync_run(selected_queue_folders)
-                if st.session_state.sync_running:
-                    set_status(f"Sync gestartet ({st.session_state.sync_run_total} Datei(en)).", "info")
-                    st.rerun()
-                else:
-                    set_status("Keine gueltigen Queue-Dateien fuer Sync ausgewaehlt.", "warn")
+                set_status("Keine gueltigen Queue-Dateien fuer Sync ausgewaehlt.", "warn")
 
     if st.session_state.sync_running:
         idx = int(st.session_state.sync_run_idx)
@@ -1594,6 +1682,7 @@ with tab_sync:
             overview_rows, queue_rows = _build_sync_overview_rows()
             st.session_state.sync_overview_rows = overview_rows
             st.session_state.sync_queue_rows = queue_rows
+            st.session_state.sync_editor_value = None
             stage_slot.success(f"Sync abgeschlossen: {ok_count} erfolgreich, {err_count} Fehler.")
             _finish_sync_run(
                 f"Sync abgeschlossen ({ok_count} OK / {err_count} Fehler).",
@@ -1643,8 +1732,6 @@ with tab_sync:
 
     st.markdown("---")
     st.caption("Hinweis: Stop wirkt zwischen Dateien (nicht mitten in einer laufenden Konvertierung).")
-
-    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
