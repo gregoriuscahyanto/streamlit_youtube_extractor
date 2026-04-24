@@ -35,6 +35,10 @@ try:
     from streamlit_cropper import st_cropper
 except Exception:
     st_cropper = None
+try:
+    from streamlit_js_eval import streamlit_js_eval
+except Exception:
+    streamlit_js_eval = None
 
 from local_storage import LocalStorageAdapter
 from backend import (
@@ -968,6 +972,28 @@ def _has_valid_8_points(points):
 
 def _clamp_roi_to_video(x, y, w, h, vid_w, vid_h):
     return clamp_roi_to_video(x, y, w, h, vid_w, vid_h)
+
+
+def _get_dynamic_roi_target_width(default_width: int = 620) -> int:
+    # Fallback-first for stability.
+    width = int(default_width)
+    if streamlit_js_eval is None:
+        return width
+    try:
+        vp = streamlit_js_eval(
+            js_expressions="window.parent.innerWidth",
+            key="roi_viewport_width_probe",
+            want_output=True,
+        )
+        if isinstance(vp, (int, float)) and float(vp) > 320:
+            vp = int(round(float(vp)))
+            # Approximation: left ROI column in a 2-column layout minus paddings/gap.
+            left_col = int(round((vp - 160) * 0.5))
+            width = max(360, min(920, left_col - 24))
+    except Exception:
+        # Never break app render because of viewport probing.
+        pass
+    return width
 
 
 def _try_auto_connect_once():
@@ -2589,15 +2615,24 @@ with tab_roi:
                 dims_key = (int(src_w), int(src_h))
                 if not isinstance(disp_meta, dict) or tuple(disp_meta.get("dims", ())) != dims_key:
                     # Stable width in ROI column, height follows source aspect ratio.
-                    target_w = 620
+                    target_w = _get_dynamic_roi_target_width(620)
                     target_w = min(target_w, max(1, src_w))
                     fit_w = int(target_w)
                     fit_h = max(1, int(round(fit_w * (src_h / float(max(1, src_w))))))
                     disp_meta = {"dims": dims_key, "w": int(fit_w), "h": int(fit_h)}
                     st.session_state.roi_display_meta = disp_meta
                 else:
-                    fit_w = max(1, int(disp_meta.get("w", src_w)))
-                    fit_h = max(1, int(disp_meta.get("h", src_h)))
+                    target_w_now = _get_dynamic_roi_target_width(int(disp_meta.get("w", 620)))
+                    target_w_now = min(target_w_now, max(1, src_w))
+                    fit_w_old = max(1, int(disp_meta.get("w", src_w)))
+                    if abs(target_w_now - fit_w_old) >= 24:
+                        fit_w = int(target_w_now)
+                        fit_h = max(1, int(round(fit_w * (src_h / float(max(1, src_w))))))
+                        disp_meta = {"dims": dims_key, "w": int(fit_w), "h": int(fit_h)}
+                        st.session_state.roi_display_meta = disp_meta
+                    else:
+                        fit_w = fit_w_old
+                        fit_h = max(1, int(disp_meta.get("h", src_h)))
                 off_x = 0
                 off_y = 0
                 if fit_w != src_w or fit_h != src_h:
