@@ -980,23 +980,41 @@ def _get_dynamic_roi_target_width(default_width: int = 620, anchor_id: str = "ro
     if streamlit_js_eval is None:
         return width
     try:
+        # streamlit_js_eval only re-evaluates when the expression string changes.
+        # We install a one-time resize bridge that proactively sends updated widths
+        # back to Python, which triggers reruns on browser resize.
+        expr = (
+            "(function(){"
+            "const d = window.parent?.document || document;"
+            f"const anchorId = {json.dumps(str(anchor_id))};"
+            "const readW = function(){"
+            "  const a = d.getElementById(anchorId);"
+            "  const col = a?.closest('[data-testid=\"column\"]');"
+            "  const p = a?.parentElement;"
+            "  const block = d.querySelector('.block-container');"
+            "  return Math.round(col?.clientWidth || p?.clientWidth || block?.clientWidth || window.parent?.innerWidth || window.innerWidth || 0);"
+            "};"
+            "if (!window.__roiResizeBridgeInstalled) {"
+            "  window.__roiResizeBridgeInstalled = true;"
+            "  let t = null;"
+            "  window.addEventListener('resize', function(){"
+            "    clearTimeout(t);"
+            "    t = setTimeout(function(){"
+            "      try { sendDataToPython({value: readW(), dataType: 'json'}); } catch (e) {}"
+            "    }, 120);"
+            "  });"
+            "}"
+            "return readW();"
+            "})()"
+        )
         container_w = streamlit_js_eval(
-            js_expressions=(
-                "(function(){"
-                "const d = window.parent?.document || document;"
-                f"const a = d.getElementById('{anchor_id}');"
-                "const p = a?.parentElement;"
-                "const block = d.querySelector('.block-container');"
-                "return (p?.clientWidth || block?.clientWidth || window.parent?.innerWidth || window.innerWidth);"
-                "})()"
-            ),
+            js_expressions=expr,
             key="roi_viewport_width_probe",
             want_output=True,
         )
-        if isinstance(container_w, (int, float)) and float(container_w) > 320:
+        if isinstance(container_w, (int, float)) and float(container_w) > 300:
             cw = int(round(float(container_w)))
-            # Exact left-column parent width with small safety margin.
-            width = max(320, min(920, cw - 16))
+            width = max(260, min(920, cw - 24))
     except Exception:
         # Never break app render because of viewport probing.
         pass
@@ -2632,15 +2650,10 @@ with tab_roi:
                 else:
                     target_w_now = _get_dynamic_roi_target_width(int(disp_meta.get("w", 620)), "roi-left-width-probe")
                     target_w_now = min(target_w_now, max(1, src_w))
-                    fit_w_old = max(1, int(disp_meta.get("w", src_w)))
-                    if abs(target_w_now - fit_w_old) >= 24:
-                        fit_w = int(target_w_now)
-                        fit_h = max(1, int(round(fit_w * (src_h / float(max(1, src_w))))))
-                        disp_meta = {"dims": dims_key, "w": int(fit_w), "h": int(fit_h)}
-                        st.session_state.roi_display_meta = disp_meta
-                    else:
-                        fit_w = fit_w_old
-                        fit_h = max(1, int(disp_meta.get("h", src_h)))
+                    fit_w = int(target_w_now)
+                    fit_h = max(1, int(round(fit_w * (src_h / float(max(1, src_w))))))
+                    disp_meta = {"dims": dims_key, "w": int(fit_w), "h": int(fit_h)}
+                    st.session_state.roi_display_meta = disp_meta
                 off_x = 0
                 off_y = 0
                 if fit_w != src_w or fit_h != src_h:
@@ -2685,7 +2698,11 @@ with tab_roi:
 
                     crop_box = None
                     pil_vis = Image.fromarray(disp_rgb)
-                    cropper_key = f"roi_cropper_main_{frame_idx}_{int(sel_idx_now) if isinstance(sel_idx_now, int) else -1}"
+                    cropper_key = (
+                        f"roi_cropper_main_{frame_idx}_"
+                        f"{int(sel_idx_now) if isinstance(sel_idx_now, int) else -1}_"
+                        f"{int(fit_w)}x{int(fit_h)}"
+                    )
                     try:
                         crop_box = st_cropper(
                             pil_vis,
