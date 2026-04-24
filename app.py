@@ -1,8 +1,8 @@
 """
-OCR Extractor â€“ Streamlit App v4
-Tab â˜  : Cloudflare R2-Verbindung, Prefix wÃ¤hlen, Datei-Browser
-Tab ðŸŽ¬  : Video laden, Start/Ende, ROI-Auswahl
-Tab ðŸ—º  : Track-Minimap Analyse â€“ 8-Punkte + Farberkennung
+OCR Extractor Ã¢â‚¬â€œ Streamlit App v4
+Tab Ã¢ËœÂ  : Cloudflare R2-Verbindung, Prefix wÃƒÂ¤hlen, Datei-Browser
+Tab Ã°Å¸Å½Â¬  : Video laden, Start/Ende, ROI-Auswahl
+Tab Ã°Å¸â€”Âº  : Track-Minimap Analyse Ã¢â‚¬â€œ 8-Punkte + Farberkennung
 """
 
 import streamlit as st
@@ -144,7 +144,7 @@ def _try_jump_to_tab(label: str):
     except Exception:
         pass
 
-# â”€â”€ Seitenkonfiguration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ Seitenkonfiguration Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 st.set_page_config(
     page_title="OCR Extractor",
     page_icon="OCR",
@@ -152,7 +152,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# â”€â”€ CSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ CSS Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;600;800&display=swap');
@@ -237,7 +237,7 @@ hr { border-color:#1e2535 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# â”€â”€ ROI / Format Listen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ ROI / Format Listen Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 ROI_NAMES = [
     "_","t_s","v_Fzg_kmph","v_Fzg_mph","numgear_GET",
     "a_G","a_mps2","a_x_G","a_x_pos_G","a_x_neg_G","a_x_mps",
@@ -277,8 +277,10 @@ AUDIO_PROXY_ENABLED = True
 AUDIO_LOWPASS_HZ = 1000
 AUDIO_TARGET_SR = 4000
 AUDIO_PROXY_NAME = "audio_proxy_1k.wav"
+LAMP_GREEN = "\U0001F7E2"
+LAMP_RED = "\U0001F534"
 
-# â”€â”€ Session-State â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ Session-State Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 def init_state():
     _acc, _key, _sec, _bkt = load_r2_credentials(streamlit_secrets=st.secrets)
     _local_default = str((st.secrets.get("local") or {}).get("default_path") or Path.cwd())
@@ -368,6 +370,8 @@ def init_state():
         roi_click_p1=None,
         roi_click_last_sig="",
         roi_display_meta={},
+        roi_editor_df=None,
+        roi_editor_widget_key="roi_data_editor_v2",
         # Track
         ref_track_img=None, ref_track_pts=None, minimap_pts=None,
         track_comparison=None, moving_pt_history=[],
@@ -381,7 +385,13 @@ def init_state():
 
 init_state()
 
-# â”€â”€ Hilfsfunktionen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# One-time migration for legacy ROI editor widget state keys that could hold
+# incompatible column schema/dtypes.
+for _legacy_roi_key in ("roi_data_editor", "roi_data_editor_v1"):
+    if _legacy_roi_key in st.session_state:
+        st.session_state.pop(_legacy_roi_key, None)
+
+# Ã¢â€â‚¬Ã¢â€â‚¬ Hilfsfunktionen Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 @st.cache_data(show_spinner=False)
 def get_frame(video_path: str, time_s: float):
     cap = cv2.VideoCapture(video_path)
@@ -1183,7 +1193,8 @@ def _apply_video(local_path, display_name):
         vid_height=info["height"], vid_duration=info["duration"],
         t_start=0.0, t_end=info["duration"], t_current=0.0, rois=[],
         selected_roi=None, drag_roi={}, roi_draw_armed=False,
-        roi_wait_user_move=False, roi_anchor_box={}, roi_reject_anchor_events=0)
+        roi_wait_user_move=False, roi_anchor_box={}, roi_reject_anchor_events=0,
+        roi_editor_df=None)
     if not st.session_state.capture_folder:
         st.session_state.capture_folder = Path(display_name).stem
     get_frame.clear(); get_video_info.clear()
@@ -1254,6 +1265,7 @@ def _load_framepack_from_r2(capture_folder: str) -> bool:
         roi_wait_user_move=False,
         roi_anchor_box={},
         roi_reject_anchor_events=0,
+        roi_editor_df=None,
     )
     set_status(f"Frame-Pack geladen: {capture_folder} ({len(frame_files)} Frames)", "ok")
     return True
@@ -1580,7 +1592,7 @@ def _analyze_mat_from_r2(remote_key: str):
 
 
 def _jn(value) -> str:
-    return "🟢" if bool(value) else "🔴"
+    return LAMP_GREEN if bool(value) else LAMP_RED
 
 
 def _summary_to_overview_row(summary: dict, display_folder: str = "") -> dict:
@@ -1681,9 +1693,9 @@ def _step_mat_update_once():
 
 def _status_cell_style(value):
     txt = str(value)
-    if ("🟢" in txt) or txt.endswith("Ja"):
+    if (LAMP_GREEN in txt) or txt.endswith("Ja"):
         return "background-color: #0f3d1f; color: #e8ffe8;"
-    if ("🔴" in txt) or txt.endswith("Nein"):
+    if (LAMP_RED in txt) or txt.endswith("Nein"):
         return "background-color: #4a1d1d; color: #ffe8e8;"
     return ""
 
@@ -1705,6 +1717,15 @@ def _style_overview_dataframe(df: pd.DataFrame):
     if hasattr(styler, "applymap"):
         return styler.applymap(_status_cell_style, subset=status_cols)
     return df
+
+
+def _normalize_overview_lamps(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    return df.replace({
+        "Ã°Å¸Å¸Â¢": LAMP_GREEN,
+        "Ã°Å¸â€Â´": LAMP_RED,
+    })
 
 
 def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progress_slot=None):
@@ -1850,6 +1871,7 @@ def _load_mat_from_r2(remote_key):
         st.session_state.roi_wait_user_move = False
         st.session_state.roi_anchor_box = {}
         st.session_state.roi_reject_anchor_events = 0
+        st.session_state.roi_editor_df = None
         if cfg.get("ref_track_pts"):
             st.session_state.ref_track_pts = cfg["ref_track_pts"]
         if cfg.get("minimap_pts"):
@@ -1874,7 +1896,7 @@ def _load_ref_from_r2(remote_key):
 _try_auto_connect_once()
 _try_auto_connect_local_once()
 
-# â”€â”€ Header + Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ Header + Status Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 st.markdown("""
 <div class="app-header">
   <h1>OCR Extractor</h1>
@@ -1891,7 +1913,7 @@ st.markdown(
     f'<span class="status-badge status-{stype}">{st.session_state.status_msg}</span>' + _pfx_badge,
     unsafe_allow_html=True)
 
-# â”€â”€ TABS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ TABS Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 _tab_labels = ["Cloud Connection & Root", "Sync", "MAT Selection", "ROI Setup", "Track Analysis"]
 _tab_default = st.session_state.get("tab_default")
 _tab_kwargs = {}
@@ -1909,9 +1931,9 @@ if isinstance(_tab_default, str) and _tab_default in _tab_labels:
     # One-shot tab jump target.
     st.session_state.tab_default = None
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB â˜ï¸  â€“ CLOUD & DATEIEN
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# TAB Ã¢ËœÂÃ¯Â¸Â  Ã¢â‚¬â€œ CLOUD & DATEIEN
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 with tab_setup:
     with st.expander("Debug-Logs", expanded=False):
         st.caption(f"Crash-Log Datei: {LOG_FILE}")
@@ -2355,9 +2377,9 @@ with tab_sync:
     st.caption("Hinweis: Stop wirkt zwischen Dateien (nicht mitten in einer laufenden Konvertierung).")
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB ðŸ§® â€“ MAT-AUSWAHL
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# TAB Ã°Å¸Â§Â® Ã¢â‚¬â€œ MAT-AUSWAHL
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 with tab_mat:
     st.markdown('<div class="section-card mat-selection-no-scroll">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">MAT-Auswahl und Analyse</div>', unsafe_allow_html=True)
@@ -2429,6 +2451,7 @@ with tab_mat:
 
     if st.session_state.mat_overview_rows:
         df_overview = pd.DataFrame(st.session_state.mat_overview_rows)
+        df_overview = _normalize_overview_lamps(df_overview)
         is_running_now = bool(st.session_state.mat_update_running)
         styled_df = df_overview
         allow_select = not is_running_now and not load_running
@@ -2797,7 +2820,7 @@ with tab_roi:
                 dw = int(drag_state.get("w", 0))
                 dh = int(drag_state.get("h", 0))
 
-            # Live-sync position: cropper drag → update active ROI x/y/w/h
+            # Live-sync position: cropper drag â†’ update active ROI x/y/w/h
             sel_idx = st.session_state.selected_roi
             if (
                 drag_roi is not None
@@ -2828,22 +2851,61 @@ with tab_roi:
             _rois = st.session_state.rois
             _sel = st.session_state.selected_roi
             _tbl_h = min(220, 38 * (len(_rois) + 1) + 4) if _rois else 80
-            df_edit = pd.DataFrame(
-                [
+            _sel_col = "__sel__"
+            _base_rows = [
+                {
+                    _sel_col: bool(i == _sel),
+                    "Name": str(r.get("name", "_")),
+                    "Format": str(r.get("fmt", "any")),
+                    "Pattern": str(r.get("pattern", "")),
+                    "Scale": float(r.get("max_scale", 1.2)),
+                }
+                for i, r in enumerate(_rois)
+            ]
+            _base_df = pd.DataFrame(_base_rows, columns=[_sel_col, "Name", "Format", "Pattern", "Scale"])
+            if _base_df.empty:
+                _base_df = pd.DataFrame(
                     {
-                        "✓": (i == _sel),
-                        "Name": r.get("name", "_"),
-                        "Format": r.get("fmt", "any"),
-                        "Pattern": r.get("pattern", ""),
-                        "Scale": float(r.get("max_scale", 1.2)),
+                        _sel_col: pd.Series(dtype="bool"),
+                        "Name": pd.Series(dtype="object"),
+                        "Format": pd.Series(dtype="object"),
+                        "Pattern": pd.Series(dtype="object"),
+                        "Scale": pd.Series(dtype="float64"),
                     }
-                    for i, r in enumerate(_rois)
-                ]
+                )
+            else:
+                _base_df[_sel_col] = _base_df[_sel_col].fillna(False).astype(bool)
+            _cached_df = st.session_state.get("roi_editor_df")
+            if (
+                isinstance(_cached_df, pd.DataFrame)
+                and list(_cached_df.columns) == list(_base_df.columns)
+                and len(_cached_df) == len(_base_df)
+            ):
+                df_edit = _cached_df.copy()
+                df_edit = df_edit.reindex(columns=[_sel_col, "Name", "Format", "Pattern", "Scale"])
+                df_edit[_sel_col] = df_edit[_sel_col].fillna(False).astype(bool)
+                df_edit[_sel_col] = [(i == _sel) for i in range(len(df_edit))]
+            else:
+                df_edit = _base_df.copy()
+
+            # Hard type normalization to keep Streamlit data_editor schema stable.
+            if _sel_col not in df_edit.columns:
+                df_edit[_sel_col] = False
+            df_edit = pd.DataFrame(
+                {
+                    _sel_col: pd.Series([bool(v) for v in df_edit[_sel_col].tolist()], dtype="bool"),
+                    "Name": pd.Series([str(v) for v in df_edit["Name"].tolist()], dtype="object"),
+                    "Format": pd.Series([str(v) for v in df_edit["Format"].tolist()], dtype="object"),
+                    "Pattern": pd.Series([str(v) for v in df_edit["Pattern"].tolist()], dtype="object"),
+                    "Scale": pd.to_numeric(df_edit["Scale"], errors="coerce").fillna(1.2).astype(float),
+                },
+                columns=[_sel_col, "Name", "Format", "Pattern", "Scale"],
             )
+
             edited_df = st.data_editor(
                 df_edit,
                 column_config={
-                    "✓": st.column_config.CheckboxColumn("", width="small"),
+                    _sel_col: st.column_config.CheckboxColumn("", width="small"),
                     "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width="medium"),
                     "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width="medium"),
                     "Pattern": st.column_config.TextColumn("Pattern", width="small"),
@@ -2853,20 +2915,22 @@ with tab_roi:
                 use_container_width=True,
                 hide_index=True,
                 height=_tbl_h,
-                key="roi_data_editor",
+                key=str(st.session_state.get("roi_editor_widget_key", "roi_data_editor_v2")),
             )
 
-            # Sync data_editor edits → session state
+            # Sync data_editor edits -> session state
             if edited_df is not None and len(edited_df) == len(_rois):
-                _newly_sel = None
-                _newly_desel = False
+                if _sel_col in edited_df.columns:
+                    edited_df[_sel_col] = edited_df[_sel_col].fillna(False).astype(bool)
+                st.session_state.roi_editor_df = edited_df.copy()
+                _checked_rows = [
+                    _i for _i, _row in edited_df.iterrows()
+                    if bool(_row.get(_sel_col, False))
+                ]
+                _newly_sel = int(_checked_rows[0]) if _checked_rows else _sel
+                _meta_changed = False
                 for _i, _row in edited_df.iterrows():
                     _r = _rois[_i]
-                    _checked = bool(_row.get("✓", False))
-                    if _checked and _i != _sel:
-                        _newly_sel = _i
-                    elif not _checked and _i == _sel:
-                        _newly_desel = True
                     _nn = str(_row["Name"]) if pd.notna(_row["Name"]) else _r.get("name", "_")
                     _nf = str(_row["Format"]) if pd.notna(_row["Format"]) else _r.get("fmt", "any")
                     _np = str(_row["Pattern"]) if pd.notna(_row["Pattern"]) else _r.get("pattern", "")
@@ -2876,7 +2940,8 @@ with tab_roi:
                             or abs(float(_r.get("max_scale", 1.2)) - _ns) > 1e-9):
                         st.session_state.rois[_i] = {**_r, "name": _nn, "fmt": _nf,
                                                       "pattern": _np, "max_scale": _ns}
-                if _newly_sel is not None:
+                        _meta_changed = True
+                if isinstance(_newly_sel, int) and _newly_sel != _sel and 0 <= _newly_sel < len(st.session_state.rois):
                     st.session_state.selected_roi = _newly_sel
                     st.session_state.roi_draw_armed = True
                     _sr = st.session_state.rois[_newly_sel]
@@ -2889,17 +2954,11 @@ with tab_roi:
                     st.session_state.roi_wait_user_move = True
                     st.session_state.roi_reject_anchor_events = 0
                     st.rerun()
-                elif _newly_desel:
-                    st.session_state.selected_roi = None
-                    st.session_state.roi_draw_armed = False
-                    st.session_state.roi_wait_user_move = False
-                    st.session_state.roi_anchor_box = {}
-                    st.session_state.roi_reject_anchor_events = 0
+                if _meta_changed:
                     st.rerun()
-
             act_sel = st.session_state.selected_roi
 
-            if st.button("ROI hinzufügen", type="primary", use_container_width=True, key="roi_add_btn"):
+            if st.button("ROI hinzufÃ¼gen", type="primary", use_container_width=True, key="roi_add_btn"):
                 # New ROI starts from a fresh default rectangle (independent from existing ROI).
                 _d = seed_drag_roi(fw, fh)
                 _cx, _cy, _cw, _ch = _clamp_roi_to_video(
@@ -2916,7 +2975,8 @@ with tab_roi:
                 st.session_state.roi_anchor_box = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
                 st.session_state.roi_wait_user_move = True
                 st.session_state.roi_reject_anchor_events = 0
-                set_status("ROI hinzugefügt. Name in Tabelle setzen und Position mit Kästchen anpassen.", "ok")
+                st.session_state.roi_editor_df = None
+                set_status("ROI hinzugefÃ¼gt. Name in Tabelle setzen und Position mit KÃ¤stchen anpassen.", "ok")
                 st.rerun()
 
             if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
@@ -2926,7 +2986,7 @@ with tab_roi:
                     f"[{int(sr.get('x',0))},{int(sr.get('y',0))},{int(sr.get('w',0))},{int(sr.get('h',0))}]"
                 )
 
-            if st.button("Ausgewählte ROI löschen", use_container_width=True,
+            if st.button("AusgewÃ¤hlte ROI lÃ¶schen", use_container_width=True,
                          key="roi_del_btn", disabled=act_sel is None):
                 if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
                     st.session_state.rois.pop(act_sel)
@@ -2935,9 +2995,10 @@ with tab_roi:
                     st.session_state.roi_wait_user_move = False
                     st.session_state.roi_anchor_box = {}
                     st.session_state.roi_reject_anchor_events = 0
+                    st.session_state.roi_editor_df = None
                     if st.session_state.media_source == "video":
                         get_frame.clear()
-                    set_status("ROI gelöscht.", "info")
+                    set_status("ROI gelÃ¶scht.", "info")
                     st.rerun()
 
             with st.expander("Speichern", expanded=False):
@@ -2965,9 +3026,9 @@ with tab_roi:
         st.markdown('</div>', unsafe_allow_html=True)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB ðŸ—º â€“ TRACK-ANALYSE
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# TAB Ã°Å¸â€”Âº Ã¢â‚¬â€œ TRACK-ANALYSE
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 with tab_track:
     has_ref   = st.session_state.ref_track_img is not None
     track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
