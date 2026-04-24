@@ -1,4 +1,4 @@
-﻿"""
+"""
 OCR Extractor â€“ Streamlit App v4
 Tab â˜  : Cloudflare R2-Verbindung, Prefix wÃ¤hlen, Datei-Browser
 Tab ðŸŽ¬  : Video laden, Start/Ende, ROI-Auswahl
@@ -6,14 +6,20 @@ Tab ðŸ—º  : Track-Minimap Analyse â€“ 8-Punkte + Farberkennung
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import cv2
 import numpy as np
 import json
 import tempfile
 import io
 import time
+import os
 import subprocess
 import shutil
+import sys
+import threading
+import traceback
+import concurrent.futures as cf
 import scipy.io as sio
 from scipy import signal
 from scipy.io import wavfile
@@ -21,6 +27,14 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+except Exception:
+    streamlit_image_coordinates = None
+try:
+    from streamlit_cropper import st_cropper
+except Exception:
+    st_cropper = None
 
 from local_storage import LocalStorageAdapter
 from backend import (
@@ -35,6 +49,13 @@ from backend import (
     summarize_mat_file,
 )
 from storage import StorageManager
+from roi_utils import (
+    can_add_roi_from_drag,
+    clamp_roi_to_video,
+    normalize_time_range,
+    roi_from_crop_box,
+    seed_drag_roi,
+)
 from track_analysis import (
     compare_minimap_to_reference,
     detect_moving_point,
@@ -42,6 +63,82 @@ from track_analysis import (
     extract_minimap_crop,
     project_point_with_homography,
 )
+
+# Crash-Log
+LOG_DIR = Path.cwd() / "logs"
+LOG_FILE = LOG_DIR / "app_crash.log"
+
+
+def _append_crash_log(header: str, tb_text: str):
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"\n\n=== {stamp} | {header} ===\n")
+            f.write(tb_text)
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def _is_ignorable_shutdown_exception(exc_type, exc_value, tb_text: str) -> bool:
+    # Streamlit shutdown can raise this benign runtime error while the event loop
+    # is already closing. We don't want to classify that as an app crash.
+    if exc_type is RuntimeError and "Event loop is closed" in str(exc_value):
+        if ("streamlit\\web\\bootstrap.py" in tb_text) or ("weakref.py" in tb_text):
+            return True
+    # Python tempfile cleanup at interpreter shutdown can fail on Windows when
+    # temp dirs are still locked by background handles.
+    if exc_type is PermissionError and "WinError 5" in str(exc_value):
+        if ("tempfile.py" in tb_text) and ("_cleanup" in tb_text) and ("weakref.py" in tb_text):
+            return True
+    return False
+
+
+def _handle_unhandled_exception(exc_type, exc_value, exc_tb):
+    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    if _is_ignorable_shutdown_exception(exc_type, exc_value, tb_text):
+        return
+    _append_crash_log("Unhandled Exception", tb_text)
+
+
+def _handle_thread_exception(args):
+    tb_text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    if _is_ignorable_shutdown_exception(args.exc_type, args.exc_value, tb_text):
+        return
+    _append_crash_log(f"Thread Exception ({getattr(args, 'thread', None)})", tb_text)
+
+
+sys.excepthook = _handle_unhandled_exception
+if hasattr(threading, "excepthook"):
+    threading.excepthook = _handle_thread_exception
+
+
+def _try_jump_to_tab(label: str):
+    try:
+        js_label = json.dumps(str(label))
+        components.html(
+            f"""
+            <script>
+            (function() {{
+              const target = {js_label};
+              const root = window.parent?.document || document;
+              const tabs = root.querySelectorAll('button[data-baseweb="tab"]');
+              for (const b of tabs) {{
+                const txt = (b.innerText || b.textContent || "").trim();
+                if (txt === target) {{
+                  b.click();
+                  break;
+                }}
+              }}
+            }})();
+            </script>
+            """,
+            height=1,
+            scrolling=False,
+        )
+    except Exception:
+        pass
 
 # â”€â”€ Seitenkonfiguration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 st.set_page_config(
@@ -180,6 +277,7 @@ AUDIO_PROXY_NAME = "audio_proxy_1k.wav"
 # â”€â”€ Session-State â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def init_state():
     _acc, _key, _sec, _bkt = load_r2_credentials(streamlit_secrets=st.secrets)
+    _local_default = str((st.secrets.get("local") or {}).get("default_path") or Path.cwd())
 
     defs = dict(
         # R2
@@ -193,9 +291,10 @@ def init_state():
         r2_listing_debug=[],
         auto_connect_attempted=False,
         auto_connect_used=False,
+        local_auto_connect_attempted=False,
         # Local DB
-        local_base_path=str(Path.cwd()),
-        local_base_path_input=str(Path.cwd()),
+        local_base_path=_local_default,
+        local_base_path_input=_local_default,
         local_connected=False,
         local_client=None,
         local_root="",
@@ -218,9 +317,12 @@ def init_state():
         sync_refresh_folders=[],
         sync_refresh_rows=[],
         mat_files=[],
+        mat_targets=[],
         mat_scan_prefix=None,
         mat_selected_key="",
+        mat_pending_selected_key="",
         mat_selected_summary=None,
+        mat_summary_cache={},
         mat_overview_rows=[],
         mat_auto_updated_prefix=None,
         jump_to_mat_tab=False,
@@ -229,6 +331,9 @@ def init_state():
         mat_update_total=0,
         mat_update_keys=[],
         mat_run_state="idle",
+        mat_load_requested=False,
+        mat_load_running=False,
+        tab_default=None,
         # Datei-Browser
         fb_path="", fb_items=[], fb_selected=None,
         # Aufnahme
@@ -242,6 +347,23 @@ def init_state():
         vid_duration=0.0, vid_fps=25.0, vid_width=0, vid_height=0,
         t_start=0.0, t_end=0.0, t_current=0.0,
         rois=[], selected_roi=None,
+        drag_roi={},
+        roi_draw_armed=False,
+        roi_force_default_once=False,
+        roi_last_frame_key=None,
+        roi_seed_drag={},
+        roi_seen_nonseed=False,
+        roi_reject_seed_once=False,
+        roi_cropper_ver=0,
+        roi_prev_frame_idx=None,
+        roi_wait_user_move=False,
+        roi_anchor_box={},
+        roi_reject_anchor_events=0,
+        roi_pending_select_idx=None,
+        roi_click_stage=0,
+        roi_click_p1=None,
+        roi_click_last_sig="",
+        roi_display_meta={},
         # Track
         ref_track_img=None, ref_track_pts=None, minimap_pts=None,
         track_comparison=None, moving_pt_history=[],
@@ -845,13 +967,7 @@ def _has_valid_8_points(points):
 
 
 def _clamp_roi_to_video(x, y, w, h, vid_w, vid_h):
-    x = max(0.0, float(x))
-    y = max(0.0, float(y))
-    max_w = max(1.0, float(vid_w) - x) if vid_w else max(1.0, float(w))
-    max_h = max(1.0, float(vid_h) - y) if vid_h else max(1.0, float(h))
-    w = min(max(1.0, float(w)), max_w)
-    h = min(max(1.0, float(h)), max_h)
-    return x, y, w, h
+    return clamp_roi_to_video(x, y, w, h, vid_w, vid_h)
 
 
 def _try_auto_connect_once():
@@ -886,6 +1002,30 @@ def _try_auto_connect_once():
     st.session_state.auto_connect_used = True
     set_status("Auto-Connect erfolgreich.", "ok")
 
+def _try_auto_connect_local_once():
+    if st.session_state.local_connected or st.session_state.get("local_auto_connect_attempted"):
+        return
+    st.session_state.local_auto_connect_attempted = True
+    lp_str = str((st.secrets.get("local") or {}).get("default_path") or "").strip()
+    if not lp_str:
+        return
+    try:
+        lp = Path(lp_str).expanduser().resolve()
+        if not lp.exists() or not lp.is_dir():
+            return
+        if not (lp / "captures").exists():
+            return
+        local_client = LocalStorageAdapter(str(lp))
+        ok_local, _ = local_client.test_connection()
+        if ok_local:
+            st.session_state.local_connected = True
+            st.session_state.local_client = local_client
+            st.session_state.local_base_path = str(lp)
+            st.session_state.local_root = ""
+    except Exception:
+        pass
+
+
 def _file_icon(name):
     ext = Path(name).suffix.lower()
     return {
@@ -895,18 +1035,57 @@ def _file_icon(name):
         ".txt": "[TXT]", ".md": "[TXT]",
     }.get(ext, "[FILE]")
 
-def draw_rois(frame, rois, sel, vid_w, vid_h):
+def draw_rois(frame, rois, sel, vid_w, vid_h, skip_idx=None):
     img = frame.copy()
     dh, dw = img.shape[:2]
     sx = dw/vid_w if vid_w else 1.0
     sy = dh/vid_h if vid_h else 1.0
     for i, r in enumerate(rois):
+        if skip_idx is not None and i == skip_idx:
+            continue
         x,y,w,h = int(r["x"]*sx),int(r["y"]*sy),int(r["w"]*sx),int(r["h"]*sy)
         is_track = r["name"]=="track_minimap"
-        color = (74,200,150) if is_track else ((90,180,255) if i==sel else (255,80,80))
-        cv2.rectangle(img,(x,y),(x+w,y+h),color,2)
-        cv2.putText(img,r["name"],(x+3,y+14),cv2.FONT_HERSHEY_SIMPLEX,.42,color,1,cv2.LINE_AA)
+        color = (40, 220, 180) if is_track else ((255, 225, 40) if i == sel else (255, 80, 80))
+        thick = 3 if i == sel else 2
+        cv2.rectangle(img,(x,y),(x+w,y+h),color,thick)
+        cv2.putText(img,r["name"],(x+3,y+14),cv2.FONT_HERSHEY_SIMPLEX,.44,color,1,cv2.LINE_AA)
     return img
+
+
+@st.cache_resource(show_spinner=False)
+def _opencv_gui_available():
+    try:
+        info = cv2.getBuildInformation()
+    except Exception:
+        return False, "OpenCV Build-Info nicht verfuegbar."
+    # OpenCV reports GUI backend in this section. Headless builds usually show NONE.
+    gui_lines = [ln.strip() for ln in info.splitlines() if ln.strip().startswith("GUI:")]
+    if not gui_lines:
+        return False, "OpenCV GUI-Backend unbekannt."
+    gui_line = gui_lines[0]
+    if "NONE" in gui_line.upper():
+        return False, (
+            "OpenCV ist als headless installiert (ohne GUI). "
+            "Bitte in der venv umstellen: "
+            "`pip uninstall -y opencv-python-headless && pip install opencv-python`"
+        )
+    return True, gui_line
+
+
+def _pick_roi_with_cv_window(frame_rgb):
+    gui_ok, gui_msg = _opencv_gui_available()
+    if not gui_ok:
+        return False, gui_msg, None
+    try:
+        view = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        cv2.namedWindow("ROI Auswahl", cv2.WINDOW_NORMAL)
+        x, y, w, h = cv2.selectROI("ROI Auswahl", view, showCrosshair=True, fromCenter=False)
+        cv2.destroyWindow("ROI Auswahl")
+    except Exception as e:
+        return False, f"ROI-Fenster konnte nicht geoeffnet werden: {e}", None
+    if int(w) < 1 or int(h) < 1:
+        return False, "Keine ROI ausgewaehlt.", None
+    return True, "", {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
 
 def build_result_json():
     return build_result_payload(
@@ -1090,23 +1269,60 @@ def _results_dir_key() -> str:
 def _refresh_mat_files():
     if not st.session_state.r2_connected or st.session_state.r2_client is None:
         st.session_state.mat_files = []
+        st.session_state.mat_targets = []
         return
+    client = st.session_state.r2_client
+    pfx = st.session_state.r2_prefix.strip("/")
     res_key = _results_dir_key()
-    ok, items = st.session_state.r2_client.list_files(res_key)
-    if not ok or not isinstance(items, list):
-        st.session_state.mat_files = []
-        return
+    cap_root = f"{pfx}/captures" if pfx else "captures"
+
+    ok_res, res_items = client.list_files(res_key)
+    ok_cap, cap_items = client.list_files(cap_root)
+    if not ok_res or not isinstance(res_items, list):
+        res_items = []
+    if not ok_cap or not isinstance(cap_items, list):
+        cap_items = []
+
     mats = []
-    for name in items:
+    for name in res_items:
         if not name.endswith("/"):
             full_key = f"{res_key}/{name}" if res_key else name
             if full_key.lower().endswith(".mat"):
                 mats.append(full_key.strip("/"))
     mats.sort(reverse=True)
     st.session_state.mat_files = mats
-    if st.session_state.mat_selected_key not in mats:
-        st.session_state.mat_selected_key = mats[0] if mats else ""
+
+    folders = sorted([n.rstrip("/") for n in cap_items if n.endswith("/")], reverse=True)
+    mats_set = set(mats)
+    mat_by_folder = {}
+    for mk in mats:
+        g = _mat_capture_guess_from_key(mk)
+        if g and g not in mat_by_folder:
+            mat_by_folder[g] = mk
+
+    targets = []
+    used_mats = set()
+    for folder in folders:
+        expected = f"{res_key}/results_{folder}.mat" if res_key else f"results_{folder}.mat"
+        mat_key = expected if expected in mats_set else mat_by_folder.get(folder, "")
+        if mat_key:
+            used_mats.add(mat_key)
+        targets.append({"kind": "folder", "folder": folder, "mat_key": mat_key})
+
+    for mk in mats:
+        if mk not in used_mats:
+            targets.append({"kind": "mat_only", "folder": _mat_capture_guess_from_key(mk), "mat_key": mk})
+    st.session_state.mat_targets = targets
+
+    # Invalidate summary cache when file set changes.
+    cache = st.session_state.get("mat_summary_cache") or {}
+    st.session_state.mat_summary_cache = {k: v for k, v in cache.items() if k in mats}
+    valid_mat_keys = [t.get("mat_key", "") for t in targets if t.get("mat_key")]
+    if st.session_state.mat_selected_key not in valid_mat_keys:
+        st.session_state.mat_selected_key = valid_mat_keys[0] if valid_mat_keys else ""
         st.session_state.mat_selected_summary = None
+    if st.session_state.mat_pending_selected_key not in valid_mat_keys:
+        st.session_state.mat_pending_selected_key = st.session_state.mat_selected_key
     st.session_state.mat_scan_prefix = st.session_state.r2_prefix
 
 
@@ -1127,11 +1343,23 @@ def _download_mat_to_temp(remote_key: str):
     return True, "", tmp.name
 
 
-def _get_mat_summary_from_r2(remote_key: str):
-    ok, msg, tmp_path = _download_mat_to_temp(remote_key)
-    if not ok or not tmp_path:
-        return {"mat_file": Path(remote_key).name, "error": f"Download: {msg}"}
-    summary = summarize_mat_file(tmp_path)
+def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+    tmp.close()
+    ok, msg = client.download_file(remote_key, tmp.name)
+    if not ok:
+        return {"mat_file": Path(remote_key).name, "remote_key": remote_key, "error": f"Download: {msg}"}
+
+    try:
+        summary = summarize_mat_file(tmp.name)
+    except Exception as e:
+        summary = {"error": f"{e.__class__.__name__}: {e}"}
+    finally:
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
     summary["mat_file"] = Path(remote_key).name
     summary["remote_key"] = remote_key
     if not summary.get("capture_folder"):
@@ -1139,10 +1367,10 @@ def _get_mat_summary_from_r2(remote_key: str):
     capture_folder = summary.get("capture_folder", "")
     summary["video_file_exists"] = None
     summary["audio_file_exists"] = None
-    if capture_folder and st.session_state.r2_client is not None:
-        pfx = st.session_state.r2_prefix.strip("/")
-        cap_dir = f"{pfx}/captures/{capture_folder}" if pfx else f"captures/{capture_folder}"
-        ok_list, items = st.session_state.r2_client.list_files(cap_dir)
+
+    if capture_folder:
+        cap_dir = f"{prefix}/captures/{capture_folder}" if prefix else f"captures/{capture_folder}"
+        ok_list, items = client.list_files(cap_dir)
         if ok_list and isinstance(items, list):
             files = [n for n in items if not n.endswith("/")]
             lower_files = [n.lower() for n in files]
@@ -1152,22 +1380,136 @@ def _get_mat_summary_from_r2(remote_key: str):
             has_audio_file = any(
                 n.endswith((".wav", ".mp3", ".m4a", ".aac", ".flac")) for n in lower_files
             )
-
-            # Reduced cloud media support:
-            # - video equivalent can be frame-pack in captures/<folder>/frames_1fps/
-            # - audio equivalent can be audio proxy file
-            has_framepack = False
-            if "frames_1fps/" in items:
-                ok_fp, fp_items = st.session_state.r2_client.list_files(f"{cap_dir}/frames_1fps")
+            has_framepack = "frames_1fps/" in items
+            framepack_count = 0
+            framepack_expected = 0
+            framepack_complete = False
+            if has_framepack:
+                ok_fp, fp_items = client.list_files(f"{cap_dir}/frames_1fps")
                 if ok_fp and isinstance(fp_items, list):
-                    has_framepack = any(
-                        x.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) for x in fp_items
+                    framepack_count = len([
+                        x for x in fp_items if str(x).lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+                    ])
+                    if "index.json" in fp_items:
+                        tmp_idx = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+                        tmp_idx.close()
+                        ok_idx, _ = client.download_file(f"{cap_dir}/frames_1fps/index.json", tmp_idx.name)
+                        if ok_idx:
+                            try:
+                                payload = json.loads(Path(tmp_idx.name).read_text(encoding="utf-8", errors="ignore"))
+                                framepack_expected = int(payload.get("frame_count", 0) or 0)
+                            except Exception:
+                                framepack_expected = 0
+                        try:
+                            Path(tmp_idx.name).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    framepack_complete = framepack_count > 0 and (
+                        framepack_expected <= 0 or framepack_count >= framepack_expected
                     )
-
             has_audio_proxy = any(n == AUDIO_PROXY_NAME.lower() for n in lower_files)
-
-            summary["video_file_exists"] = bool(has_full_or_proxy_video or has_framepack)
+            summary["framepack_count"] = int(framepack_count)
+            summary["framepack_expected"] = int(framepack_expected)
+            summary["framepack_complete"] = bool(framepack_complete)
+            summary["audio_proxy_present"] = bool(has_audio_proxy)
+            summary["video_file_exists"] = bool(has_full_or_proxy_video or framepack_complete)
             summary["audio_file_exists"] = bool(has_audio_file or has_audio_proxy)
+            if not framepack_complete and has_framepack:
+                summary["media_detail"] = f"Frames unvollstaendig ({framepack_count}/{framepack_expected or '?'})."
+            elif not has_framepack:
+                summary["media_detail"] = "Frames fehlen."
+            elif not summary["audio_file_exists"]:
+                summary["media_detail"] = "Audio fehlt."
+            else:
+                summary["media_detail"] = ""
+        else:
+            summary["media_detail"] = "Capture-Ordner nicht lesbar."
+    else:
+        summary["media_detail"] = ""
+
+    return summary
+
+
+def _compute_folder_only_summary(folder: str, client, prefix: str) -> dict:
+    summary = {
+        "mat_file": "",
+        "remote_key": "",
+        "capture_folder": folder,
+        "video_file_exists": False,
+        "audio_file_exists": False,
+        "roi_selected": False,
+        "track_selected": False,
+        "start_end_selected": False,
+        "ocr_done": False,
+        "ocr_complete": False,
+        "audio_spectrogram_done": False,
+        "validation_done": False,
+        "error": "",
+        "media_detail": "",
+    }
+    cap_dir = f"{prefix}/captures/{folder}" if prefix else f"captures/{folder}"
+    ok_list, items = client.list_files(cap_dir)
+    if not ok_list or not isinstance(items, list):
+        summary["error"] = "Capture-Ordner nicht lesbar."
+        return summary
+
+    files = [n for n in items if not n.endswith("/")]
+    lower_files = [n.lower() for n in files]
+    has_audio_file = any(n.endswith((".wav", ".mp3", ".m4a", ".aac", ".flac")) for n in lower_files)
+    has_audio_proxy = any(n == AUDIO_PROXY_NAME.lower() for n in lower_files)
+
+    has_framepack = "frames_1fps/" in items
+    framepack_count = 0
+    framepack_expected = 0
+    if has_framepack:
+        ok_fp, fp_items = client.list_files(f"{cap_dir}/frames_1fps")
+        if ok_fp and isinstance(fp_items, list):
+            framepack_count = len([
+                x for x in fp_items if str(x).lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+            ])
+            if "index.json" in fp_items:
+                tmp_idx = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+                tmp_idx.close()
+                ok_idx, _ = client.download_file(f"{cap_dir}/frames_1fps/index.json", tmp_idx.name)
+                if ok_idx:
+                    try:
+                        payload = json.loads(Path(tmp_idx.name).read_text(encoding="utf-8", errors="ignore"))
+                        framepack_expected = int(payload.get("frame_count", 0) or 0)
+                    except Exception:
+                        framepack_expected = 0
+                try:
+                    Path(tmp_idx.name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    framepack_complete = framepack_count > 0 and (framepack_expected <= 0 or framepack_count >= framepack_expected)
+    summary["video_file_exists"] = bool(framepack_complete)
+    summary["audio_file_exists"] = bool(has_audio_file or has_audio_proxy)
+    if not framepack_complete and has_framepack:
+        summary["media_detail"] = f"Frames unvollstaendig ({framepack_count}/{framepack_expected or '?'})."
+    elif not has_framepack:
+        summary["media_detail"] = "Frames fehlen."
+    elif not summary["audio_file_exists"]:
+        summary["media_detail"] = "Audio fehlt."
+    else:
+        summary["media_detail"] = ""
+    return summary
+
+
+def _get_mat_summary_from_r2(remote_key: str):
+    cache = st.session_state.get("mat_summary_cache")
+    if isinstance(cache, dict) and remote_key in cache:
+        cval = cache.get(remote_key)
+        if isinstance(cval, dict):
+            return dict(cval)
+    summary = _compute_mat_summary_remote(
+        remote_key=remote_key,
+        client=st.session_state.r2_client,
+        prefix=st.session_state.r2_prefix.strip("/"),
+    )
+    if isinstance(cache, dict):
+        cache[remote_key] = dict(summary)
+        st.session_state.mat_summary_cache = cache
     return summary
 
 
@@ -1179,12 +1521,13 @@ def _analyze_mat_from_r2(remote_key: str):
 
 
 def _jn(value) -> str:
-    return "Ja" if bool(value) else "Nein"
+    return "🟢" if bool(value) else "🔴"
 
 
-def _summary_to_overview_row(summary: dict) -> dict:
+def _summary_to_overview_row(summary: dict, display_folder: str = "") -> dict:
+    folder_label = display_folder or summary.get("capture_folder") or summary.get("mat_file", "")
     return {
-        "mat_datei": summary.get("mat_file", ""),
+        "mat_datei": folder_label,
         "remote_key": summary.get("remote_key", ""),
         "audio_video_vorhanden": _jn(
             bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists"))
@@ -1196,14 +1539,21 @@ def _summary_to_overview_row(summary: dict) -> dict:
         "ocr_vollstaendig": _jn(summary.get("ocr_complete")),
         "audioanalyse_spektrogramm": _jn(summary.get("audio_spectrogram_done")),
         "validierung": _jn(summary.get("validation_done")),
-        "fehler": summary.get("error", ""),
+        "fehler": summary.get("error", "") or summary.get("media_detail", ""),
     }
 
 
-def _placeholder_overview_row(remote_key: str) -> dict:
+def _placeholder_overview_row(target) -> dict:
+    if isinstance(target, dict):
+        folder = str(target.get("folder", "") or "")
+        mat_key = str(target.get("mat_key", "") or "")
+    else:
+        folder = ""
+        mat_key = str(target)
+    title = folder or Path(mat_key).name
     return {
-        "mat_datei": Path(remote_key).name,
-        "remote_key": remote_key,
+        "mat_datei": title,
+        "remote_key": mat_key,
         "audio_video_vorhanden": "...",
         "roi_ausgewaehlt": "...",
         "track_ausgewaehlt": "...",
@@ -1225,12 +1575,18 @@ def _build_mat_overview_rows(remote_keys: list[str]) -> list[dict]:
 
 
 def _start_mat_update(remote_keys: list[str]):
-    st.session_state.mat_update_keys = list(remote_keys)
-    st.session_state.mat_update_total = len(remote_keys)
+    targets = []
+    for it in remote_keys:
+        if isinstance(it, dict):
+            targets.append(it)
+        else:
+            targets.append({"kind": "mat_only", "folder": _mat_capture_guess_from_key(str(it)), "mat_key": str(it)})
+    st.session_state.mat_update_keys = list(targets)
+    st.session_state.mat_update_total = len(targets)
     st.session_state.mat_update_idx = 0
-    st.session_state.mat_update_running = len(remote_keys) > 0
-    st.session_state.mat_run_state = "running" if len(remote_keys) > 0 else "idle"
-    st.session_state.mat_overview_rows = [_placeholder_overview_row(k) for k in remote_keys]
+    st.session_state.mat_update_running = len(targets) > 0
+    st.session_state.mat_run_state = "running" if len(targets) > 0 else "idle"
+    st.session_state.mat_overview_rows = [_placeholder_overview_row(t) for t in targets]
 
 
 def _step_mat_update_once():
@@ -1244,9 +1600,18 @@ def _step_mat_update_once():
         st.session_state.mat_run_state = "idle"
         return
 
-    key = keys[idx]
-    summary = _get_mat_summary_from_r2(key)
-    st.session_state.mat_overview_rows[idx] = _summary_to_overview_row(summary)
+    target = keys[idx]
+    folder = str(target.get("folder", "") or "") if isinstance(target, dict) else ""
+    key = str(target.get("mat_key", "") or "") if isinstance(target, dict) else str(target)
+    if key:
+        summary = _get_mat_summary_from_r2(key)
+    else:
+        summary = _compute_folder_only_summary(
+            folder=folder,
+            client=st.session_state.r2_client,
+            prefix=st.session_state.r2_prefix.strip("/"),
+        )
+    st.session_state.mat_overview_rows[idx] = _summary_to_overview_row(summary, display_folder=folder)
     st.session_state.mat_update_idx = idx + 1
 
     if st.session_state.mat_update_idx >= total:
@@ -1256,9 +1621,10 @@ def _step_mat_update_once():
 
 
 def _status_cell_style(value):
-    if str(value) == "Ja":
+    txt = str(value)
+    if ("🟢" in txt) or txt.endswith("Ja"):
         return "background-color: #0f3d1f; color: #e8ffe8;"
-    if str(value) == "Nein":
+    if ("🔴" in txt) or txt.endswith("Nein"):
         return "background-color: #4a1d1d; color: #ffe8e8;"
     return ""
 
@@ -1287,15 +1653,29 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
     Backward-compatible synchronous updater for MAT overview rows.
     """
     _start_mat_update(remote_keys)
-    total = len(remote_keys)
+    total = len(st.session_state.mat_update_keys or [])
     progress = progress_slot.progress(0, text=f"0/{total} MAT-Dateien analysiert") if (total > 0 and progress_slot is not None) else None
+    try:
+        cache = st.session_state.get("mat_summary_cache")
+        if not isinstance(cache, dict):
+            cache = {}
 
-    while st.session_state.mat_update_running:
-        _step_mat_update_once()
-        done = int(st.session_state.mat_update_idx or 0)
+        targets = list(st.session_state.mat_update_keys or [])
+        pending_idx = []
+        done = 0
+        for i, t in enumerate(targets):
+            mk = str(t.get("mat_key", "") or "")
+            folder = str(t.get("folder", "") or "")
+            if mk and mk in cache:
+                st.session_state.mat_overview_rows[i] = _summary_to_overview_row(cache[mk], display_folder=folder)
+                done += 1
+            else:
+                pending_idx.append(i)
+
+        st.session_state.mat_update_idx = done
         if live_table is not None:
             live_table.dataframe(
-                _style_overview_dataframe(pd.DataFrame(st.session_state.mat_overview_rows)),
+                pd.DataFrame(st.session_state.mat_overview_rows),
                 width="stretch",
                 hide_index=True,
                 height=MAT_TABLE_HEIGHT,
@@ -1303,6 +1683,65 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
             )
         if progress is not None and total > 0:
             progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
+
+        if pending_idx:
+            max_workers = max(2, min(8, (os.cpu_count() or 4)))
+            pfx = st.session_state.r2_prefix.strip("/")
+            client = st.session_state.r2_client
+            with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                fut_to_idx = {}
+                for i in pending_idx:
+                    t = targets[i]
+                    mk = str(t.get("mat_key", "") or "")
+                    folder = str(t.get("folder", "") or "")
+                    if mk:
+                        fut = ex.submit(_compute_mat_summary_remote, mk, client, pfx)
+                    else:
+                        fut = ex.submit(_compute_folder_only_summary, folder, client, pfx)
+                    fut_to_idx[fut] = i
+
+                for fut in cf.as_completed(fut_to_idx):
+                    i = fut_to_idx[fut]
+                    t = targets[i]
+                    mk = str(t.get("mat_key", "") or "")
+                    folder = str(t.get("folder", "") or "")
+                    try:
+                        summary = fut.result()
+                    except Exception as e:
+                        summary = {"mat_file": Path(mk).name if mk else "", "remote_key": mk, "error": f"{e.__class__.__name__}: {e}"}
+                    if mk:
+                        cache[mk] = dict(summary)
+                    st.session_state.mat_overview_rows[i] = _summary_to_overview_row(summary, display_folder=folder)
+                    done += 1
+                    st.session_state.mat_update_idx = done
+                    if live_table is not None and (done == total or done % 3 == 0 or done <= 2):
+                        live_table.dataframe(
+                            pd.DataFrame(st.session_state.mat_overview_rows),
+                            width="stretch",
+                            hide_index=True,
+                            height=MAT_TABLE_HEIGHT,
+                            column_config=MAT_OVERVIEW_COLCFG,
+                        )
+                    if progress is not None and total > 0:
+                        progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
+
+        st.session_state.mat_summary_cache = cache
+        st.session_state.mat_update_running = False
+        st.session_state.mat_run_state = "idle"
+    except Exception:
+        while st.session_state.mat_update_running:
+            _step_mat_update_once()
+            done = int(st.session_state.mat_update_idx or 0)
+            if live_table is not None and (done == total or done % 3 == 0 or done <= 2):
+                live_table.dataframe(
+                    pd.DataFrame(st.session_state.mat_overview_rows),
+                    width="stretch",
+                    hide_index=True,
+                    height=MAT_TABLE_HEIGHT,
+                    column_config=MAT_OVERVIEW_COLCFG,
+                )
+            if progress is not None and total > 0:
+                progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
 
     if progress is not None:
         progress.empty()
@@ -1368,6 +1807,7 @@ def _load_ref_from_r2(remote_key):
 
 
 _try_auto_connect_once()
+_try_auto_connect_local_once()
 
 # â”€â”€ Header + Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 st.markdown("""
@@ -1387,14 +1827,53 @@ st.markdown(
     unsafe_allow_html=True)
 
 # â”€â”€ TABS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-tab_setup, tab_sync, tab_mat, tab_roi, tab_track = st.tabs(
-    ["Cloud Connection & Root", "Sync", "MAT Selection", "ROI Setup", "Track Analysis"]
-)
+_tab_labels = ["Cloud Connection & Root", "Sync", "MAT Selection", "ROI Setup", "Track Analysis"]
+_tab_default = st.session_state.get("tab_default")
+_tab_kwargs = {}
+if isinstance(_tab_default, str) and _tab_default in _tab_labels:
+    _tab_kwargs["default"] = _tab_default
+try:
+    tab_setup, tab_sync, tab_mat, tab_roi, tab_track = st.tabs(_tab_labels, **_tab_kwargs)
+except TypeError:
+    tab_setup, tab_sync, tab_mat, tab_roi, tab_track = st.tabs(_tab_labels)
+finally:
+    pass
+
+if isinstance(_tab_default, str) and _tab_default in _tab_labels:
+    _try_jump_to_tab(_tab_default)
+    # One-shot tab jump target.
+    st.session_state.tab_default = None
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # TAB â˜ï¸  â€“ CLOUD & DATEIEN
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_setup:
+    with st.expander("Debug-Logs", expanded=False):
+        st.caption(f"Crash-Log Datei: {LOG_FILE}")
+        if LOG_FILE.exists():
+            try:
+                log_text = LOG_FILE.read_text(encoding="utf-8", errors="ignore")
+            except Exception as e:
+                log_text = f"Log konnte nicht gelesen werden: {e}"
+            st.code(log_text[-12000:] if log_text else "(leer)", language="text")
+            c_log1, c_log2 = st.columns(2)
+            c_log1.download_button(
+                "Log herunterladen",
+                data=log_text.encode("utf-8", errors="ignore"),
+                file_name="app_crash.log",
+                mime="text/plain",
+                use_container_width=True,
+            )
+            if c_log2.button("Log leeren", use_container_width=True):
+                try:
+                    LOG_FILE.write_text("", encoding="utf-8")
+                    set_status("Crash-Log geleert.", "info")
+                    st.rerun()
+                except Exception as e:
+                    set_status(f"Log konnte nicht geleert werden: {e}", "warn")
+        else:
+            st.info("Noch kein Crash-Log vorhanden.")
+
     cloud_ok = bool(st.session_state.r2_connected)
     local_ok = bool(st.session_state.local_connected)
 
@@ -1823,8 +2302,9 @@ with tab_mat:
         _refresh_mat_files()
         st.session_state.mat_auto_updated_prefix = None
 
-    mats = st.session_state.mat_files if connected else []
+    mat_targets = st.session_state.mat_targets if connected else []
     running = bool(st.session_state.mat_update_running)
+    load_running = bool(st.session_state.mat_load_running)
 
     c1, c2 = st.columns(2)
     update_clicked = c1.button(
@@ -1833,7 +2313,13 @@ with tab_mat:
         key="mat_update_tab",
         disabled=not connected,
     )
-    can_load = connected and bool(st.session_state.mat_selected_key) and not running
+    can_load = (
+        connected
+        and bool(st.session_state.mat_overview_rows)
+        and bool(st.session_state.get("mat_pending_selected_key", ""))
+        and not running
+        and not load_running
+    )
     load_clicked = c2.button(
         "MAT + Video laden",
         type="primary",
@@ -1842,7 +2328,6 @@ with tab_mat:
         disabled=not can_load,
     )
 
-    # Progress appears below the buttons.
     progress_slot = st.empty()
     table_slot = st.empty()
 
@@ -1853,54 +2338,56 @@ with tab_mat:
             set_status("Analyse abgebrochen.", "warn")
         else:
             _refresh_mat_files()
-            mats = st.session_state.mat_files
+            mat_targets = st.session_state.mat_targets
             st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
-            if mats:
+            if mat_targets:
                 st.session_state.mat_run_state = "running"
-                set_status(f"Analyse gestartet ({len(mats)} MAT-Dateien).", "info")
-                _update_all_mat_overview_rows(mats, live_table=table_slot, progress_slot=progress_slot)
+                set_status(f"Analyse gestartet ({len(mat_targets)} Eintraege).", "info")
+                _update_all_mat_overview_rows(mat_targets, live_table=table_slot, progress_slot=progress_slot)
                 st.session_state.mat_run_state = "idle"
-                set_status(f"Analyse fuer {len(mats)} MAT-Dateien abgeschlossen.", "ok")
+                set_status(f"Analyse fuer {len(mat_targets)} Eintraege abgeschlossen.", "ok")
             else:
                 st.session_state.mat_run_state = "idle"
                 set_status("Keine MAT-Dateien gefunden.", "warn")
 
-    if connected and mats and st.session_state.mat_auto_updated_prefix != st.session_state.r2_prefix and not running:
+    if connected and mat_targets and st.session_state.mat_auto_updated_prefix != st.session_state.r2_prefix and not running:
         st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
         st.session_state.mat_run_state = "running"
-        _update_all_mat_overview_rows(mats, live_table=table_slot, progress_slot=progress_slot)
+        _update_all_mat_overview_rows(mat_targets, live_table=table_slot, progress_slot=progress_slot)
         st.session_state.mat_run_state = "idle"
-        set_status(f"Analyse fuer {len(mats)} MAT-Dateien abgeschlossen.", "ok")
+        set_status(f"Analyse fuer {len(mat_targets)} Eintraege abgeschlossen.", "ok")
 
     if not connected:
-        st.caption("Erst in Tab 'Verbindung & Root' verbinden und Projektroot wählen.")
+        st.caption("Erst in Tab 'Verbindung & Root' verbinden und Projektroot waehlen.")
+
+    current_selected_key = str(st.session_state.get("mat_pending_selected_key", "") or "")
+
     if st.session_state.mat_overview_rows:
         df_overview = pd.DataFrame(st.session_state.mat_overview_rows)
         is_running_now = bool(st.session_state.mat_update_running)
-        colorize_cells = not is_running_now
-        styled_df = _style_overview_dataframe(df_overview) if colorize_cells else df_overview
-        allow_select = not is_running_now
+        styled_df = df_overview
+        allow_select = not is_running_now and not load_running
         if allow_select:
-            try:
-                event = table_slot.dataframe(
-                    styled_df,
-                    width="stretch",
-                    hide_index=True,
-                    height=MAT_TABLE_HEIGHT,
-                    column_config=MAT_OVERVIEW_COLCFG,
-                    on_select="rerun",
-                    selection_mode="single-row",
-                )
-            except Exception:
-                event = table_slot.dataframe(
-                    df_overview,
-                    width="stretch",
-                    hide_index=True,
-                    height=MAT_TABLE_HEIGHT,
-                    column_config=MAT_OVERVIEW_COLCFG,
-                    on_select="rerun",
-                    selection_mode="single-row",
-                )
+            sel_event = table_slot.dataframe(
+                styled_df,
+                width="stretch",
+                hide_index=True,
+                height=MAT_TABLE_HEIGHT,
+                column_config=MAT_OVERVIEW_COLCFG,
+                key="mat_single_table",
+                on_select="rerun",
+                selection_mode="single-row",
+            )
+            selected_rows = []
+            if hasattr(sel_event, "selection"):
+                selected_rows = list(getattr(sel_event.selection, "rows", []) or [])
+            elif isinstance(sel_event, dict):
+                selected_rows = list((((sel_event.get("selection") or {}).get("rows")) or []))
+            if selected_rows:
+                idx0 = int(selected_rows[0])
+                if 0 <= idx0 < len(styled_df):
+                    current_selected_key = str(styled_df.iloc[idx0].get("remote_key", "") or "")
+                    st.session_state.mat_pending_selected_key = current_selected_key
         else:
             table_slot.dataframe(
                 styled_df,
@@ -1909,25 +2396,58 @@ with tab_mat:
                 height=MAT_TABLE_HEIGHT,
                 column_config=MAT_OVERVIEW_COLCFG,
             )
-            event = None
-        if isinstance(event, dict):
-            sel_rows = event.get("selection", {}).get("rows", [])
-        else:
-            sel = getattr(event, "selection", None)
-            sel_rows = getattr(sel, "rows", []) if sel is not None else []
-        if sel_rows:
-            selected_idx = sel_rows[0]
-            if 0 <= selected_idx < len(st.session_state.mat_overview_rows):
-                selected_key = st.session_state.mat_overview_rows[selected_idx].get("remote_key", "")
-                if selected_key and selected_key != st.session_state.mat_selected_key:
-                    st.session_state.mat_selected_key = selected_key
-                    st.session_state.mat_selected_summary = _get_mat_summary_from_r2(selected_key)
     else:
         table_slot.empty()
         st.caption("Noch keine MAT analysiert.")
 
-    if load_clicked:
+    if load_clicked and can_load:
+        selected_key = str(st.session_state.get("mat_pending_selected_key", "") or "")
+        if selected_key:
+            st.session_state.mat_selected_key = selected_key
+            st.session_state.mat_pending_selected_key = selected_key
+            st.session_state.mat_selected_summary = None
+            st.session_state.mat_load_requested = True
+        else:
+            st.session_state.mat_selected_key = ""
+            st.session_state.mat_selected_summary = None
+            set_status("Bitte zuerst genau eine MAT-Zeile anwaehlen.", "warn")
+
+    if st.session_state.mat_load_requested and (not running) and connected:
         selected = st.session_state.mat_selected_key
+        st.session_state.mat_load_requested = False
+        if not selected:
+            set_status("Bitte zuerst eine Zeile mit MAT-Datei waehlen.", "warn")
+            st.rerun()
+        st.session_state.mat_load_running = True
+        st.rerun()
+
+    if st.session_state.mat_load_running and (not running) and connected:
+        selected = st.session_state.mat_selected_key
+        st.markdown(
+            """
+            <style>
+            .mat-load-overlay {
+              position: fixed;
+              inset: 0;
+              background: rgba(15, 22, 36, 0.42);
+              z-index: 9998;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+            }
+            .mat-load-overlay-box {
+              background: rgba(7, 14, 26, 0.90);
+              color: #d7e8ff;
+              border: 1px solid rgba(74, 144, 164, 0.45);
+              border-radius: 12px;
+              padding: 14px 18px;
+              font-weight: 700;
+            }
+            </style>
+            <div class="mat-load-overlay"><div class="mat-load-overlay-box">MAT + Video wird geladen ...</div></div>
+            """,
+            unsafe_allow_html=True,
+        )
         with st.spinner("Lade MAT + Video ..."):
             _analyze_mat_from_r2(selected)
             _load_mat_from_r2(selected)
@@ -1938,13 +2458,16 @@ with tab_mat:
                 st.session_state.capture_folder = capture_folder
             else:
                 set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
+        st.session_state.mat_load_running = False
+        st.session_state.tab_default = "ROI Setup"
+        st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB ðŸŽ¬ â€“ ROI-SETUP
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ==============================
+# TAB ROI SETUP
+# ==============================
 with tab_roi:
     if not _has_media_source():
         st.markdown("""
@@ -1957,161 +2480,424 @@ with tab_roi:
             -> Tab CLOUD oeffnen -> Video laden oder von R2 laden</div>
         </div>""", unsafe_allow_html=True)
     else:
-        dur=st.session_state.vid_duration; fps=st.session_state.vid_fps
-        fw=st.session_state.vid_width;    fh=st.session_state.vid_height
-        tot=max(1,int(dur*fps))
+        st.markdown(
+            """
+            <style>
+            .roi-compact .section-card { margin-bottom: .4rem !important; padding: .5rem .7rem !important; }
+            [data-testid="stTabContent"] { overflow: visible !important; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="roi-compact">', unsafe_allow_html=True)
 
-        col_v, col_r = st.columns([3,1], gap="medium")
+        dur = st.session_state.vid_duration
+        fps = st.session_state.vid_fps
+        fw = st.session_state.vid_width
+        fh = st.session_state.vid_height
+        step_s = round(1 / max(fps, 1.0), 4)
+
+        prev_start = float(st.session_state.get("_roi_prev_start", st.session_state.t_start))
+        prev_end = float(st.session_state.get("_roi_prev_end", st.session_state.t_end))
+        prev_tcur = float(st.session_state.get("_roi_prev_tcur", st.session_state.t_current))
+
+        col_v, col_r = st.columns([1, 1], gap="medium")
         with col_v:
-            st.markdown('<div class="section-card">',unsafe_allow_html=True)
-            st.markdown('<div class="section-title">Zeitbereich</div>',unsafe_allow_html=True)
-            c1,c2=st.columns([5,1])
-            t_start=c1.slider("Start [s]",0.0,float(dur),float(st.session_state.t_start),
-                               step=round(1/fps,4),format="%.2f s",key="sl_start")
-            c2.markdown(f'<div class="frame-info" style="margin-top:26px">F{int(t_start*fps)+1}/{tot}</div>',
-                        unsafe_allow_html=True)
-            c1,c2=st.columns([5,1])
-            t_end=c1.slider("Ende [s]",0.0,float(dur),float(st.session_state.t_end),
-                             step=round(1/fps,4),format="%.2f s",key="sl_end")
-            c2.markdown(f'<div class="frame-info" style="margin-top:26px">F{int(t_end*fps)+1}/{tot}</div>',
-                        unsafe_allow_html=True)
-            st.session_state.t_start=t_start
-            st.session_state.t_end=max(t_end,t_start+1.0/fps)
-            st.markdown('</div>',unsafe_allow_html=True)
+            st.markdown('<div class="section-card">', unsafe_allow_html=True)
+            _sc1, _sc2 = st.columns(2)
+            _min_gap = 1.0 / max(fps, 1.0)
+            _start_max = max(0.0, float(st.session_state.t_end) - _min_gap)
+            t_start = _sc1.slider(
+                "Start [s]",
+                0.0,
+                float(_start_max),
+                float(min(max(st.session_state.t_start, 0.0), _start_max)),
+                step=step_s,
+                format="%d s",
+                key="sl_start",
+            )
+            _end_min = min(float(dur), float(t_start) + _min_gap)
+            t_end_raw = _sc2.slider(
+                "Ende [s]",
+                float(_end_min),
+                float(dur),
+                float(min(max(st.session_state.t_end, _end_min), float(dur))),
+                step=step_s,
+                format="%d s",
+                key="sl_end",
+            )
+            t_start, t_end = normalize_time_range(
+                start_s=float(t_start),
+                end_s=float(t_end_raw),
+                duration_s=float(dur),
+                fps=float(fps),
+            )
+            st.session_state.t_start = float(t_start)
+            st.session_state.t_end = float(min(t_end, dur))
 
-            st.markdown('<div class="section-card">',unsafe_allow_html=True)
-            st.markdown('<div class="section-title">Video-Frame</div>',unsafe_allow_html=True)
-            t_cur=st.slider("Position [s]",0.0,float(dur),float(st.session_state.t_current),
-                             step=round(1/fps,4),format="%.3f s",key="sl_cur")
-            st.session_state.t_current=t_cur
-            frame=_get_media_frame(t_cur)
+            start_changed = abs(t_start - prev_start) > 1e-9
+            end_changed = abs(st.session_state.t_end - prev_end) > 1e-9
+            if start_changed and not end_changed:
+                st.session_state.t_current = float(st.session_state.t_start)
+            elif end_changed and not start_changed:
+                st.session_state.t_current = float(st.session_state.t_end)
+            elif start_changed and end_changed:
+                st.session_state.t_current = float(st.session_state.t_start)
+            st.session_state._roi_prev_start = float(st.session_state.t_start)
+            st.session_state._roi_prev_end = float(st.session_state.t_end)
+
+            t_cur = st.slider(
+                "Position [s]",
+                float(st.session_state.t_start),
+                float(st.session_state.t_end),
+                float(min(max(st.session_state.t_current, st.session_state.t_start), st.session_state.t_end)),
+                step=step_s,
+                format="%d s",
+                key="sl_cur",
+            )
+            st.session_state.t_current = float(t_cur)
+            frame_idx = int(round(float(t_cur) * max(float(fps), 1.0)))
+            prev_frame_idx = st.session_state.get("roi_prev_frame_idx")
+            t_changed = (prev_frame_idx is None) or (int(prev_frame_idx) != frame_idx)
+            st.session_state._roi_prev_tcur = float(t_cur)
+            st.session_state.roi_prev_frame_idx = frame_idx
+            if t_changed and isinstance(st.session_state.selected_roi, int) and 0 <= st.session_state.selected_roi < len(st.session_state.rois):
+                _ar = st.session_state.rois[st.session_state.selected_roi]
+                st.session_state.roi_anchor_box = {
+                    "x": int(round(float(_ar.get("x", 0)))),
+                    "y": int(round(float(_ar.get("y", 0)))),
+                    "w": int(round(float(_ar.get("w", 0)))),
+                    "h": int(round(float(_ar.get("h", 0)))),
+                }
+                st.session_state.roi_wait_user_move = True
+                st.session_state.roi_reject_anchor_events = 0
+
+            frame = _get_media_frame(t_cur)
+            drag_roi = None
+            _editing_idx = st.session_state.selected_roi
+            show_draw_box = bool(st.session_state.get("roi_draw_armed", False))
+            # Keep all existing ROIs visible; active ROI is still shown by cropper box.
+            _skip_bg = None
             if frame is not None:
-                st.image(draw_rois(frame,st.session_state.rois,
-                                   st.session_state.selected_roi,fw,fh),
-                         width="stretch",
-                         caption=f"t={t_cur:.3f}s  |  {fw}x{fh}  |  {fps:.1f}fps")
+                vis_rgb = draw_rois(frame, st.session_state.rois, _editing_idx, fw, fh, skip_idx=_skip_bg)
+            if frame is not None:
+                st.caption(f"t={t_cur:.3f}s  |  {fw}x{fh}  |  {fps:.1f}fps")
+                # Hard no-clipping mode: full frame is resized to a fixed fit size (constant per video).
+                src_w = int(fw) if int(fw) > 0 else int(vis_rgb.shape[1])
+                src_h = int(fh) if int(fh) > 0 else int(vis_rgb.shape[0])
+                disp_meta = st.session_state.get("roi_display_meta", {})
+                dims_key = (int(src_w), int(src_h))
+                if not isinstance(disp_meta, dict) or tuple(disp_meta.get("dims", ())) != dims_key:
+                    # Stable width in ROI column, height follows source aspect ratio.
+                    target_w = 620
+                    target_w = min(target_w, max(1, src_w))
+                    fit_w = int(target_w)
+                    fit_h = max(1, int(round(fit_w * (src_h / float(max(1, src_w))))))
+                    disp_meta = {"dims": dims_key, "w": int(fit_w), "h": int(fit_h)}
+                    st.session_state.roi_display_meta = disp_meta
+                else:
+                    fit_w = max(1, int(disp_meta.get("w", src_w)))
+                    fit_h = max(1, int(disp_meta.get("h", src_h)))
+                off_x = 0
+                off_y = 0
+                if fit_w != src_w or fit_h != src_h:
+                    disp_rgb = cv2.resize(vis_rgb, (fit_w, fit_h), interpolation=cv2.INTER_AREA)
+                else:
+                    disp_rgb = vis_rgb
+                scale_x = src_w / float(max(1, fit_w))
+                scale_y = src_h / float(max(1, fit_h))
+
+                if st_cropper is not None:
+                    sel_idx_now = st.session_state.selected_roi
+                    drag_seed = st.session_state.get("drag_roi", {}) or {}
+                    if (
+                        isinstance(sel_idx_now, int)
+                        and 0 <= sel_idx_now < len(st.session_state.rois)
+                    ):
+                        src = st.session_state.rois[sel_idx_now]
+                        sx = int(round(float(src.get("x", 0))))
+                        sy = int(round(float(src.get("y", 0))))
+                        sw = int(round(float(src.get("w", 0))))
+                        sh = int(round(float(src.get("h", 0))))
+                    elif all(k in drag_seed for k in ("x", "y", "w", "h")):
+                        sx = int(drag_seed.get("x", 0))
+                        sy = int(drag_seed.get("y", 0))
+                        sw = int(drag_seed.get("w", 0))
+                        sh = int(drag_seed.get("h", 0))
+                    else:
+                        seeded = seed_drag_roi(fw, fh)
+                        sx = int(seeded["x"])
+                        sy = int(seeded["y"])
+                        sw = int(seeded["w"])
+                        sh = int(seeded["h"])
+                    sx, sy, sw, sh = _clamp_roi_to_video(sx, sy, sw, sh, fw, fh)
+                    sx_d = int(round(float(sx) / max(scale_x, 1e-9))) + off_x
+                    sy_d = int(round(float(sy) / max(scale_y, 1e-9))) + off_y
+                    sw_d = int(round(float(sw) / max(scale_x, 1e-9)))
+                    sh_d = int(round(float(sh) / max(scale_y, 1e-9)))
+                    sx_d = max(off_x, min(off_x + fit_w - 1, sx_d))
+                    sy_d = max(off_y, min(off_y + fit_h - 1, sy_d))
+                    sw_d = max(1, min(off_x + fit_w - sx_d, sw_d))
+                    sh_d = max(1, min(off_y + fit_h - sy_d, sh_d))
+
+                    crop_box = None
+                    pil_vis = Image.fromarray(disp_rgb)
+                    cropper_key = f"roi_cropper_main_{frame_idx}_{int(sel_idx_now) if isinstance(sel_idx_now, int) else -1}"
+                    try:
+                        crop_box = st_cropper(
+                            pil_vis,
+                            realtime_update=True,
+                            box_color="#4a90a4",
+                            aspect_ratio=None,
+                            return_type="box",
+                            should_resize_image=False,
+                            default_coords=(int(sx_d), int(sx_d + sw_d), int(sy_d), int(sy_d + sh_d)),
+                            key=cropper_key,
+                        )
+                    except TypeError:
+                        crop_box = st_cropper(
+                            pil_vis,
+                            realtime_update=True,
+                            box_color="#4a90a4",
+                            aspect_ratio=None,
+                            return_type="box",
+                            key=cropper_key,
+                        )
+
+                    if isinstance(crop_box, dict):
+                        dx_d = int(round(float(crop_box.get("left", sx_d))))
+                        dy_d = int(round(float(crop_box.get("top", sy_d))))
+                        dw_d = int(round(float(crop_box.get("width", sw_d))))
+                        dh_d = int(round(float(crop_box.get("height", sh_d))))
+                        x1_d = dx_d
+                        y1_d = dy_d
+                        x2_d = dx_d + dw_d
+                        y2_d = dy_d + dh_d
+                        # Intersect with actual image area (exclude black letterbox bars).
+                        x1_fit = max(0, min(fit_w, x1_d - off_x))
+                        y1_fit = max(0, min(fit_h, y1_d - off_y))
+                        x2_fit = max(0, min(fit_w, x2_d - off_x))
+                        y2_fit = max(0, min(fit_h, y2_d - off_y))
+                        if x2_fit < x1_fit:
+                            x1_fit, x2_fit = x2_fit, x1_fit
+                        if y2_fit < y1_fit:
+                            y1_fit, y2_fit = y2_fit, y1_fit
+                        dx = int(round(x1_fit * scale_x))
+                        dy = int(round(y1_fit * scale_y))
+                        dw = int(round((x2_fit - x1_fit) * scale_x))
+                        dh = int(round((y2_fit - y1_fit) * scale_y))
+                        if dw > 0 and dh > 0:
+                            cx, cy, cw_roi, ch_roi = _clamp_roi_to_video(dx, dy, dw, dh, fw, fh)
+                            drag_roi = {"x": int(cx), "y": int(cy), "w": int(cw_roi), "h": int(ch_roi)}
+                            st.session_state.drag_roi = drag_roi
+                    st.caption("ROI direkt mit der Maus ziehen/skalieren.")
+                elif streamlit_image_coordinates is not None:
+                    st.warning("Drag fehlt: installiere 'streamlit-cropper-fix' fuer Ziehen mit der Maus.")
+                    click = streamlit_image_coordinates(disp_rgb, key=f"roi_img_click_{frame_idx}")
+                    if click and isinstance(click, dict):
+                        cx_d = int(round(float(click.get("x", 0))))
+                        cy_d = int(round(float(click.get("y", 0))))
+                        cx = int(round(max(0, min(fit_w - 1, cx_d - off_x)) * scale_x))
+                        cy = int(round(max(0, min(fit_h - 1, cy_d - off_y)) * scale_y))
+                        st.session_state.drag_roi = {"x": cx, "y": cy, "w": 4, "h": 4}
+                else:
+                    st.image(disp_rgb, width="stretch")
+                    st.warning(
+                        "Fuer ROI-Drag bitte installieren: pip install streamlit-cropper-fix"
+                    )
             else:
                 st.warning("Frame nicht verfuegbar.")
-            st.markdown('</div>',unsafe_allow_html=True)
 
-            st.markdown('<div class="section-card">',unsafe_allow_html=True)
-            st.markdown('<div class="section-title">ROI hinzufuegen</div>',unsafe_allow_html=True)
-            rc=st.columns(4)
-            rx=rc[0].number_input("X",0,fw or 9999,0,1,key="rx")
-            ry=rc[1].number_input("Y",0,fh or 9999,0,1,key="ry")
-            rw=rc[2].number_input("W",1,fw or 9999,min(200,fw or 200),1,key="rw")
-            rh=rc[3].number_input("H",1,fh or 9999,min(60,fh or 60),1,key="rh")
-            rn=st.columns([2,2,1,1])
-            roi_name=rn[0].selectbox("Name",ROI_NAMES,key="rn_name")
-            dfmt=("time_hh:mm:ss" if roi_name=="t_s"
-                  else "integer" if any(x in roi_name for x in ["v_Fzg","n_mot","gear"])
-                  else "any")
-            roi_fmt=rn[1].selectbox("Format",FMT_OPTIONS,
-                                     index=FMT_OPTIONS.index(dfmt),key="rn_fmt")
-            roi_pat=rn[2].text_input("Pattern","",key="rn_pat",placeholder="Regex")
-            roi_sc=rn[3].number_input("max_scale",1.2,step=0.1,key="rn_sc")
-            if roi_name=="track_minimap":
-                st.info("[i] Danach in Tab Track Analysis weiterarbeiten.")
-            if st.button("+ ROI hinzufuegen",type="primary",use_container_width=True):
-                if roi_name == "track_minimap" and any(r["name"] == "track_minimap" for r in st.session_state.rois):
-                    set_status("track_minimap ist nur einmal erlaubt.", "warn")
-                    st.rerun()
-                cx, cy, cw_roi, ch_roi = _clamp_roi_to_video(rx, ry, rw, rh, fw, fh)
-                st.session_state.rois.append(dict(name=roi_name,
-                    x=cx,y=cy,w=cw_roi,h=ch_roi,
-                    fmt=roi_fmt,pattern=roi_pat,max_scale=roi_sc))
-                st.session_state.selected_roi=len(st.session_state.rois)-1
-                if st.session_state.media_source == "video":
-                    get_frame.clear()
-                set_status(f"ROI '{roi_name}' hinzugefuegt.","ok"); st.rerun()
-            st.markdown('</div>',unsafe_allow_html=True)
+            drag_state = st.session_state.get("drag_roi", {})
+            if not isinstance(drag_state, dict):
+                drag_state = {}
+            sel_idx = st.session_state.selected_roi
+            _is_active = isinstance(sel_idx, int) and 0 <= sel_idx < len(st.session_state.rois)
+            if _is_active:
+                cur_sel = st.session_state.rois[sel_idx]
+                # Prefer live cropper data; fall back to stored ROI position
+                if drag_roi is not None:
+                    dx = int(drag_state.get("x", 0))
+                    dy = int(drag_state.get("y", 0))
+                    dw = int(drag_state.get("w", 0))
+                    dh = int(drag_state.get("h", 0))
+                else:
+                    dx = int(round(float(cur_sel.get("x", 0))))
+                    dy = int(round(float(cur_sel.get("y", 0))))
+                    dw = int(round(float(cur_sel.get("w", 0))))
+                    dh = int(round(float(cur_sel.get("h", 0))))
+            else:
+                dx = int(drag_state.get("x", 0))
+                dy = int(drag_state.get("y", 0))
+                dw = int(drag_state.get("w", 0))
+                dh = int(drag_state.get("h", 0))
+
+            # Live-sync position: cropper drag → update active ROI x/y/w/h
+            sel_idx = st.session_state.selected_roi
+            if (
+                drag_roi is not None
+                and isinstance(sel_idx, int)
+                and 0 <= sel_idx < len(st.session_state.rois)
+            ):
+                ok_drag, _ = can_add_roi_from_drag({"x": dx, "y": dy, "w": dw, "h": dh})
+                if ok_drag:
+                    cx, cy, cw_roi, ch_roi = _clamp_roi_to_video(dx, dy, dw, dh, fw, fh)
+                    cur = st.session_state.rois[sel_idx]
+                    if (
+                        int(round(float(cur.get("x", 0)))) != int(cx)
+                        or int(round(float(cur.get("y", 0)))) != int(cy)
+                        or int(round(float(cur.get("w", 0)))) != int(cw_roi)
+                        or int(round(float(cur.get("h", 0)))) != int(ch_roi)
+                    ):
+                        st.session_state.rois[sel_idx] = {
+                            **st.session_state.rois[sel_idx],
+                            "x": float(cx), "y": float(cy), "w": float(cw_roi), "h": float(ch_roi),
+                        }
+
+            st.markdown('</div>', unsafe_allow_html=True)
 
         with col_r:
-            st.markdown('<div class="section-card">',unsafe_allow_html=True)
-            st.markdown('<div class="section-title">ROI-Liste</div>',unsafe_allow_html=True)
-            if not st.session_state.rois:
-                st.markdown('<div style="font-family:\'JetBrains Mono\',monospace;'
-                            'font-size:.72rem;color:#2e3545;text-align:center;padding:1rem;">'
-                            'Keine ROIs</div>',unsafe_allow_html=True)
-            for i,roi in enumerate(st.session_state.rois):
-                is_track=roi["name"]=="track_minimap"; is_sel=i==st.session_state.selected_roi
-                pos=f'[{int(roi["x"])},{int(roi["y"])},{int(roi["w"])},{int(roi["h"])}]'
-                if st.button(("> " if is_sel else "")+roi["name"],
-                              key=f"rsel_{i}",use_container_width=True):
-                    st.session_state.selected_roi=i; st.rerun()
-                tag_cls="roi-tag-track" if is_track else ("roi-tag-sel" if is_sel else "roi-tag")
-                st.markdown(f'<span class="roi-tag {tag_cls}">{pos}</span> '
-                            f'<span style="font-family:\'JetBrains Mono\',monospace;'
-                            f'font-size:.62rem;color:#4a5060">{roi["fmt"]}</span><br>',
-                            unsafe_allow_html=True)
-            st.markdown('</div>',unsafe_allow_html=True)
+            st.markdown('<div class="section-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">ROI-Liste</div>', unsafe_allow_html=True)
 
-            sel=st.session_state.selected_roi
-            if sel is not None and sel<len(st.session_state.rois):
-                roi=st.session_state.rois[sel]
-                st.markdown('<div class="section-card">',unsafe_allow_html=True)
-                st.markdown(f'<div class="section-title">ROI #{sel} bearbeiten</div>',
-                            unsafe_allow_html=True)
-                en=st.selectbox("Name",ROI_NAMES,
-                    index=ROI_NAMES.index(roi["name"]) if roi["name"] in ROI_NAMES else 0,
-                    key=f"en_{sel}")
-                c1,c2=st.columns(2)
-                ex=c1.number_input("X",value=int(roi["x"]),step=1,key=f"ex_{sel}")
-                ew=c1.number_input("W",value=int(roi["w"]),step=1,min_value=1,key=f"ew_{sel}")
-                ey=c2.number_input("Y",value=int(roi["y"]),step=1,key=f"ey_{sel}")
-                eh=c2.number_input("H",value=int(roi["h"]),step=1,min_value=1,key=f"eh_{sel}")
-                ef=st.selectbox("Format",FMT_OPTIONS,
-                    index=FMT_OPTIONS.index(roi["fmt"]) if roi["fmt"] in FMT_OPTIONS else 0,
-                    key=f"ef_{sel}")
-                ep=st.text_input("Pattern",roi.get("pattern",""),key=f"ep_{sel}")
-                esc=st.number_input("max_scale",float(roi.get("max_scale",1.2)),
-                                     step=0.1,min_value=0.5,key=f"esc_{sel}")
-                ca,cb=st.columns(2)
-                if ca.button("Save",use_container_width=True,key=f"sv_{sel}"):
-                    cx, cy, cw_roi, ch_roi = _clamp_roi_to_video(ex, ey, ew, eh, fw, fh)
-                    if en == "track_minimap" and any(
-                        idx != sel and r["name"] == "track_minimap"
-                        for idx, r in enumerate(st.session_state.rois)
-                    ):
-                        set_status("track_minimap ist nur einmal erlaubt.", "warn")
-                        st.rerun()
-                    st.session_state.rois[sel]=dict(name=en,x=float(ex),y=float(ey),
-                        w=float(ew),h=float(eh),fmt=ef,pattern=ep,max_scale=esc)
-                    st.session_state.rois[sel].update(dict(x=cx, y=cy, w=cw_roi, h=ch_roi))
+            _rois = st.session_state.rois
+            _sel = st.session_state.selected_roi
+            _tbl_h = min(220, 38 * (len(_rois) + 1) + 4) if _rois else 80
+            df_edit = pd.DataFrame(
+                [
+                    {
+                        "✓": (i == _sel),
+                        "Name": r.get("name", "_"),
+                        "Format": r.get("fmt", "any"),
+                        "Pattern": r.get("pattern", ""),
+                        "Scale": float(r.get("max_scale", 1.2)),
+                    }
+                    for i, r in enumerate(_rois)
+                ]
+            )
+            edited_df = st.data_editor(
+                df_edit,
+                column_config={
+                    "✓": st.column_config.CheckboxColumn("", width="small"),
+                    "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width="medium"),
+                    "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width="medium"),
+                    "Pattern": st.column_config.TextColumn("Pattern", width="small"),
+                    "Scale": st.column_config.NumberColumn("Scale", min_value=0.1, step=0.1, width="small"),
+                },
+                num_rows="fixed",
+                use_container_width=True,
+                hide_index=True,
+                height=_tbl_h,
+                key="roi_data_editor",
+            )
+
+            # Sync data_editor edits → session state
+            if edited_df is not None and len(edited_df) == len(_rois):
+                _newly_sel = None
+                _newly_desel = False
+                for _i, _row in edited_df.iterrows():
+                    _r = _rois[_i]
+                    _checked = bool(_row.get("✓", False))
+                    if _checked and _i != _sel:
+                        _newly_sel = _i
+                    elif not _checked and _i == _sel:
+                        _newly_desel = True
+                    _nn = str(_row["Name"]) if pd.notna(_row["Name"]) else _r.get("name", "_")
+                    _nf = str(_row["Format"]) if pd.notna(_row["Format"]) else _r.get("fmt", "any")
+                    _np = str(_row["Pattern"]) if pd.notna(_row["Pattern"]) else _r.get("pattern", "")
+                    _ns = float(_row["Scale"]) if pd.notna(_row["Scale"]) else float(_r.get("max_scale", 1.2))
+                    if (_r.get("name") != _nn or _r.get("fmt") != _nf
+                            or _r.get("pattern", "") != _np
+                            or abs(float(_r.get("max_scale", 1.2)) - _ns) > 1e-9):
+                        st.session_state.rois[_i] = {**_r, "name": _nn, "fmt": _nf,
+                                                      "pattern": _np, "max_scale": _ns}
+                if _newly_sel is not None:
+                    st.session_state.selected_roi = _newly_sel
+                    st.session_state.roi_draw_armed = True
+                    _sr = st.session_state.rois[_newly_sel]
+                    st.session_state.roi_anchor_box = {
+                        "x": int(round(float(_sr.get("x", 0)))),
+                        "y": int(round(float(_sr.get("y", 0)))),
+                        "w": int(round(float(_sr.get("w", 0)))),
+                        "h": int(round(float(_sr.get("h", 0)))),
+                    }
+                    st.session_state.roi_wait_user_move = True
+                    st.session_state.roi_reject_anchor_events = 0
+                    st.rerun()
+                elif _newly_desel:
+                    st.session_state.selected_roi = None
+                    st.session_state.roi_draw_armed = False
+                    st.session_state.roi_wait_user_move = False
+                    st.session_state.roi_anchor_box = {}
+                    st.session_state.roi_reject_anchor_events = 0
+                    st.rerun()
+
+            act_sel = st.session_state.selected_roi
+
+            if st.button("ROI hinzufügen", type="primary", use_container_width=True, key="roi_add_btn"):
+                # New ROI starts from a fresh default rectangle (independent from existing ROI).
+                _d = seed_drag_roi(fw, fh)
+                _cx, _cy, _cw, _ch = _clamp_roi_to_video(
+                    int(_d["x"]), int(_d["y"]), int(_d["w"]), int(_d["h"]), fw, fh
+                )
+                st.session_state.rois.append(dict(
+                    name="_", x=float(_cx), y=float(_cy),
+                    w=float(_cw), h=float(_ch), fmt="any", pattern="", max_scale=1.2,
+                ))
+                _ni = len(st.session_state.rois) - 1
+                st.session_state.selected_roi = _ni
+                st.session_state.roi_draw_armed = True
+                st.session_state.drag_roi = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
+                st.session_state.roi_anchor_box = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
+                st.session_state.roi_wait_user_move = True
+                st.session_state.roi_reject_anchor_events = 0
+                set_status("ROI hinzugefügt. Name in Tabelle setzen und Position mit Kästchen anpassen.", "ok")
+                st.rerun()
+
+            if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
+                sr = st.session_state.rois[act_sel]
+                st.caption(
+                    f"#{act_sel} {sr.get('name','')} "
+                    f"[{int(sr.get('x',0))},{int(sr.get('y',0))},{int(sr.get('w',0))},{int(sr.get('h',0))}]"
+                )
+
+            if st.button("Ausgewählte ROI löschen", use_container_width=True,
+                         key="roi_del_btn", disabled=act_sel is None):
+                if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
+                    st.session_state.rois.pop(act_sel)
+                    st.session_state.selected_roi = None
+                    st.session_state.roi_draw_armed = False
+                    st.session_state.roi_wait_user_move = False
+                    st.session_state.roi_anchor_box = {}
+                    st.session_state.roi_reject_anchor_events = 0
                     if st.session_state.media_source == "video":
                         get_frame.clear()
-                    set_status("ROI gespeichert.","ok"); st.rerun()
-                if cb.button("Delete",use_container_width=True,key=f"dl_{sel}"):
-                    st.session_state.rois.pop(sel); st.session_state.selected_roi=None
-                    if st.session_state.media_source == "video":
-                        get_frame.clear()
-                    set_status("ROI geloescht.","info"); st.rerun()
-                st.markdown('</div>',unsafe_allow_html=True)
+                    set_status("ROI gelöscht.", "info")
+                    st.rerun()
 
-            st.markdown('<div class="section-card">',unsafe_allow_html=True)
-            st.markdown('<div class="section-title">Lokal speichern</div>',unsafe_allow_html=True)
-            cf=st.session_state.capture_folder or "output"
-            result=build_result_json()
-            result_str=json.dumps(result,indent=2,ensure_ascii=False)
-            st.download_button("Download JSON",result_str,f"results_{cf}.json",
-                               "application/json",use_container_width=True)
-            mat_buf=io.BytesIO(); sio.savemat(mat_buf,build_mat_struct(result))
-            st.download_button("Download MAT",mat_buf.getvalue(),f"results_{cf}.mat",
-                               "application/octet-stream",use_container_width=True)
-            st.markdown('</div>',unsafe_allow_html=True)
+            with st.expander("Speichern", expanded=False):
+                cf = st.session_state.capture_folder or "output"
+                result = build_result_json()
+                result_str = json.dumps(result, indent=2, ensure_ascii=False)
+                st.download_button(
+                    "Download JSON",
+                    result_str,
+                    f"results_{cf}.json",
+                    "application/json",
+                    use_container_width=True,
+                )
+                mat_buf = io.BytesIO()
+                sio.savemat(mat_buf, build_mat_struct(result))
+                st.download_button(
+                    "Download MAT",
+                    mat_buf.getvalue(),
+                    f"results_{cf}.mat",
+                    "application/octet-stream",
+                    use_container_width=True,
+                )
+            st.markdown('</div>', unsafe_allow_html=True)
 
-            st.markdown('<div class="section-card">',unsafe_allow_html=True)
-            st.markdown('<div class="section-title">Info</div>',unsafe_allow_html=True)
-            n_t=sum(1 for r in st.session_state.rois if r["name"]=="track_minimap")
-            st.markdown(f"""
-            <div style="font-family:'JetBrains Mono',monospace;font-size:.67rem;
-                 color:#8892a4;line-height:2.0;">
-            <b style="color:#e8eaf0">Video</b> {fw}x{fh} @ {fps:.1f}fps<br>
-            <b style="color:#e8eaf0">Dauer</b> {dur:.2f}s<br>
-            <b style="color:#e8eaf0">Bereich</b> {t_start:.2f}->{st.session_state.t_end:.2f}s<br>
-            <b style="color:#e8eaf0">ROIs</b> {len(st.session_state.rois)} ({n_t} track)
-            </div>""",unsafe_allow_html=True)
-            st.markdown('</div>',unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
