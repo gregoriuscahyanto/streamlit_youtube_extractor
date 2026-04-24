@@ -974,22 +974,29 @@ def _clamp_roi_to_video(x, y, w, h, vid_w, vid_h):
     return clamp_roi_to_video(x, y, w, h, vid_w, vid_h)
 
 
-def _get_dynamic_roi_target_width(default_width: int = 620) -> int:
+def _get_dynamic_roi_target_width(default_width: int = 620, anchor_id: str = "roi-left-width-probe") -> int:
     # Fallback-first for stability.
     width = int(default_width)
     if streamlit_js_eval is None:
         return width
     try:
-        vp = streamlit_js_eval(
-            js_expressions="window.parent.innerWidth",
+        container_w = streamlit_js_eval(
+            js_expressions=(
+                "(function(){"
+                "const d = window.parent?.document || document;"
+                f"const a = d.getElementById('{anchor_id}');"
+                "const p = a?.parentElement;"
+                "const block = d.querySelector('.block-container');"
+                "return (p?.clientWidth || block?.clientWidth || window.parent?.innerWidth || window.innerWidth);"
+                "})()"
+            ),
             key="roi_viewport_width_probe",
             want_output=True,
         )
-        if isinstance(vp, (int, float)) and float(vp) > 320:
-            vp = int(round(float(vp)))
-            # Approximation: left ROI column in a 2-column layout minus paddings/gap.
-            left_col = int(round((vp - 160) * 0.5))
-            width = max(360, min(920, left_col - 24))
+        if isinstance(container_w, (int, float)) and float(container_w) > 320:
+            cw = int(round(float(container_w)))
+            # Exact left-column parent width with small safety margin.
+            width = max(320, min(920, cw - 16))
     except Exception:
         # Never break app render because of viewport probing.
         pass
@@ -2530,6 +2537,7 @@ with tab_roi:
         col_v, col_r = st.columns([1, 1], gap="medium")
         with col_v:
             st.markdown('<div class="section-card">', unsafe_allow_html=True)
+            st.markdown('<div id="roi-left-width-probe"></div>', unsafe_allow_html=True)
             _sc1, _sc2 = st.columns(2)
             _min_gap = 1.0 / max(fps, 1.0)
             _start_max = max(0.0, float(st.session_state.t_end) - _min_gap)
@@ -2615,14 +2623,14 @@ with tab_roi:
                 dims_key = (int(src_w), int(src_h))
                 if not isinstance(disp_meta, dict) or tuple(disp_meta.get("dims", ())) != dims_key:
                     # Stable width in ROI column, height follows source aspect ratio.
-                    target_w = _get_dynamic_roi_target_width(620)
+                    target_w = _get_dynamic_roi_target_width(620, "roi-left-width-probe")
                     target_w = min(target_w, max(1, src_w))
                     fit_w = int(target_w)
                     fit_h = max(1, int(round(fit_w * (src_h / float(max(1, src_w))))))
                     disp_meta = {"dims": dims_key, "w": int(fit_w), "h": int(fit_h)}
                     st.session_state.roi_display_meta = disp_meta
                 else:
-                    target_w_now = _get_dynamic_roi_target_width(int(disp_meta.get("w", 620)))
+                    target_w_now = _get_dynamic_roi_target_width(int(disp_meta.get("w", 620)), "roi-left-width-probe")
                     target_w_now = min(target_w_now, max(1, src_w))
                     fit_w_old = max(1, int(disp_meta.get("w", src_w)))
                     if abs(target_w_now - fit_w_old) >= 24:
