@@ -1181,7 +1181,9 @@ def _apply_video(local_path, display_name):
         framepack_cache={},
         vid_fps=info["fps"], vid_width=info["width"],
         vid_height=info["height"], vid_duration=info["duration"],
-        t_start=0.0, t_end=info["duration"], t_current=0.0, rois=[])
+        t_start=0.0, t_end=info["duration"], t_current=0.0, rois=[],
+        selected_roi=None, drag_roi={}, roi_draw_armed=False,
+        roi_wait_user_move=False, roi_anchor_box={}, roi_reject_anchor_events=0)
     if not st.session_state.capture_folder:
         st.session_state.capture_folder = Path(display_name).stem
     get_frame.clear(); get_video_info.clear()
@@ -1246,6 +1248,12 @@ def _load_framepack_from_r2(capture_folder: str) -> bool:
         t_end=duration,
         t_current=0.0,
         rois=[],
+        selected_roi=None,
+        drag_roi={},
+        roi_draw_armed=False,
+        roi_wait_user_move=False,
+        roi_anchor_box={},
+        roi_reject_anchor_events=0,
     )
     set_status(f"Frame-Pack geladen: {capture_folder} ({len(frame_files)} Frames)", "ok")
     return True
@@ -1836,6 +1844,12 @@ def _load_mat_from_r2(remote_key):
         st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
         st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
         st.session_state.rois = cfg.get("rois", st.session_state.rois)
+        st.session_state.selected_roi = None
+        st.session_state.roi_draw_armed = False
+        st.session_state.drag_roi = {}
+        st.session_state.roi_wait_user_move = False
+        st.session_state.roi_anchor_box = {}
+        st.session_state.roi_reject_anchor_events = 0
         if cfg.get("ref_track_pts"):
             st.session_state.ref_track_pts = cfg["ref_track_pts"]
         if cfg.get("minimap_pts"):
@@ -2663,29 +2677,17 @@ with tab_roi:
                 scale_x = src_w / float(max(1, fit_w))
                 scale_y = src_h / float(max(1, fit_h))
 
-                if st_cropper is not None:
-                    sel_idx_now = st.session_state.selected_roi
-                    drag_seed = st.session_state.get("drag_roi", {}) or {}
-                    if (
-                        isinstance(sel_idx_now, int)
-                        and 0 <= sel_idx_now < len(st.session_state.rois)
-                    ):
-                        src = st.session_state.rois[sel_idx_now]
-                        sx = int(round(float(src.get("x", 0))))
-                        sy = int(round(float(src.get("y", 0))))
-                        sw = int(round(float(src.get("w", 0))))
-                        sh = int(round(float(src.get("h", 0))))
-                    elif all(k in drag_seed for k in ("x", "y", "w", "h")):
-                        sx = int(drag_seed.get("x", 0))
-                        sy = int(drag_seed.get("y", 0))
-                        sw = int(drag_seed.get("w", 0))
-                        sh = int(drag_seed.get("h", 0))
-                    else:
-                        seeded = seed_drag_roi(fw, fh)
-                        sx = int(seeded["x"])
-                        sy = int(seeded["y"])
-                        sw = int(seeded["w"])
-                        sh = int(seeded["h"])
+                sel_idx_now = st.session_state.selected_roi
+                has_active_roi = (
+                    isinstance(sel_idx_now, int)
+                    and 0 <= sel_idx_now < len(st.session_state.rois)
+                )
+                if st_cropper is not None and has_active_roi:
+                    src = st.session_state.rois[sel_idx_now]
+                    sx = int(round(float(src.get("x", 0))))
+                    sy = int(round(float(src.get("y", 0))))
+                    sw = int(round(float(src.get("w", 0))))
+                    sh = int(round(float(src.get("h", 0))))
                     sx, sy, sw, sh = _clamp_roi_to_video(sx, sy, sw, sh, fw, fh)
                     sx_d = int(round(float(sx) / max(scale_x, 1e-9))) + off_x
                     sy_d = int(round(float(sy) / max(scale_y, 1e-9))) + off_y
@@ -2751,6 +2753,9 @@ with tab_roi:
                             drag_roi = {"x": int(cx), "y": int(cy), "w": int(cw_roi), "h": int(ch_roi)}
                             st.session_state.drag_roi = drag_roi
                     st.caption("ROI direkt mit der Maus ziehen/skalieren.")
+                elif st_cropper is not None:
+                    # No active ROI selected: show frame only (no default blue box).
+                    st.image(disp_rgb, width="stretch")
                 elif streamlit_image_coordinates is not None:
                     st.warning("Drag fehlt: installiere 'streamlit-cropper-fix' fuer Ziehen mit der Maus.")
                     click = streamlit_image_coordinates(disp_rgb, key=f"roi_img_click_{frame_idx}")
