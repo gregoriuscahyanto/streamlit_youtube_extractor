@@ -127,7 +127,23 @@ if hasattr(threading, "excepthook"):
 
 
 def _try_jump_to_tab(label: str):
-    return
+    """Best-effort tab switch for Streamlit versions without st.tabs(default=...)."""
+    if not label or streamlit_js_eval is None:
+        return
+    try:
+        expr = (
+            "(function(){"
+            "const label = " + json.dumps(str(label)) + ";"
+            "const doc = window.parent?.document || document;"
+            "const tabs = Array.from(doc.querySelectorAll('[role=\"tab\"]'));"
+            "const tab = tabs.find(t => (t.innerText || t.textContent || '').trim() === label);"
+            "if (tab) { tab.click(); return true; }"
+            "return false;"
+            "})()"
+        )
+        streamlit_js_eval(js_expressions=expr, key=f"jump_to_tab_{str(label).replace(' ', '_')}", want_output=False)
+    except Exception:
+        pass
 
 st.set_page_config(
     page_title="OCR Extractor",
@@ -221,6 +237,11 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
   letter-spacing:.04em !important; border-radius:4px !important; }
 .stButton>button[kind="primary"] { background:#4a90a4 !important;
   border-color:#4a90a4 !important; color:#0d0f14 !important; }
+.st-key-roi_ocr_probe_btn.ocr-all-ok button,
+.st-key-roi_ocr_probe_btn.ocr-all-ok [data-testid="stBaseButton-secondary"] {
+  background:#3ddc84 !important; border-color:#3ddc84 !important; color:#07100b !important;
+  box-shadow:0 0 0 1px rgba(61,220,132,.25), 0 0 14px rgba(61,220,132,.18) !important;
+}
 
 hr { border-color:#1e2535 !important; }
 
@@ -357,6 +378,9 @@ def init_state():
         mat_run_state="idle",
         mat_load_requested=False,
         mat_load_running=False,
+        roi_save_running=False,
+        roi_saved_once=False,
+        roi_scroll_top_once=False,
         tab_default=None,
         # Datei-Browser
         fb_path="", fb_items=[], fb_selected=None,
@@ -406,6 +430,47 @@ def init_state():
             st.session_state[k] = v
 
 init_state()
+
+
+def _render_blocking_overlay(text: str):
+    st.markdown(
+        f"""
+        <style>
+        .app-busy-overlay {{
+          position: fixed; inset: 0; z-index: 10000;
+          background: rgba(8, 10, 16, 0.62);
+          backdrop-filter: grayscale(1) blur(1px);
+          pointer-events: all; cursor: wait;
+          display:flex; align-items:center; justify-content:center;
+        }}
+        .app-busy-overlay-box {{
+          background: rgba(7, 14, 26, 0.94); color:#dfffe8;
+          border:1px solid rgba(61, 220, 132, 0.55);
+          border-radius:12px; padding:16px 20px;
+          font-family:'JetBrains Mono', monospace; font-size:.85rem; font-weight:800;
+          box-shadow: 0 10px 34px rgba(0,0,0,.45);
+        }}
+        </style>
+        <div class="app-busy-overlay"><div class="app-busy-overlay-box">{text}</div></div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+if bool(st.session_state.get("roi_save_running", False)):
+    _render_blocking_overlay("Speichern läuft ...")
+
+
+def _scroll_to_top_once(flag_key: str = "roi_scroll_top_once"):
+    if not bool(st.session_state.get(flag_key, False)):
+        return
+    st.session_state[flag_key] = False
+    if streamlit_js_eval is None:
+        return
+    try:
+        streamlit_js_eval(js_expressions="window.parent?.scrollTo(0,0); document.querySelector('.block-container')?.scrollTo(0,0); true;", key=f"scroll_top_{int(time.time()*1000)}", want_output=False)
+    except Exception:
+        pass
 
 # One-time migration for legacy ROI editor widget state keys that could hold
 # incompatible column schema/dtypes.
@@ -1346,9 +1411,7 @@ def _build_roi_table_for_matlab(rois=None):
             row["fmt"],
             np.array([[row["max_scale"]]], dtype=float),
         )
-    if MatlabObject is None:
-        return arr
-    return MatlabObject(arr, classname="table")
+    return arr
 
 
 def _mat_export_to_jsonable(obj):
@@ -1389,10 +1452,9 @@ def _ensure_ocr_extractor_ocr_struct(rr: dict) -> dict:
     # OCRExtractor.m expects table-like ROI parameter blocks. Build both the
     # effective and raw table from the current ROI editor state; do not leave
     # scipy's default nested struct representation here.
-    roi_table = _build_roi_table_for_matlab(st.session_state.get("rois", []))
-    ocr["roi_table"] = roi_table
-    ocr["roi_table_raw"] = roi_table
-    ocr["created"] = _matlab_datetime_object(datetime.now())
+    ocr["roi_table"] = _build_roi_table_for_matlab(st.session_state.get("rois", []))
+    ocr["roi_table_raw"] = _build_roi_table_for_matlab(st.session_state.get("rois", []))
+    ocr["created"] = datetime.now().isoformat(timespec="seconds")
 
     # Match OCRExtractor.m catalog names exactly.
     ocr["roi_catalog"] = {
@@ -1488,11 +1550,11 @@ def _save_result_json_and_mat() -> tuple[bool, str, dict]:
     mat_struct_for_save = _build_save_mat_struct(result)
     json_payload = _mat_export_to_jsonable(mat_struct_for_save)
     json_bytes = json.dumps(json_payload, indent=2, ensure_ascii=False, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
+    mat_name = f"results_{safe_cf}.mat"
     mat_buf = io.BytesIO()
     sio.savemat(mat_buf, mat_struct_for_save, do_compression=True)
     mat_bytes = mat_buf.getvalue()
     json_name = f"results_{safe_cf}.json"
-    mat_name = f"results_{safe_cf}.mat"
     saved_targets = []
     try:
         out_dir = Path.cwd() / "results"
@@ -1563,7 +1625,8 @@ def _apply_video(local_path, display_name):
         t_start=0.0, t_end=info["duration"], t_current=0.0, rois=[],
         selected_roi=None, drag_roi={}, roi_draw_armed=False,
         roi_wait_user_move=False, roi_anchor_box={}, roi_reject_anchor_events=0,
-        roi_editor_df=None)
+        roi_editor_df=None,
+        roi_saved_once=False)
     if not st.session_state.capture_folder:
         st.session_state.capture_folder = Path(display_name).stem
     get_frame.clear(); get_video_info.clear()
@@ -1635,6 +1698,7 @@ def _load_framepack_from_r2(capture_folder: str) -> bool:
         roi_anchor_box={},
         roi_reject_anchor_events=0,
         roi_editor_df=None,
+        roi_saved_once=False,
     )
     set_status(f"Frame-Pack geladen: {capture_folder} ({len(frame_files)} Frames)", "ok")
     return True
@@ -3430,6 +3494,9 @@ def _load_next_roi_setup_file() -> tuple[bool, str]:
             _analyze_mat_from_r2(key)
         except Exception:
             pass
+    st.session_state.tab_default = "ROI Setup"
+    st.session_state.roi_scroll_top_once = True
+    st.session_state.roi_saved_once = False
     set_status(f"Nächste Datei geladen: {folder}", "ok")
     return True, folder
 
@@ -4245,8 +4312,8 @@ with tab_mat:
                 set_status("MAT konnte nicht geladen werden.", "warn")
             elif not video_ok:
                 set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
-        st.session_state.mat_load_running = False
         st.session_state.tab_default = "ROI Setup"
+        st.session_state.mat_load_running = False
         st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
@@ -4256,6 +4323,7 @@ with tab_mat:
 # TAB ROI SETUP
 # ==============================
 with tab_roi:
+    _scroll_to_top_once()
     if not _has_media_source():
         st.markdown("""
         <div style="text-align:center;padding:3rem 2rem;color:#4a5060;">
@@ -4705,6 +4773,11 @@ with tab_roi:
                 if str(_r.get("name", "")).strip().lower() != "track_minimap"
             ]
             _can_ocr_probe = frame is not None and bool(_ocr_probe_indices)
+            _all_ocr_probe_ok = bool(_ocr_probe_indices) and all(
+                bool(st.session_state.rois[_i].get("ocr_test_ok", False)) for _i in _ocr_probe_indices
+            )
+            if _all_ocr_probe_ok:
+                st.markdown('<style>.st-key-roi_ocr_probe_btn button{background:#3ddc84!important;border-color:#3ddc84!important;color:#07100b!important;box-shadow:0 0 14px rgba(61,220,132,.22)!important;}</style>', unsafe_allow_html=True)
             if st.button(
                 "OCR-Test ROI",
                 width="stretch",
@@ -4818,8 +4891,10 @@ with tab_track:
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:.5rem 0;">'
                         'Keine Streckenkarte geladen</div>', unsafe_allow_html=True)
+            if not track_roi:
+                st.caption("Referenz-Track kann erst geladen werden, wenn eine ROI 'track_minimap' vorhanden ist.")
             # Cloud: list .mat files from reference_track_siesmann/
-            if st.session_state.r2_connected and st.session_state.r2_client is not None:
+            if track_roi and st.session_state.r2_connected and st.session_state.r2_client is not None:
                 pfx = st.session_state.r2_prefix.strip("/")
                 ref_dir = (pfx + "/reference_track_siesmann").strip("/") if pfx else "reference_track_siesmann"
                 ok_ls, ref_items = st.session_state.r2_client.list_files(ref_dir)
@@ -4843,7 +4918,7 @@ with tab_track:
                         st.caption(f"Keine .mat-Dateien in Cloud-Ordner: {ref_dir}")
                 else:
                     st.caption("Cloud-Ordner 'reference_track_siesmann' nicht gefunden.")
-            else:
+            elif track_roi:
                 st.caption("Cloud nicht verbunden.")
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -5119,15 +5194,31 @@ with tab_track:
 
 
     st.markdown('<div class="roi-theme-card"><div class="theme-title">Speicherung</div><div class="theme-text">Speichert die aktuelle ROI-, Zeit- und Track-Konfiguration gemeinsam als JSON und MAT.</div></div>', unsafe_allow_html=True)
-    if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn_bottom"):
+    _has_any_roi = len(st.session_state.get("rois") or []) > 0
+    _save_busy = bool(st.session_state.get("roi_save_running", False))
+
+    if _save_busy:
+        st.session_state.tab_default = "ROI Setup"
+        _render_blocking_overlay("Speichern läuft ...")
         ok_save, msg_save, payload_save = _save_result_json_and_mat()
         st.session_state["_last_save_payload"] = payload_save
+        st.session_state.roi_save_running = False
+        st.session_state.roi_saved_once = bool(ok_save)
+        st.session_state.tab_default = "ROI Setup"
         set_status(msg_save, "ok" if ok_save else "warn")
         st.rerun()
 
-    if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn_bottom"):
+    if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn_bottom", disabled=(_save_busy or not _has_any_roi)):
+        st.session_state.roi_save_running = True
+        st.session_state.tab_default = "ROI Setup"
+        st.rerun()
+
+    _next_disabled = _save_busy or (not bool(st.session_state.get("roi_saved_once", False)))
+    if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn_bottom", disabled=_next_disabled):
         ok_next, msg_next = _load_next_roi_setup_file()
         set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
+        st.session_state.tab_default = "ROI Setup"
+        st.session_state.roi_scroll_top_once = True
         st.rerun()
 
     _last_save = st.session_state.get("_last_save_payload") or {}
