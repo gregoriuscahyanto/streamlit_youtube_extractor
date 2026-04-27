@@ -936,3 +936,167 @@ def summarize_mat_status_rows(summary: dict) -> list[dict]:
             "detail": "",
         },
     ]
+
+
+# ─── Reference-Track / Centerline ────────────────────────────────────────────
+
+# Hardcoded 8 reference points on the Nordschleife centerline [m], matching
+# getFixedPointsForTrack() in OCRExtractor.m.
+FIXED_POINTS_BY_TRACK: dict[str, list[list[float]]] = {
+    "nordschleife": [
+        [307.196,             299.616],
+        [1978.42832378196,    321.354522948525],
+        [3085.71261117950,   -484.441468375425],
+        [3414.60893416886,  -2534.56188167581],
+        [2301.84304138817,  -4261.26757736999],
+        [87.274466593099,   -5374.03347015068],
+        [-1031.33,          -5077.18],
+        [-937.785740057097, -2912.79265311359],
+    ],
+}
+
+
+def _extract_centerline_v5(mat_path: str) -> np.ndarray:
+    """Parse Bnd.L2R_xyz__m from a scipy-readable .mat → Nx2 XY [m]."""
+    mat = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+    bnd = mat.get("Bnd")
+    if bnd is None:
+        raise ValueError("Kein Feld 'Bnd'")
+    L2R = getattr(bnd, "L2R_xyz__m", None)
+    if L2R is None:
+        raise ValueError("Kein Feld 'Bnd.L2R_xyz__m'")
+    L2R_list = np.atleast_1d(L2R)
+    left_pts: list[np.ndarray] = []
+    right_pts: list[np.ndarray] = []
+    for cell in L2R_list:
+        arr = np.atleast_2d(np.asarray(cell, dtype=float))
+        if arr.shape[0] >= 1 and arr.shape[1] >= 2:
+            left_pts.append(arr[0, :2])
+            right_pts.append(arr[-1, :2])
+    if not left_pts:
+        raise ValueError("Bnd.L2R_xyz__m: keine verwertbaren Einträge")
+    return (np.array(left_pts) + np.array(right_pts)) / 2.0
+
+
+def _extract_centerline_v73(mat_path: str) -> np.ndarray:
+    """Parse Bnd.L2R_xyz__m from a MATLAB v7.3 (HDF5) .mat → Nx2 XY [m]."""
+    if h5py is None:
+        raise RuntimeError("h5py nicht verfügbar (benötigt für MATLAB v7.3)")
+    with h5py.File(mat_path, "r") as h5f:
+        if "Bnd" not in h5f:
+            raise ValueError("Kein Feld 'Bnd'")
+        bnd_grp = h5f["Bnd"]
+        if "L2R_xyz__m" not in bnd_grp:
+            raise ValueError("Kein Feld 'Bnd/L2R_xyz__m'")
+        refs = np.array(bnd_grp["L2R_xyz__m"][()]).reshape(-1)
+        left_pts: list[np.ndarray] = []
+        right_pts: list[np.ndarray] = []
+        for ref in refs:
+            cell = np.array(h5f[ref][()], dtype=float)
+            # MATLAB column-major → h5py transposes: shape is (n_cols, n_rows).
+            # A(1,   1:2) in MATLAB → cell[0:2, 0]  in h5py (first col = first row)
+            # A(end, 1:2) in MATLAB → cell[0:2, -1] in h5py (last col  = last row)
+            if cell.ndim == 1:
+                cell = cell.reshape(-1, 1)
+            if cell.shape[0] >= 2 and cell.shape[1] >= 1:
+                left_pts.append(cell[0:2, 0])
+                right_pts.append(cell[0:2, -1])
+        if not left_pts:
+            raise ValueError("Bnd.L2R_xyz__m: keine HDF5-Einträge gefunden")
+        return (np.array(left_pts) + np.array(right_pts)) / 2.0
+
+
+def load_centerline_from_mat(mat_path: str) -> np.ndarray:
+    """Load centerline from .mat — supports slim format (centerline field) and full (Bnd.L2R_xyz__m)."""
+    try:
+        mat = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        if "centerline" in mat:
+            return np.atleast_2d(np.asarray(mat["centerline"], dtype=float))
+        return _extract_centerline_v5(mat_path)
+    except NotImplementedError:
+        return _extract_centerline_v73(mat_path)
+
+
+def save_slim_mat(centerline: np.ndarray, save_path: str) -> None:
+    """Save a lightweight .mat containing only the centerline XY [m] (~few KB vs ~30MB full file)."""
+    sio.savemat(save_path, {"centerline": np.asarray(centerline, dtype=np.float64)})
+
+
+def guess_fixed_points(mat_name: str) -> list[list[float]] | None:
+    """Return the 8 hardcoded reference points [m] for a known track, or None."""
+    n = mat_name.lower()
+    if any(k in n for k in ("nordschleife", "nuerburgring", "nürburgring")):
+        return [row[:] for row in FIXED_POINTS_BY_TRACK["nordschleife"]]
+    return None
+
+
+def render_centerline_image(
+    centerline: np.ndarray,
+    fixed_pts: list[list[float]] | np.ndarray | None = None,
+    size_px: int = 800,
+) -> tuple[np.ndarray, list[list[float]] | None]:
+    """
+    Render the centerline XY [m] as an RGB image on a dark background.
+    Returns (img_rgb, fixed_pts_px) where fixed_pts_px are pixel [x,y] coords
+    matching the positions of fixed_pts in the returned image.
+    """
+    try:
+        import cv2 as _cv2
+    except ImportError:
+        _cv2 = None
+
+    x, y = centerline[:, 0], centerline[:, 1]
+    margin = 0.05
+    span_x_raw = float(x.max() - x.min()) or 1.0
+    span_y_raw = float(y.max() - y.min()) or 1.0
+    xl  = float(x.min()) - margin * span_x_raw
+    xr_ = float(x.max()) + margin * span_x_raw
+    yl  = float(y.min()) - margin * span_y_raw
+    yr_ = float(y.max()) + margin * span_y_raw
+    span_x = xr_ - xl or 1.0
+    span_y = yr_ - yl or 1.0
+
+    aspect = span_x / span_y
+    if aspect >= 1.0:
+        w_px = int(size_px)
+        h_px = max(1, int(size_px / aspect))
+    else:
+        h_px = int(size_px)
+        w_px = max(1, int(size_px * aspect))
+
+    def to_px(xy: np.ndarray) -> np.ndarray:
+        xi = (np.asarray(xy)[:, 0] - xl) / span_x * (w_px - 1)
+        # Y is flipped: larger Y → lower pixel row
+        yi = (yr_ - np.asarray(xy)[:, 1]) / span_y * (h_px - 1)
+        return np.clip(
+            np.column_stack([xi, yi]).astype(int),
+            [0, 0], [w_px - 1, h_px - 1],
+        )
+
+    # Dark background (BGR for cv2, converted to RGB at the end)
+    img = np.full((h_px, w_px, 3), (36, 21, 11), dtype=np.uint8)
+    pts_cl = to_px(centerline)
+    if _cv2 is not None:
+        for i in range(len(pts_cl) - 1):
+            _cv2.line(img, tuple(pts_cl[i]), tuple(pts_cl[i + 1]), (132, 220, 61), 1)
+    else:
+        for pt in pts_cl:
+            img[pt[1], pt[0]] = (132, 220, 61)
+
+    fixed_pts_px: list[list[float]] | None = None
+    if fixed_pts is not None:
+        fp = np.asarray(fixed_pts, dtype=float)
+        fp_px = to_px(fp)
+        clrs_bgr = [
+            (92, 92, 255), (0, 160, 255), (0, 255, 255), (128, 255, 128),
+            (255, 200, 0), (255, 128, 128), (255, 128, 200), (200, 128, 255),
+        ]
+        if _cv2 is not None:
+            for i, (pp, c) in enumerate(zip(fp_px, clrs_bgr)):
+                _cv2.circle(img, tuple(pp), 7, c, -1)
+                _cv2.putText(img, f"P{i + 1}", (int(pp[0]) + 9, int(pp[1]) + 4),
+                             _cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1)
+        fixed_pts_px = fp_px.astype(float).tolist()
+
+    img = img[:, :, ::-1]  # BGR → RGB
+    return img, fixed_pts_px

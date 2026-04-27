@@ -48,8 +48,12 @@ from backend import (
     config_from_json_payload,
     config_from_mat_file,
     connect_r2_client,
+    guess_fixed_points,
     list_root_prefixes,
+    load_centerline_from_mat,
     load_r2_credentials,
+    render_centerline_image,
+    save_slim_mat,
     summarize_mat_file,
 )
 from storage import StorageManager
@@ -378,6 +382,8 @@ def init_state():
         roi_editor_widget_key="roi_data_editor_v2",
         # Track
         ref_track_img=None, ref_track_pts=None, minimap_pts=None,
+        centerline=None, ref_track_mat_name="",
+        minimap_next_pt_idx=0,
         track_comparison=None, moving_pt_history=[],
         moving_pt_color_range=dict(h_lo=0,h_hi=30,s_lo=150,s_hi=255,v_lo=150,v_hi=255),
         # Status
@@ -1917,16 +1923,32 @@ def _load_mat_from_r2(remote_key):
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
     return None
 
-def _load_ref_from_r2(remote_key):
+def _apply_centerline_to_session(mat_path: str, mat_name: str) -> None:
+    """Parse .mat → centerline → render image + auto-set fixed ref points."""
+    try:
+        cl = load_centerline_from_mat(mat_path)
+    except Exception as e:
+        set_status(f"Centerline-Fehler: {e}", "warn")
+        return
+    fixed = guess_fixed_points(mat_name)
+    img, fp_px = render_centerline_image(cl, fixed_pts=fixed, size_px=800)
+    st.session_state.centerline = cl.tolist()
+    st.session_state.ref_track_mat_name = mat_name
+    st.session_state.ref_track_img = img
+    if fp_px is not None:
+        st.session_state.ref_track_pts = fp_px
+    set_status(f"Centerline geladen: {mat_name} ({len(cl)} Punkte)", "ok")
+
+
+def _load_centerline_from_r2(remote_key: str, mat_name: str) -> None:
     client = st.session_state.r2_client
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(remote_key).suffix)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
     tmp.close()
     ok, msg = client.download_file(remote_key, tmp.name)
     if ok:
-        img = np.array(Image.open(tmp.name).convert("RGB"))
-        st.session_state.ref_track_img = img
-        set_status("Referenz-Track geladen OK","ok")
-    else: set_status(f"Ref-Download: {msg}","warn")
+        _apply_centerline_to_session(tmp.name, mat_name)
+    else:
+        set_status(f"Download fehlgeschlagen: {msg}", "warn")
 
 
 _try_auto_connect_once()
@@ -3119,7 +3141,7 @@ with tab_track:
     fw=st.session_state.vid_width; fh=st.session_state.vid_height
 
     if not has_ref:
-        st.info("[i] Referenz-Track fehlt -> Tab CLOUD -> Bild laden.")
+        st.info("[i] Referenz-Track fehlt. Bitte im linken Bereich unten laden (Cloud oder lokal).")
     if not track_roi:
         st.info("[i] Keine track_minimap ROI -> Tab ROI Setup -> ROI anlegen.")
 
@@ -3129,97 +3151,193 @@ with tab_track:
 
     with col_a:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Referenz-Track | 8 Kalibrierpunkte</div>',
-                    unsafe_allow_html=True)
+        _mat_name = st.session_state.get("ref_track_mat_name", "") or ""
+        _ref_title = f"Referenz-Track | {_mat_name}" if _mat_name else "Referenz-Track | Centerline [m]"
+        st.markdown(f'<div class="section-title">{_ref_title}</div>', unsafe_allow_html=True)
         if has_ref:
-            ref_pts=st.session_state.ref_track_pts or [[0,0]]*8
-            if len(ref_pts)!=8: ref_pts=[[0,0]]*8
-            st.caption("Pixel-Koordinaten auf der Referenzkarte:")
-            pt_data=[]
-            for pi,pt in enumerate(ref_pts):
-                c1,c2,c3=st.columns([.4,1,1])
-                c1.markdown(f'<div style="font-family:\'JetBrains Mono\',monospace;'
-                            f'font-size:.8rem;color:#4a90a4;padding-top:28px">P{pi+1}</div>',
-                            unsafe_allow_html=True)
-                px=c2.number_input(f"RX{pi}",value=int(pt[0]),step=1,
-                                    label_visibility="collapsed",key=f"rp_x_{pi}")
-                py=c3.number_input(f"RY{pi}",value=int(pt[1]),step=1,
-                                    label_visibility="collapsed",key=f"rp_y_{pi}")
-                pt_data.append([px,py])
-            if st.button("Save Referenzpunkte",use_container_width=True):
-                st.session_state.ref_track_pts=pt_data
-                set_status("Referenzpunkte gespeichert.","ok"); st.rerun()
-            vis=st.session_state.ref_track_img.copy()
-            for pi,pt in enumerate(ref_pts):
-                if pt and len(pt)==2:
-                    cv2.circle(vis,(int(pt[0]),int(pt[1])),8,clrs[pi%8],-1)
-                    cv2.putText(vis,f"P{pi+1}",(int(pt[0])+10,int(pt[1])),
-                                cv2.FONT_HERSHEY_SIMPLEX,.5,clrs[pi%8],1)
-            st.image(vis, width="stretch", caption="Referenz-Track")
+            # P1-P8 already baked into the rendered image by render_centerline_image()
+            st.image(st.session_state.ref_track_img, width="stretch",
+                     caption="P1–P8 fest aus Streckendatei")
+            _sl_c1, _sl_c2 = st.columns(2)
+            if _sl_c1.button("Neu laden", use_container_width=True, key="reload_mat_btn"):
+                st.session_state.ref_track_img = None
+                st.session_state.ref_track_pts = None
+                st.session_state.centerline = None
+                st.session_state.ref_track_mat_name = ""
+                st.rerun()
+            _can_slim = (
+                st.session_state.centerline is not None
+                and st.session_state.r2_connected
+                and st.session_state.r2_client is not None
+            )
+            if _sl_c2.button(
+                "Slim → Cloud",
+                use_container_width=True,
+                key="save_slim_btn",
+                disabled=not _can_slim,
+                help="Speichert nur die Centerline (~KB) in die Cloud — ersetzt die 30 MB Datei",
+            ):
+                _cl = np.array(st.session_state.centerline, dtype=np.float64)
+                _base = Path(st.session_state.ref_track_mat_name or "track").stem
+                _slim_name = _base + "_slim.mat"
+                _pfx = st.session_state.r2_prefix.strip("/")
+                _ref_dir = (_pfx + "/reference_track_siesmann").strip("/") if _pfx else "reference_track_siesmann"
+                _remote = f"{_ref_dir}/{_slim_name}"
+                _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+                _tmp.close()
+                save_slim_mat(_cl, _tmp.name)
+                _ok, _msg = st.session_state.r2_client.upload_file(_tmp.name, _remote)
+                if _ok:
+                    set_status(f"Slim gespeichert: {_slim_name}", "ok")
+                else:
+                    set_status(f"Upload fehlgeschlagen: {_msg}", "warn")
+                st.rerun()
         else:
-            st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
-                        'Kein Referenzbild</div>',unsafe_allow_html=True)
-        st.markdown('</div>',unsafe_allow_html=True)
+            st.markdown('<div style="text-align:center;color:#2e3545;padding:.5rem 0;">'
+                        'Keine Streckenkarte geladen</div>', unsafe_allow_html=True)
+            # Cloud: list .mat files from reference_track_siesmann/
+            if st.session_state.r2_connected and st.session_state.r2_client is not None:
+                pfx = st.session_state.r2_prefix.strip("/")
+                ref_dir = (pfx + "/reference_track_siesmann").strip("/") if pfx else "reference_track_siesmann"
+                ok_ls, ref_items = st.session_state.r2_client.list_files(ref_dir)
+                if ok_ls and isinstance(ref_items, list):
+                    mat_files = [f for f in ref_items if f.lower().endswith(".mat")]
+                    if mat_files:
+                        sel = st.selectbox(
+                            "Streckendatei wählen",
+                            mat_files,
+                            key="ref_track_sel",
+                            label_visibility="collapsed",
+                        )
+                        if st.button("Aus Cloud laden", use_container_width=True, key="ref_track_load_btn"):
+                            _load_centerline_from_r2(f"{ref_dir}/{sel}", sel)
+                            st.rerun()
+                    else:
+                        st.caption(f"Keine .mat-Dateien in Cloud-Ordner: {ref_dir}")
+                else:
+                    st.caption("Cloud-Ordner 'reference_track_siesmann' nicht gefunden.")
+            else:
+                st.caption("Cloud nicht verbunden.")
+        st.markdown('</div>', unsafe_allow_html=True)
 
     with col_b:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Minimap | 8 Punkte + Bewegungserkennung</div>',
+        st.markdown('<div class="section-title">Minimap | Kalibrierung + Farberkennung</div>',
                     unsafe_allow_html=True)
         if has_vid and track_roi:
             frame=_get_media_frame(st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
                 ch,cw=crop.shape[:2]
-                mm_pts=st.session_state.minimap_pts or [[0,0]]*8
-                if len(mm_pts)!=8: mm_pts=[[0,0]]*8
-                st.caption("Pixel-Koordinaten auf der Minimap:")
-                mm_data=[]
-                for pi,pt in enumerate(mm_pts):
-                    c1,c2,c3=st.columns([.4,1,1])
-                    c1.markdown(f'<div style="font-family:\'JetBrains Mono\',monospace;'
-                                f'font-size:.8rem;color:#3ddc84;padding-top:28px">P{pi+1}</div>',
-                                unsafe_allow_html=True)
-                    px=c2.number_input(f"MX{pi}",value=int(pt[0]),min_value=0,
-                                        max_value=max(1,cw),step=1,
-                                        label_visibility="collapsed",key=f"mp_x_{pi}")
-                    py=c3.number_input(f"MY{pi}",value=int(pt[1]),min_value=0,
-                                        max_value=max(1,ch),step=1,
-                                        label_visibility="collapsed",key=f"mp_y_{pi}")
-                    mm_data.append([px,py])
-                if st.button("Save Minimap-Punkte",use_container_width=True):
-                    st.session_state.minimap_pts=mm_data
-                    set_status("Minimap-Punkte gespeichert.","ok"); st.rerun()
-                vis_c=crop.copy()
-                for pi,pt in enumerate(st.session_state.minimap_pts or []):
-                    if pt and len(pt)==2:
-                        cv2.circle(vis_c,(int(pt[0]),int(pt[1])),6,clrs[pi%8],-1)
-                        cv2.putText(vis_c,f"P{pi+1}",(int(pt[0])+7,int(pt[1])),
-                                    cv2.FONT_HERSHEY_SIMPLEX,.4,clrs[pi%8],1)
-                st.image(vis_c, width="stretch", caption=f"Minimap ({cw}x{ch}px)")
+                mm_pts=list(st.session_state.minimap_pts or [])
+                # Sync counter forward if points already loaded from config/MAT
+                if st.session_state.minimap_next_pt_idx < len(mm_pts):
+                    st.session_state.minimap_next_pt_idx = len(mm_pts)
+                next_idx = st.session_state.minimap_next_pt_idx
+
+                # Draw set points (white ring + colored fill + shadow label for contrast)
+                vis_c = crop.copy()
+                for pi, pt in enumerate(mm_pts):
+                    if pt and len(pt) == 2:
+                        px_i, py_i = int(pt[0]), int(pt[1])
+                        cv2.circle(vis_c, (px_i, py_i), 9, (255,255,255), 2)
+                        cv2.circle(vis_c, (px_i, py_i), 6, clrs[pi%8], -1)
+                        cv2.putText(vis_c, f"P{pi+1}", (px_i+10, py_i+5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .45, (0,0,0), 3)
+                        cv2.putText(vis_c, f"P{pi+1}", (px_i+10, py_i+5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .45, clrs[pi%8], 1)
+
+                if streamlit_image_coordinates is None:
+                    st.warning("Bitte installieren: pip install streamlit-image-coordinates")
+                    st.image(vis_c, width="stretch", caption=f"Minimap ({cw}x{ch}px)")
+                elif next_idx < 8:
+                    # ── Kalibrierung: P1 … P8 anklicken ──
+                    # Fixed widget key + dedup: avoids image disappearing when key changes.
+                    # The widget returns the last click on every rerun; we only act on a NEW click.
+                    st.caption(f"Klicke **P{next_idx+1}** auf der Minimap  ·  {next_idx}/8 gesetzt")
+                    _last_cal = st.session_state.get("_mm_last_click")
+                    click = streamlit_image_coordinates(vis_c, key="mm_calibrate")
+                    if click and isinstance(click, dict) and click != _last_cal:
+                        st.session_state["_mm_last_click"] = click
+                        x = int(round(float(click.get("x", 0))))
+                        y = int(round(float(click.get("y", 0))))
+                        while len(mm_pts) <= next_idx:
+                            mm_pts.append([0, 0])
+                        mm_pts[next_idx] = [x, y]
+                        st.session_state.minimap_pts = mm_pts
+                        st.session_state.minimap_next_pt_idx = next_idx + 1
+                        st.rerun()
+                else:
+                    # ── 8 Punkte fertig → Farberkennung per Klick ──
+                    # Live detection with current color range (runs every render)
+                    cr = st.session_state.moving_pt_color_range
+                    mp_live = detect_moving_point(crop, cr)
+
+                    # Overlay detected blob as yellow ring on vis_c
+                    vis_detect = vis_c.copy()
+                    if mp_live:
+                        dx, dy = int(mp_live["x"]), int(mp_live["y"])
+                        cv2.circle(vis_detect, (dx, dy), 12, (255, 255, 0), 2)
+                        cv2.circle(vis_detect, (dx, dy),  3, (255, 255, 0), -1)
+
+                    # Color swatch for current target color
+                    h_m=(cr["h_lo"]+cr["h_hi"])//2
+                    s_m=(cr["s_lo"]+cr["s_hi"])//2
+                    v_m=(cr["v_lo"]+cr["v_hi"])//2
+                    swatch=np.zeros((20,40,3),dtype=np.uint8)
+                    swatch[:]=cv2.cvtColor(
+                        np.array([[[h_m,s_m,v_m]]],dtype=np.uint8),
+                        cv2.COLOR_HSV2RGB)[0,0]
+
+                    detected_lbl = "✓ Erkannt" if mp_live else "✗ Nicht erkannt"
+                    sc1, sc2 = st.columns([3,1])
+                    sc1.caption(
+                        f"✓ 8 Punkte  ·  Farberkennung: **{detected_lbl}** (gelber Kreis)"
+                        f"  —  Klicke Marker → Farbe sofort übernehmen"
+                    )
+                    sc2.image(swatch, caption="Zielfarbe", width="stretch")
+
+                    _last_col = st.session_state.get("_mm_last_color_click")
+                    color_click = streamlit_image_coordinates(vis_detect, key="mm_color_pick")
+                    if color_click and isinstance(color_click, dict) and color_click != _last_col:
+                        st.session_state["_mm_last_color_click"] = color_click
+                        cx = max(0, min(cw-1, int(round(float(color_click.get("x",0))))))
+                        cy = max(0, min(ch-1, int(round(float(color_click.get("y",0))))))
+                        pixel_rgb = crop[cy, cx]
+                        hsv_px = cv2.cvtColor(
+                            np.array([[pixel_rgb]],dtype=np.uint8),
+                            cv2.COLOR_RGB2HSV)[0,0]
+                        h,s,v = int(hsv_px[0]),int(hsv_px[1]),int(hsv_px[2])
+                        st.session_state.moving_pt_color_range = dict(
+                            h_lo=max(0,h-15),   h_hi=min(179,h+15),
+                            s_lo=max(0,s-60),   s_hi=min(255,s+60),
+                            v_lo=max(0,v-60),   v_hi=min(255,v+60),
+                        )
+                        set_status(f"Farbe gesetzt: HSV({h},{s},{v})","ok")
+                        st.rerun()
+
+                # Reset / Undo buttons
+                rb1, rb2 = st.columns(2)
+                if rb1.button("Zurücksetzen", use_container_width=True, key="mm_pts_reset"):
+                    st.session_state.minimap_pts = []
+                    st.session_state.minimap_next_pt_idx = 0
+                    st.session_state["_mm_last_click"] = None
+                    st.session_state["_mm_last_color_click"] = None
+                    st.rerun()
+                if rb2.button("Letzten entfernen", use_container_width=True, key="mm_pts_undo"):
+                    if next_idx > 0:
+                        st.session_state.minimap_pts = mm_pts[:next_idx-1]
+                        st.session_state.minimap_next_pt_idx = next_idx-1
+                        st.rerun()
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
-                        'Video + track_minimap ROI benoetigt</div>',unsafe_allow_html=True)
+                        'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
         st.markdown('</div>',unsafe_allow_html=True)
 
     st.markdown('<div class="section-card">',unsafe_allow_html=True)
     st.markdown('<div class="section-title">Vergleich | Ueberlagerung | Bewegende Punkte</div>',
                 unsafe_allow_html=True)
-    cv1,cv2_,cv3=st.columns([2,2,1])
-    with cv3:
-        st.markdown("**Farberkennung (HSV)**")
-        cr=st.session_state.moving_pt_color_range
-        h_lo=st.slider("H min",0,179,cr["h_lo"],key="h_lo")
-        h_hi=st.slider("H max",0,179,cr["h_hi"],key="h_hi")
-        s_lo=st.slider("S min",0,255,cr["s_lo"],key="s_lo")
-        s_hi=st.slider("S max",0,255,cr["s_hi"],key="s_hi")
-        v_lo=st.slider("V min",0,255,cr["v_lo"],key="v_lo")
-        v_hi=st.slider("V max",0,255,cr["v_hi"],key="v_hi")
-        st.session_state.moving_pt_color_range=dict(
-            h_lo=h_lo,h_hi=h_hi,s_lo=s_lo,s_hi=s_hi,v_lo=v_lo,v_hi=v_hi)
-        h_m=(h_lo+h_hi)//2; s_m=(s_lo+s_hi)//2; v_m=(v_lo+v_hi)//2
-        px=np.zeros((28,56,3),dtype=np.uint8)
-        px[:]=cv2.cvtColor(np.array([[[h_m,s_m,v_m]]],dtype=np.uint8),cv2.COLOR_HSV2RGB)[0,0]
-        st.image(px, caption="Zielfarbe", width="stretch")
+    cv1,cv2_=st.columns(2,gap="medium")
 
     can_cmp=(has_ref and track_roi and has_vid and
              _has_valid_8_points(st.session_state.ref_track_pts) and
