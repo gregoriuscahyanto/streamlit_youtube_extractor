@@ -366,6 +366,7 @@ def init_state():
         mat_scan_prefix=None,
         mat_selected_key="",
         mat_pending_selected_key="",
+        mat_user_selected_key="",
         mat_selected_summary=None,
         mat_summary_cache={},
         mat_overview_rows=[],
@@ -380,6 +381,7 @@ def init_state():
         mat_load_running=False,
         roi_save_running=False,
         roi_ocr_probe_running=False,
+        roi_next_load_running=False,
         roi_saved_once=False,
         roi_scroll_top_once=False,
         tab_default=None,
@@ -462,6 +464,8 @@ if bool(st.session_state.get("roi_save_running", False)):
     _render_blocking_overlay("Speichern läuft ...")
 if bool(st.session_state.get("roi_ocr_probe_running", False)):
     _render_blocking_overlay("OCR-Test ROI läuft ...")
+if bool(st.session_state.get("roi_next_load_running", False)):
+    _render_blocking_overlay("Nächste Datei wird geladen ...")
 
 
 def _scroll_to_top_once(flag_key: str = "roi_scroll_top_once"):
@@ -1838,11 +1842,15 @@ def _refresh_mat_files():
     cache = st.session_state.get("mat_summary_cache") or {}
     st.session_state.mat_summary_cache = {k: v for k, v in cache.items() if k in mats}
     valid_mat_keys = [t.get("mat_key", "") for t in targets if t.get("mat_key")]
+    # Keine implizite Auswahl des ersten Eintrags: MAT+Video laden erfordert
+    # immer einen expliziten Klick in der aktuell sichtbaren Tabelle.
     if st.session_state.mat_selected_key not in valid_mat_keys:
-        st.session_state.mat_selected_key = valid_mat_keys[0] if valid_mat_keys else ""
+        st.session_state.mat_selected_key = ""
         st.session_state.mat_selected_summary = None
     if st.session_state.mat_pending_selected_key not in valid_mat_keys:
-        st.session_state.mat_pending_selected_key = st.session_state.mat_selected_key
+        st.session_state.mat_pending_selected_key = ""
+    if st.session_state.get("mat_user_selected_key", "") not in valid_mat_keys:
+        st.session_state.mat_user_selected_key = ""
     st.session_state.mat_scan_prefix = st.session_state.r2_prefix
 
 
@@ -2712,6 +2720,11 @@ def _mat_table_height(tbl) -> int:
         return 0
     try:
         if isinstance(tbl, np.ndarray):
+            if tbl.dtype.names:
+                return int(tbl.size)
+            if tbl.dtype == object:
+                vals = [v for v in tbl.ravel().tolist() if v is not None]
+                return int(len(vals))
             return int(tbl.shape[0]) if tbl.ndim > 0 else int(tbl.size)
         for name in getattr(tbl, "_fieldnames", []) or []:
             val = _mat_obj_get(tbl, name)
@@ -2723,11 +2736,36 @@ def _mat_table_height(tbl) -> int:
 
 
 def _mat_table_column(tbl, *names):
+    """Return one column from MATLAB table-like data, struct arrays, or scipy savemat structs."""
     tbl = _mat_scalar(tbl)
+    if tbl is None:
+        return None
     for name in names:
         val = _mat_obj_get(tbl, name)
         if val is not None:
             return val
+    try:
+        if isinstance(tbl, np.ndarray):
+            if tbl.dtype.names:
+                for name in names:
+                    if name in tbl.dtype.names:
+                        return tbl[name].ravel()
+            vals = []
+            found = False
+            for item in tbl.ravel().tolist():
+                item = _mat_scalar(item)
+                for name in names:
+                    val = _mat_obj_get(item, name)
+                    if val is not None:
+                        vals.append(val)
+                        found = True
+                        break
+                else:
+                    vals.append(None)
+            if found:
+                return np.array(vals, dtype=object)
+    except Exception:
+        pass
     return None
 
 
@@ -2744,8 +2782,8 @@ def _mat_roi_table_has_track(roi_table) -> bool:
     if names is None:
         return False
     try:
-        vals = np.asarray(names).ravel().tolist()
-        joined = " ".join(str(_mat_scalar(v)).lower() for v in vals)
+        vals = np.asarray(names, dtype=object).ravel().tolist()
+        joined = " ".join(_mat_to_text(v, "").lower() for v in vals)
         return "track_minimap" in joined
     except Exception:
         return False
@@ -2811,13 +2849,18 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
 
         roi_table = _mat_obj_get(ocr, "roi_table")
         roi_rows = _mat_table_height(roi_table)
+        if roi_rows <= 0:
+            try:
+                roi_rows = len(_extract_rois_from_recordresult_hdf5(mat_path))
+            except Exception:
+                roi_rows = 0
         out["roi_selected"] = bool(roi_rows > 0)
         out["roi_count"] = int(roi_rows)
 
         # OCRExtractor.m stores reusable track calibration in recordResult.ocr.trkCalSlim.
-        # Count Track as available only when trkCalSlim exists AND has a non-empty roi field.
+        # Fresh ROI-setup MATs may only contain track_minimap in roi_table.
         trk_slim = _mat_obj_get(ocr, "trkCalSlim")
-        out["track_selected"] = bool(_mat_has_nonempty_roi_field(trk_slim))
+        out["track_selected"] = bool(_mat_has_nonempty_roi_field(trk_slim) or _mat_roi_table_has_track(roi_table))
 
         raw_table = _mat_obj_get(ocr, "table")
         cleaned = _mat_obj_get(ocr, "cleaned")
@@ -3433,7 +3476,7 @@ def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_ke
                     rows[i] = row
                     replaced = True
                     break
-            if not replaced and rows:
+            if not replaced:
                 rows.insert(0, row)
             st.session_state.mat_overview_rows = rows
             st.session_state.mat_selected_key = key
@@ -3511,7 +3554,7 @@ def _load_next_roi_setup_file() -> tuple[bool, str]:
         except Exception:
             pass
     st.session_state.tab_default = "ROI Setup"
-    st.session_state.roi_scroll_top_once = True
+    st.session_state.roi_scroll_top_once = False
     st.session_state.roi_saved_once = False
     set_status(f"Nächste Datei geladen: {folder}", "ok")
     return True, folder
@@ -4243,6 +4286,7 @@ with tab_mat:
                 if 0 <= idx0 < len(styled_df):
                     current_selected_key = str(styled_df.iloc[idx0].get("remote_key", "") or "")
                     st.session_state.mat_pending_selected_key = current_selected_key
+                    st.session_state.mat_user_selected_key = current_selected_key
         else:
             with table_slot.container():
                 st.markdown('<div class="mat-selection-disabled">MAT-Auswahl wird aktualisiert ...</div>', unsafe_allow_html=True)
@@ -4269,8 +4313,13 @@ with tab_mat:
         st.caption("Noch keine MAT analysiert.")
 
     if load_clicked and can_load:
-        selected_key = str(st.session_state.get("mat_pending_selected_key", "") or "")
-        if selected_key:
+        selected_key = str(st.session_state.get("mat_user_selected_key", "") or "")
+        visible_keys = set()
+        try:
+            visible_keys = {str(v or "") for v in display_df.get("remote_key", pd.Series(dtype=str)).tolist()}
+        except Exception:
+            visible_keys = set()
+        if selected_key and selected_key in visible_keys:
             st.session_state.mat_selected_key = selected_key
             st.session_state.mat_pending_selected_key = selected_key
             st.session_state.mat_selected_summary = None
@@ -4278,7 +4327,8 @@ with tab_mat:
         else:
             st.session_state.mat_selected_key = ""
             st.session_state.mat_selected_summary = None
-            set_status("Bitte zuerst genau eine MAT-Zeile anwaehlen.", "warn")
+            st.session_state.mat_user_selected_key = ""
+            set_status("Bitte zuerst genau eine MAT-Zeile in der aktuell sichtbaren Tabelle anwaehlen.", "warn")
 
     if st.session_state.mat_load_requested and (not running) and connected:
         selected = st.session_state.mat_selected_key
@@ -5224,6 +5274,15 @@ with tab_track:
     _ocr_probe_busy = bool(st.session_state.get("roi_ocr_probe_running", False))
     _ocr_ready_to_save = _roi_ocr_all_ok()
 
+    if bool(st.session_state.get("roi_next_load_running", False)):
+        st.session_state.tab_default = "ROI Setup"
+        _render_blocking_overlay("Nächste Datei wird geladen ...")
+        ok_next, msg_next = _load_next_roi_setup_file()
+        st.session_state.roi_next_load_running = False
+        st.session_state.tab_default = "ROI Setup"
+        set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
+        st.rerun()
+
     if _save_busy:
         st.session_state.tab_default = "ROI Setup"
         _render_blocking_overlay("Speichern läuft ...")
@@ -5240,12 +5299,10 @@ with tab_track:
         st.session_state.tab_default = "ROI Setup"
         st.rerun()
 
-    _next_disabled = _save_busy or _ocr_probe_busy or (not bool(st.session_state.get("roi_saved_once", False)))
+    _next_disabled = _save_busy or _ocr_probe_busy or bool(st.session_state.get("roi_next_load_running", False)) or (not bool(st.session_state.get("roi_saved_once", False)))
     if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn_bottom", disabled=_next_disabled):
-        ok_next, msg_next = _load_next_roi_setup_file()
-        set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
+        st.session_state.roi_next_load_running = True
         st.session_state.tab_default = "ROI Setup"
-        st.session_state.roi_scroll_top_once = True
         st.rerun()
 
     _last_save = st.session_state.get("_last_save_payload") or {}
