@@ -239,7 +239,7 @@ hr { border-color:#1e2535 !important; }
 .stDataFrame [aria-selected="true"] {
   background-color: rgba(74, 144, 164, 0.30) !important;
 }
-.ref-track-fit img { max-height: 340px; object-fit: contain; }
+.ref-track-fit img { max-height: calc(100vh - 360px); object-fit: contain; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1497,70 +1497,14 @@ def _mat_to_text(x, default: str = "") -> str:
 
 def _normalize_roi_format(fmt) -> str:
     txt = _mat_to_text(fmt, "any")
-    if not txt or txt == "<undefined>":
-        txt = "any"
     if txt == "custom" or txt not in FMT_OPTIONS:
         return "any"
     return txt
 
 
-def _mat_text_list(x) -> list[str]:
-    """MATLAB char/cell/string/categorical labels -> list[str]."""
-    if x is None:
-        return []
-    x = _mat_scalar(x)
-    try:
-        arr = np.asarray(x)
-        if arr.size == 0:
-            return []
-        if arr.dtype.kind in ("U", "S"):
-            if arr.ndim == 2:
-                return ["".join(str(c) for c in row).strip() for row in arr]
-            return [str(v).strip() for v in arr.ravel().tolist()]
-        return [_mat_to_text(v, "") for v in arr.ravel().tolist()]
-    except Exception:
-        txt = _mat_to_text(x, "")
-        return [txt] if txt else []
-
-
-def _mat_categorical_column_values(col, n: int) -> list | None:
-    """Decode MATLAB categorical saved in v7 MAT as codes + categoryNames/categories."""
-    if col is None:
-        return None
-    obj = _mat_scalar(col)
-    codes = _mat_obj_get(obj, "codes")
-    cats = (_mat_obj_get(obj, "categoryNames") or
-            _mat_obj_get(obj, "categories") or
-            _mat_obj_get(obj, "category_names"))
-    if codes is None or cats is None:
-        return None
-    labels = _mat_text_list(cats)
-    if not labels:
-        return None
-    try:
-        code_arr = np.asarray(_mat_scalar(codes)).ravel()
-    except Exception:
-        return None
-    vals = []
-    for c in code_arr[:n]:
-        try:
-            if not np.isfinite(float(c)):
-                vals.append(""); continue
-            idx = int(c) - 1
-            vals.append(labels[idx] if 0 <= idx < len(labels) else "")
-        except Exception:
-            vals.append("")
-    if len(vals) < n:
-        vals += [""] * (n - len(vals))
-    return vals[:n]
-
-
 def _mat_column_values(col, n: int) -> list:
     if col is None:
         return [None] * n
-    cat_vals = _mat_categorical_column_values(col, n)
-    if cat_vals is not None:
-        return cat_vals
     col = _mat_scalar(col)
     try:
         arr = np.asarray(col)
@@ -1627,95 +1571,6 @@ def _extract_rois_from_recordresult_mat(mat_path: str) -> list[dict]:
         return out
     except Exception:
         return []
-
-
-
-def _pts_from_mat_value(v) -> list[list[float]]:
-    try:
-        arr = np.asarray(_mat_scalar(v), dtype=float)
-        if arr.size < 4:
-            return []
-        arr = arr.reshape((-1, 2)) if arr.ndim == 1 else arr
-        if arr.shape[1] != 2 and arr.shape[0] == 2:
-            arr = arr.T
-        pts = []
-        for x, y in arr[:8, :2]:
-            if np.isfinite(x) and np.isfinite(y):
-                pts.append([float(x), float(y)])
-        return pts
-    except Exception:
-        return []
-
-
-def _marker_to_color_range(marker) -> dict | None:
-    if marker is None:
-        return None
-    try:
-        mu = np.asarray(_mat_scalar(_mat_obj_get(marker, "hsv_mu")), dtype=float).ravel()
-        sig = np.asarray(_mat_scalar(_mat_obj_get(marker, "hsv_sig")), dtype=float).ravel()
-        if mu.size < 3 or not np.all(np.isfinite(mu[:3])):
-            return None
-        if sig.size < 3 or not np.all(np.isfinite(sig[:3])):
-            sig = np.array([0.08, 0.20, 0.20], dtype=float)
-        # OCRExtractor.m stores HSV as MATLAB normalized values: H/S/V in [0..1].
-        h = float(mu[0]) * 179.0
-        s = float(mu[1]) * 255.0
-        v = float(mu[2]) * 255.0
-        dh = max(15.0, float(sig[0]) * 179.0 * 3.0)
-        ds = max(35.0, float(sig[1]) * 255.0 * 3.0)
-        dv = max(35.0, float(sig[2]) * 255.0 * 3.0)
-        return dict(
-            h_lo=int(max(0, round(h - dh))), h_hi=int(min(179, round(h + dh))),
-            s_lo=int(max(0, round(s - ds))), s_hi=int(min(255, round(s + ds))),
-            v_lo=int(max(0, round(v - dv))), v_hi=int(min(255, round(v + dv))),
-        )
-    except Exception:
-        return None
-
-
-def _extract_track_cal_from_recordresult_mat(mat_path: str) -> dict:
-    """Load recordResult.ocr.trkCalSlim: ROI, 8 minimap points and marker color."""
-    out = {}
-    try:
-        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
-        rr = _mat_scalar(data.get("recordResult"))
-        ocr = _mat_obj_get(rr, "ocr")
-        trk = _mat_obj_get(ocr, "trkCalSlim")
-        if trk is None:
-            return out
-        roi = _parse_roi_value(_mat_obj_get(trk, "roi"))
-        if roi and len(roi) >= 4 and roi[2] > 0 and roi[3] > 0:
-            out["track_roi"] = [float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])]
-        pts = _pts_from_mat_value(_mat_obj_get(trk, "ptsMini"))
-        if len(pts) >= 4:
-            out["minimap_pts"] = pts[:8]
-        cr = _marker_to_color_range(_mat_obj_get(trk, "marker"))
-        if cr:
-            out["moving_pt_color_range"] = cr
-    except Exception:
-        pass
-    return out
-
-
-def _upsert_track_minimap_roi_from_mat(track_roi: list[float]) -> None:
-    if not track_roi or len(track_roi) < 4:
-        return
-    x, y, w, h = [float(v) for v in track_roi[:4]]
-    if w <= 0 or h <= 0:
-        return
-    new_roi = dict(name="track_minimap", x=x, y=y, w=w, h=h, fmt="any", max_scale=float(st.session_state.get("roi_global_scale", 1.2)))
-    rois = list(st.session_state.get("rois") or [])
-    replaced = False
-    for i, r in enumerate(rois):
-        if str(r.get("name", "")).strip() == "track_minimap":
-            nr = dict(r)
-            nr.update(new_roi)
-            rois[i] = nr
-            replaced = True
-            break
-    if not replaced:
-        rois.append(new_roi)
-    st.session_state.rois = _sanitize_rois(rois)
 
 
 def _mat_has_nonempty_roi_field(x) -> bool:
@@ -2414,14 +2269,6 @@ def _load_mat_from_r2(remote_key):
             st.session_state.ref_track_pts = cfg["ref_track_pts"]
         if cfg.get("minimap_pts"):
             st.session_state.minimap_pts = cfg["minimap_pts"]
-        track_cfg = _extract_track_cal_from_recordresult_mat(tmp.name)
-        if track_cfg.get("track_roi"):
-            _upsert_track_minimap_roi_from_mat(track_cfg["track_roi"])
-        if track_cfg.get("minimap_pts"):
-            st.session_state.minimap_pts = track_cfg["minimap_pts"]
-            st.session_state.minimap_next_pt_idx = len(track_cfg["minimap_pts"])
-        if track_cfg.get("moving_pt_color_range"):
-            st.session_state.moving_pt_color_range = track_cfg["moving_pt_color_range"]
         set_status("MAT geladen OK","ok")
         return tmp.name
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
@@ -3718,7 +3565,7 @@ with tab_track:
         if has_ref:
             # P1-P8 already baked into the rendered image by render_centerline_image(); height-limited in this tab.
             st.markdown('<div class="ref-track-fit">', unsafe_allow_html=True)
-            st.image(st.session_state.ref_track_img, width=520,
+            st.image(st.session_state.ref_track_img, width="stretch",
                      caption="P1–P8 fest aus Streckendatei")
             st.markdown('</div>', unsafe_allow_html=True)
             _sl_c1, _sl_c2 = st.columns(2)
@@ -3776,6 +3623,7 @@ with tab_track:
                 key="track_color_time_slider",
             )
             st.session_state.t_current = float(_track_t)
+            st.session_state.sl_cur = float(_track_t)
             frame=_get_media_frame(st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
@@ -3794,7 +3642,6 @@ with tab_track:
                 vis_c = crop.copy()
                 if _cl_px and _ref_pts and len(mm_pts) >= 4:
                     try:
-                        vis_overlay = vis_c.copy()
                         n_use = min(len(mm_pts), len(_ref_pts))
                         H_fwd, _ = cv2.findHomography(
                             np.array(mm_pts[:n_use], dtype=np.float32),
@@ -3812,8 +3659,7 @@ with tab_track:
                                 p2 = (int(cl_int[i+1, 0]), int(cl_int[i+1, 1]))
                                 if (0 <= p1[0] < cw and 0 <= p1[1] < ch and
                                         0 <= p2[0] < cw and 0 <= p2[1] < ch):
-                                    cv2.line(vis_overlay, p1, p2, (0, 220, 100), 1)
-                            vis_c = cv2.addWeighted(vis_c, 0.70, vis_overlay, 0.30, 0)
+                                    cv2.line(vis_c, p1, p2, (0, 220, 100), 1)
                             _overlay_pts = n_use
                         else:
                             _overlay_pts = 0
@@ -3933,59 +3779,38 @@ with tab_track:
                         'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
         st.markdown('</div>',unsafe_allow_html=True)
 
-    def _centerline_progress_percent(ref_pt, centerline_px) -> float | None:
-        if ref_pt is None or not centerline_px:
-            return None
-        try:
-            p = np.array(ref_pt, dtype=float).reshape(2)
-            cl = np.asarray(centerline_px, dtype=float).reshape(-1, 2)
-            if cl.shape[0] < 2:
-                return None
-            seg = cl[1:] - cl[:-1]
-            seg_len = np.linalg.norm(seg, axis=1)
-            total = float(np.sum(seg_len))
-            if total <= 0:
-                return None
-            best_s = 0.0
-            best_d2 = float("inf")
-            cum = np.concatenate([[0.0], np.cumsum(seg_len)])
-            for i, v in enumerate(seg):
-                l2 = float(np.dot(v, v))
-                if l2 <= 0:
-                    continue
-                u = float(np.clip(np.dot(p - cl[i], v) / l2, 0.0, 1.0))
-                q = cl[i] + u * v
-                d2 = float(np.sum((p - q) ** 2))
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_s = float(cum[i] + u * seg_len[i])
-            return float(np.clip(100.0 * best_s / total, 0.0, 100.0))
-        except Exception:
-            return None
-
-    def _comparison_overlay_low_opacity(crop, cmp):
-        overlay = draw_comparison_overlay(
-            crop, st.session_state.ref_track_img,
-            st.session_state.minimap_pts, st.session_state.ref_track_pts,
-            cmp, st.session_state.moving_pt_color_range,
-        )
-        try:
-            if overlay is not None and overlay.shape == crop.shape:
-                return cv2.addWeighted(crop, 0.62, overlay, 0.38, 0)
-        except Exception:
-            pass
-        return overlay
-
     st.markdown('<div class="section-card">',unsafe_allow_html=True)
     st.markdown('<div class="section-title">Vergleich | Ueberlagerung | Bewegende Punkte</div>',
                 unsafe_allow_html=True)
-    cv1, cv2_ = st.columns([1, 3], gap="medium")
+    cv1,cv2_=st.columns(2,gap="medium")
 
-    can_cmp = (has_ref and track_roi and has_vid and
-               _has_valid_8_points(st.session_state.ref_track_pts) and
-               _has_valid_8_points(st.session_state.minimap_pts))
+    can_cmp=(has_ref and track_roi and has_vid and
+             _has_valid_8_points(st.session_state.ref_track_pts) and
+             _has_valid_8_points(st.session_state.minimap_pts))
     with cv1:
-        if can_cmp and st.button("Vergleich 5 Zeiten", type="primary", width="stretch", key="cmp_5_times_btn"):
+        if can_cmp and st.button("> Vergleich",type="primary",width="stretch"):
+            frame=_get_media_frame(st.session_state.t_current)
+            if frame is not None:
+                crop=extract_minimap_crop(frame,track_roi,fw,fh)
+                cmp=compare_minimap_to_reference(crop,st.session_state.ref_track_img,
+                    st.session_state.minimap_pts,st.session_state.ref_track_pts)
+                st.session_state.track_comparison=cmp
+                if cmp.get("error"):
+                    set_status(f"Vergleich fehlgeschlagen: {cmp['error']}", "warn")
+                    st.rerun()
+                mp=detect_moving_point(crop,st.session_state.moving_pt_color_range)
+                if mp:
+                    ref_pt = project_point_with_homography((mp["x"], mp["y"]), cmp.get("H"))
+                    st.session_state.moving_pt_history.append({
+                        "t": st.session_state.t_current,
+                        "x_minimap": mp["x"],
+                        "y_minimap": mp["y"],
+                        "x_ref": ref_pt[0] if ref_pt else None,
+                        "y_ref": ref_pt[1] if ref_pt else None,
+                        "confidence": mp.get("confidence", 0.0),
+                    })
+                set_status("Vergleich durchgefuehrt.","ok"); st.rerun()
+        if can_cmp and st.button("Vergleich 5 Zeiten", width="stretch", key="cmp_5_times_btn"):
             rng = np.random.default_rng(12345)
             lo, hi = float(st.session_state.t_start), float(st.session_state.t_end)
             times = sorted(rng.uniform(lo, hi, size=5).tolist()) if hi > lo else [lo] * 5
@@ -3995,45 +3820,47 @@ with tab_track:
                 if _frame is None:
                     continue
                 _crop = extract_minimap_crop(_frame, track_roi, fw, fh)
-                _cmp = compare_minimap_to_reference(
-                    _crop, st.session_state.ref_track_img,
-                    st.session_state.minimap_pts, st.session_state.ref_track_pts,
-                )
+                _cmp = compare_minimap_to_reference(_crop, st.session_state.ref_track_img, st.session_state.minimap_pts, st.session_state.ref_track_pts)
                 if _cmp.get("error"):
                     continue
                 _mp = detect_moving_point(_crop, st.session_state.moving_pt_color_range)
-                _ref_pt = None
-                _progress = None
-                if _mp:
-                    _ref_pt = project_point_with_homography((_mp["x"], _mp["y"]), _cmp.get("H"))
-                    _progress = _centerline_progress_percent(_ref_pt, st.session_state.get("centerline_px"))
-                _overlay = _comparison_overlay_low_opacity(_crop, _cmp)
-                results.append({
-                    "t": float(_t), "cmp": _cmp, "mp": _mp,
-                    "ref_pt": _ref_pt, "progress_pct": _progress,
-                    "overlay": _overlay,
-                })
+                _overlay = draw_comparison_overlay(_crop, st.session_state.ref_track_img, st.session_state.minimap_pts, st.session_state.ref_track_pts, _cmp, st.session_state.moving_pt_color_range)
+                results.append({"t": float(_t), "cmp": _cmp, "mp": _mp, "overlay": _overlay})
             st.session_state.track_comparison_samples = results
             set_status(f"Vergleich fuer {len(results)} Zeiten durchgefuehrt.", "ok")
             st.rerun()
-        elif not can_cmp:
-            st.caption("Benötigt: Referenztrack, track_minimap ROI, Video und je 8 Punkte.")
-
+        cmp=st.session_state.track_comparison
+        if cmp:
+            if cmp.get("error"):
+                st.warning(cmp["error"])
+            st.caption(
+                f"Qualitaet: Ø-Abstand={cmp.get('mean_dist_px', 0.0):.2f}px, "
+                f"Max-Abstand={cmp.get('max_dist_px', 0.0):.2f}px, "
+                f"Homographie-Fehler={cmp.get('homography_err', 0.0):.2f}px"
+            )
     with cv2_:
-        _samples = st.session_state.get("track_comparison_samples") or []
-        if _samples:
-            st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
-            _cols = st.columns(len(_samples))
-            for _col, _res in zip(_cols, _samples):
-                _col.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
-                _c = _res.get("cmp", {})
-                _mp = _res.get("mp")
-                _progress = _res.get("progress_pct")
-                _pos_txt = f"Pos={_progress:.1f}%" if _progress is not None else "Pos=n/a"
-                _col.caption(
-                    f"Ø={_c.get('mean_dist_px', 0.0):.1f}px | Max={_c.get('max_dist_px', 0.0):.1f}px | "
-                    f"Pt={'ja' if _mp else 'nein'} | {_pos_txt}"
-                )
+        cmp=st.session_state.track_comparison
+        if cmp and has_ref and track_roi and has_vid:
+            frame=_get_media_frame(st.session_state.t_current)
+            if frame is not None:
+                crop=extract_minimap_crop(frame,track_roi,fw,fh)
+                overlay=draw_comparison_overlay(crop,st.session_state.ref_track_img,
+                    st.session_state.minimap_pts,st.session_state.ref_track_pts,
+                    cmp,st.session_state.moving_pt_color_range)
+                st.image(overlay, width="stretch",
+                         caption="Minimap (blau) vs. Referenz (gruen)")
+    _samples = st.session_state.get("track_comparison_samples") or []
+    if _samples:
+        st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
+        _cols = st.columns(len(_samples))
+        for _col, _res in zip(_cols, _samples):
+            _col.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
+            _c = _res.get("cmp", {})
+            _mp = _res.get("mp")
+            _col.caption(
+                f"Ø={_c.get('mean_dist_px', 0.0):.1f}px | Max={_c.get('max_dist_px', 0.0):.1f}px | "
+                f"Pt={'ja' if _mp else 'nein'}"
+            )
     st.markdown('</div>',unsafe_allow_html=True)
 
     if False and st.session_state.moving_pt_history:
