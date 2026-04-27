@@ -1034,11 +1034,12 @@ def render_centerline_image(
     centerline: np.ndarray,
     fixed_pts: list[list[float]] | np.ndarray | None = None,
     size_px: int = 800,
-) -> tuple[np.ndarray, list[list[float]] | None]:
+) -> tuple[np.ndarray, list[list[float]] | None, list[list[int]]]:
     """
     Render the centerline XY [m] as an RGB image on a dark background.
-    Returns (img_rgb, fixed_pts_px) where fixed_pts_px are pixel [x,y] coords
-    matching the positions of fixed_pts in the returned image.
+    Returns (img_rgb, fixed_pts_px, centerline_px) where:
+      - fixed_pts_px  : pixel [x,y] coords of fixed_pts in the image
+      - centerline_px : pixel [x,y] coords of every centerline point (for overlay)
     """
     try:
         import cv2 as _cv2
@@ -1099,4 +1100,4 @@ def render_centerline_image(
         fixed_pts_px = fp_px.astype(float).tolist()
 
     img = img[:, :, ::-1]  # BGR → RGB
-    return img, fixed_pts_px
+    return img, fixed_pts_px, pts_cl.tolist()

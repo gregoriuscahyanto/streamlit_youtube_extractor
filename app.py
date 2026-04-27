@@ -382,7 +382,7 @@ def init_state():
         roi_editor_widget_key="roi_data_editor_v2",
         # Track
         ref_track_img=None, ref_track_pts=None, minimap_pts=None,
-        centerline=None, ref_track_mat_name="",
+        centerline=None, centerline_px=None, ref_track_mat_name="",
         minimap_next_pt_idx=0,
         track_comparison=None, moving_pt_history=[],
         moving_pt_color_range=dict(h_lo=0,h_hi=30,s_lo=150,s_hi=255,v_lo=150,v_hi=255),
@@ -1931,8 +1931,9 @@ def _apply_centerline_to_session(mat_path: str, mat_name: str) -> None:
         set_status(f"Centerline-Fehler: {e}", "warn")
         return
     fixed = guess_fixed_points(mat_name)
-    img, fp_px = render_centerline_image(cl, fixed_pts=fixed, size_px=800)
+    img, fp_px, cl_px = render_centerline_image(cl, fixed_pts=fixed, size_px=800)
     st.session_state.centerline = cl.tolist()
+    st.session_state.centerline_px = cl_px
     st.session_state.ref_track_mat_name = mat_name
     st.session_state.ref_track_img = img
     if fp_px is not None:
@@ -3235,8 +3236,41 @@ with tab_track:
                     st.session_state.minimap_next_pt_idx = len(mm_pts)
                 next_idx = st.session_state.minimap_next_pt_idx
 
-                # Draw set points (white ring + colored fill + shadow label for contrast)
+                # ── Iterativer Track-Overlay ──────────────────────────────────────
+                # Ab 4 Punkten: Homographie berechnen und Centerline auf Minimap projizieren.
+                # Je mehr Punkte, desto besser die Überlagerung.
+                _cl_px   = st.session_state.get("centerline_px")
+                _ref_pts = st.session_state.ref_track_pts
                 vis_c = crop.copy()
+                if _cl_px and _ref_pts and len(mm_pts) >= 4:
+                    try:
+                        n_use = min(len(mm_pts), len(_ref_pts))
+                        H_fwd, _ = cv2.findHomography(
+                            np.array(mm_pts[:n_use], dtype=np.float32),
+                            np.array(_ref_pts[:n_use], dtype=np.float32),
+                            cv2.RANSAC, 5.0,
+                        )
+                        if H_fwd is not None:
+                            H_inv = np.linalg.inv(H_fwd)
+                            # Subsample centerline (every 15th pt) for speed
+                            cl_sub = np.array(_cl_px[::15], dtype=np.float32).reshape(-1, 1, 2)
+                            cl_mm  = cv2.perspectiveTransform(cl_sub, H_inv).reshape(-1, 2)
+                            cl_int = np.round(cl_mm).astype(int)
+                            for i in range(len(cl_int) - 1):
+                                p1 = (int(cl_int[i, 0]),   int(cl_int[i, 1]))
+                                p2 = (int(cl_int[i+1, 0]), int(cl_int[i+1, 1]))
+                                if (0 <= p1[0] < cw and 0 <= p1[1] < ch and
+                                        0 <= p2[0] < cw and 0 <= p2[1] < ch):
+                                    cv2.line(vis_c, p1, p2, (0, 220, 100), 1)
+                            _overlay_pts = n_use
+                        else:
+                            _overlay_pts = 0
+                    except Exception:
+                        _overlay_pts = 0
+                else:
+                    _overlay_pts = 0
+
+                # Draw set points on top of overlay (white ring + colored fill + shadow label)
                 for pi, pt in enumerate(mm_pts):
                     if pt and len(pt) == 2:
                         px_i, py_i = int(pt[0]), int(pt[1])
@@ -3254,7 +3288,12 @@ with tab_track:
                     # ── Kalibrierung: P1 … P8 anklicken ──
                     # Fixed widget key + dedup: avoids image disappearing when key changes.
                     # The widget returns the last click on every rerun; we only act on a NEW click.
-                    st.caption(f"Klicke **P{next_idx+1}** auf der Minimap  ·  {next_idx}/8 gesetzt")
+                    _overlay_info = (f"  ·  Track-Overlay: {_overlay_pts} Punkte"
+                                     if _overlay_pts >= 4 else "")
+                    st.caption(
+                        f"Klicke **P{next_idx+1}** auf der Minimap  ·  {next_idx}/8 gesetzt"
+                        + _overlay_info
+                    )
                     _last_cal = st.session_state.get("_mm_last_click")
                     click = streamlit_image_coordinates(vis_c, key="mm_calibrate")
                     if click and isinstance(click, dict) and click != _last_cal:
@@ -3273,12 +3312,18 @@ with tab_track:
                     cr = st.session_state.moving_pt_color_range
                     mp_live = detect_moving_point(crop, cr)
 
-                    # Overlay detected blob as yellow ring on vis_c
+                    # Overlay: detected blob (yellow) + last click position (cyan cross)
                     vis_detect = vis_c.copy()
                     if mp_live:
                         dx, dy = int(mp_live["x"]), int(mp_live["y"])
                         cv2.circle(vis_detect, (dx, dy), 12, (255, 255, 0), 2)
                         cv2.circle(vis_detect, (dx, dy),  3, (255, 255, 0), -1)
+                    _clk_pos = st.session_state.get("_mm_color_click_px")
+                    if _clk_pos and 0 <= _clk_pos[0] < cw and 0 <= _clk_pos[1] < ch:
+                        cv2.drawMarker(
+                            vis_detect, (int(_clk_pos[0]), int(_clk_pos[1])),
+                            (0, 255, 255), cv2.MARKER_CROSS, 14, 2,
+                        )
 
                     # Color swatch for current target color
                     h_m=(cr["h_lo"]+cr["h_hi"])//2
@@ -3292,8 +3337,9 @@ with tab_track:
                     detected_lbl = "✓ Erkannt" if mp_live else "✗ Nicht erkannt"
                     sc1, sc2 = st.columns([3,1])
                     sc1.caption(
-                        f"✓ 8 Punkte  ·  Farberkennung: **{detected_lbl}** (gelber Kreis)"
-                        f"  —  Klicke Marker → Farbe sofort übernehmen"
+                        f"✓ 8 Punkte  ·  Farberkennung: **{detected_lbl}**  "
+                        f"| 🟡 Blob-Zentrum  🔵 Klick-Position  "
+                        f"— Klicke Marker → Farbe übernehmen"
                     )
                     sc2.image(swatch, caption="Zielfarbe", width="stretch")
 
@@ -3303,6 +3349,7 @@ with tab_track:
                         st.session_state["_mm_last_color_click"] = color_click
                         cx = max(0, min(cw-1, int(round(float(color_click.get("x",0))))))
                         cy = max(0, min(ch-1, int(round(float(color_click.get("y",0))))))
+                        st.session_state["_mm_color_click_px"] = (cx, cy)
                         pixel_rgb = crop[cy, cx]
                         hsv_px = cv2.cvtColor(
                             np.array([[pixel_rgb]],dtype=np.uint8),
