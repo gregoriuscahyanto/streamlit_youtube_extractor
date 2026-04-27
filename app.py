@@ -383,6 +383,7 @@ def init_state():
         roi_ocr_probe_running=False,
         roi_next_load_running=False,
         roi_saved_once=False,
+        roi_delete_confirm_idx=None,
         roi_scroll_top_once=False,
         tab_default=None,
         # Datei-Browser
@@ -460,10 +461,8 @@ def _render_blocking_overlay(text: str):
     )
 
 
-if bool(st.session_state.get("roi_save_running", False)):
-    _render_blocking_overlay("Speichern läuft ...")
-if bool(st.session_state.get("roi_ocr_probe_running", False)):
-    _render_blocking_overlay("OCR-Test ROI läuft ...")
+# Nur "Nächste Datei laden" darf bewusst einen kompletten Rerun/Refresh auslösen.
+# Speichern und OCR-Test zeigen ihr Overlay lokal im jeweiligen Button-Flow.
 if bool(st.session_state.get("roi_next_load_running", False)):
     _render_blocking_overlay("Nächste Datei wird geladen ...")
 
@@ -1265,6 +1264,58 @@ def _roi_ocr_all_ok() -> bool:
     rois = st.session_state.get("rois", []) or []
     indices = _roi_ocr_probe_indices()
     return bool(indices) and all(bool(rois[i].get("ocr_test_ok", False)) for i in indices)
+
+
+def _run_roi_ocr_probe_now(frame, fw, fh, indices: list[int]) -> tuple[bool, str]:
+    """Run OCR probe synchronously in the current button run to avoid a pre-run page refresh."""
+    if frame is None or not indices:
+        st.session_state.roi_ocr_probe_result = None
+        return False, "Kein Frame oder keine OCR-ROIs zum Testen vorhanden."
+    tess_cmd = find_tesseract_cmd()
+    if not tess_cmd:
+        st.session_state.roi_ocr_probe_result = None
+        return False, "Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD."
+    all_probe_results = []
+    for _idx in indices:
+        probe_roi = {
+            **st.session_state.rois[_idx],
+            "max_scale": float(st.session_state.get("roi_global_scale", 1.2)),
+        }
+        probe = diagnose_roi_ocr(
+            frame,
+            probe_roi,
+            (int(fw), int(fh)),
+            tmp_root=LOG_DIR / "ocr_tmp",
+        )
+        _conf = float(probe.get("confidence", 0.0) or 0.0)
+        _scale = probe.get("scale", "")
+        _fr_up = probe.get("frUp", probe.get("fr_up", probe.get("variant", "")))
+        _details = (
+            f"raw={probe.get('raw', '')}; "
+            f"conf={_conf:.2f}; "
+            f"scale={_scale}; "
+            f"frUp={_fr_up}"
+        )
+        st.session_state.rois[_idx] = {
+            **st.session_state.rois[_idx],
+            "ocr_test_ok": bool(probe.get("ok")),
+            "ocr_test_value": probe.get("value", ""),
+            "ocr_test_raw": probe.get("raw", ""),
+            "ocr_test_confidence": _conf,
+            "ocr_test_scale": _scale,
+            "ocr_test_frUp": _fr_up,
+            "ocr_test_error": probe.get("error", ""),
+            "ocr_test_details": _details,
+        }
+        all_probe_results.append({
+            "idx": _idx,
+            "name": st.session_state.rois[_idx].get("name", ""),
+            **probe,
+        })
+    st.session_state.roi_ocr_probe_result = all_probe_results
+    st.session_state.roi_editor_df = None
+    ok = _roi_ocr_all_ok()
+    return ok, "OCR-Test ROI abgeschlossen." if ok else "OCR-Test ROI abgeschlossen; mindestens eine ROI ist noch nicht OK."
 
 
 def build_result_json():
@@ -4191,10 +4242,12 @@ with tab_mat:
         key="mat_update_tab",
         disabled=(not connected) or running or load_running,
     )
+    # Button soll nach Update/Filter nicht durch einen veralteten Selection-State
+    # blockiert werden. Ob wirklich eine sichtbare MAT-Zeile gewaehlt ist, wird
+    # beim Klick gegen die aktuell sichtbare Tabelle validiert.
     can_load = (
         connected
         and bool(st.session_state.mat_overview_rows)
-        and bool(st.session_state.get("mat_pending_selected_key", ""))
         and not running
         and not load_running
     )
@@ -4411,6 +4464,7 @@ with tab_roi:
             unsafe_allow_html=True,
         )
         st.markdown('<div class="roi-compact">', unsafe_allow_html=True)
+        st.subheader("1 · ROI Setup")
 
         dur = st.session_state.vid_duration
         fps = st.session_state.vid_fps
@@ -4902,22 +4956,38 @@ with tab_roi:
                 for _idx in _ocr_probe_indices:
                     st.session_state.rois[_idx]["ocr_test_ok"] = False
                 st.session_state.roi_ocr_probe_running = True
+                _render_blocking_overlay("OCR-Test ROI läuft ...")
+                _ok_probe, _msg_probe = _run_roi_ocr_probe_now(frame, fw, fh, _ocr_probe_indices)
+                st.session_state.roi_ocr_probe_running = False
                 st.session_state.tab_default = "ROI Setup"
+                set_status(_msg_probe, "ok" if _ok_probe else "warn")
                 st.rerun()
 
             if st.button("Ausgew\u00e4hlte ROI l\u00f6schen", width="stretch",
                          key="roi_del_btn", disabled=act_sel is None):
                 if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
-                    st.session_state.rois.pop(act_sel)
+                    st.session_state.roi_delete_confirm_idx = int(act_sel)
+
+            _confirm_idx = st.session_state.get("roi_delete_confirm_idx")
+            if isinstance(_confirm_idx, int) and 0 <= _confirm_idx < len(st.session_state.rois):
+                _roi_name = st.session_state.rois[_confirm_idx].get("name", "")
+                st.warning(f"ROI #{_confirm_idx} ({_roi_name}) wirklich löschen?")
+                _del_yes, _del_no = st.columns(2)
+                if _del_yes.button("Ja, löschen", width="stretch", key="roi_del_confirm_yes"):
+                    st.session_state.rois.pop(_confirm_idx)
                     st.session_state.selected_roi = None
                     st.session_state.roi_draw_armed = False
                     st.session_state.roi_wait_user_move = False
                     st.session_state.roi_anchor_box = {}
                     st.session_state.roi_reject_anchor_events = 0
                     st.session_state.roi_editor_df = None
+                    st.session_state.roi_delete_confirm_idx = None
                     if st.session_state.media_source == "video":
                         get_frame.clear()
-                    set_status("ROI gel\u00f6scht.", "info")
+                    set_status("ROI gelöscht.", "info")
+                    st.rerun()
+                if _del_no.button("Nein", width="stretch", key="roi_del_confirm_no"):
+                    st.session_state.roi_delete_confirm_idx = None
                     st.rerun()
 
 
@@ -4928,7 +4998,8 @@ with tab_roi:
 # TAB ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âº ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“ TRACK-ANALYSE
 # ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
 with tab_track:
-    st.markdown('<div class="roi-theme-card"><div class="theme-title">Track Analysis</div><div class="theme-text">Referenz-Track, Minimap-Kalibrierung, Farberkennung und Vergleich sind jetzt direkt im ROI Setup integriert.</div></div>', unsafe_allow_html=True)
+    st.divider()
+    st.subheader("2 · Track Analysis")
     has_ref   = st.session_state.ref_track_img is not None
     track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
     has_vid   = _has_media_source()
@@ -5268,7 +5339,9 @@ with tab_track:
 
 
 
-    st.markdown('<div class="roi-theme-card"><div class="theme-title">Speicherung</div><div class="theme-text">Speichert die aktuelle ROI-, Zeit- und Track-Konfiguration gemeinsam als JSON und MAT.</div></div>', unsafe_allow_html=True)
+    st.divider()
+    st.subheader("3 · Speicherung")
+    st.caption("Speichert die aktuelle ROI-, Zeit- und Track-Konfiguration gemeinsam als JSON und MAT. Downloads sind nur optional nach dem Speichern.")
     _has_any_roi = len(st.session_state.get("rois") or []) > 0
     _save_busy = bool(st.session_state.get("roi_save_running", False))
     _ocr_probe_busy = bool(st.session_state.get("roi_ocr_probe_running", False))
@@ -5283,23 +5356,29 @@ with tab_track:
         set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
         st.rerun()
 
+    # Alter/Stale Save-State darf die Seite nicht blockieren. Speichern laeuft
+    # synchron im Button-Klick und verwendet keinen persistenten Fixed-Overlay.
     if _save_busy:
-        st.session_state.tab_default = "ROI Setup"
-        _render_blocking_overlay("Speichern läuft ...")
-        ok_save, msg_save, payload_save = _save_result_json_and_mat()
-        st.session_state["_last_save_payload"] = payload_save
         st.session_state.roi_save_running = False
-        st.session_state.roi_saved_once = bool(ok_save)
-        st.session_state.tab_default = "ROI Setup"
-        set_status(msg_save, "ok" if ok_save else "warn")
-        st.rerun()
+        _save_busy = False
 
     if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn_bottom", disabled=(_save_busy or _ocr_probe_busy or not _has_any_roi or not _ocr_ready_to_save), help="Erst aktiv, wenn der OCR-Test ROI grün ist."):
-        st.session_state.roi_save_running = True
         st.session_state.tab_default = "ROI Setup"
-        st.rerun()
+        st.session_state.roi_save_running = True
+        try:
+            with st.spinner("Speichern läuft ..."):
+                ok_save, msg_save, payload_save = _save_result_json_and_mat()
+            st.session_state["_last_save_payload"] = payload_save
+            st.session_state.roi_saved_once = bool(ok_save)
+            set_status(msg_save, "ok" if ok_save else "warn")
+        except Exception as e:
+            st.session_state.roi_saved_once = False
+            set_status(f"Speichern fehlgeschlagen: {e}", "warn")
+        finally:
+            st.session_state.roi_save_running = False
+            _save_busy = False
 
-    _next_disabled = _save_busy or _ocr_probe_busy or bool(st.session_state.get("roi_next_load_running", False)) or (not bool(st.session_state.get("roi_saved_once", False)))
+    _next_disabled = _ocr_probe_busy or bool(st.session_state.get("roi_next_load_running", False)) or (not bool(st.session_state.get("roi_saved_once", False)))
     if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn_bottom", disabled=_next_disabled):
         st.session_state.roi_next_load_running = True
         st.session_state.tab_default = "ROI Setup"
@@ -5309,8 +5388,11 @@ with tab_track:
     if _last_save:
         targets = " · ".join(str(x) for x in (_last_save.get("targets") or []))
         st.markdown(f'<div class="save-status-card">Zuletzt gespeichert: <b>{_last_save.get("json_name", "results.json")}</b> + <b>{_last_save.get("mat_name", "results.mat")}</b><br>{targets}</div>', unsafe_allow_html=True)
-        st.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch", key="json_download_bottom")
-        st.download_button("MAT herunterladen", _last_save.get("mat_bytes", b""), _last_save.get("mat_name", "results.mat"), "application/octet-stream", width="stretch", key="mat_download_bottom")
+        with st.expander("Optionale Downloads anzeigen", expanded=False):
+            st.caption("Die Dateien wurden bereits gespeichert. Diese Buttons sind nur für eine lokale Kopie.")
+            _dl_json_col, _dl_mat_col = st.columns(2)
+            _dl_json_col.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch", key="json_download_bottom")
+            _dl_mat_col.download_button("MAT herunterladen", _last_save.get("mat_bytes", b""), _last_save.get("mat_name", "results.mat"), "application/octet-stream", width="stretch", key="mat_download_bottom")
 
     if False and st.session_state.moving_pt_history:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
