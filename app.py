@@ -20,6 +20,10 @@ import threading
 import traceback
 import concurrent.futures as cf
 import scipy.io as sio
+try:
+    from scipy.io.matlab._mio5_params import MatlabObject
+except Exception:
+    MatlabObject = None
 from scipy import signal
 from scipy.io import wavfile
 import pandas as pd
@@ -1281,6 +1285,99 @@ def _download_template_mat_for_save() -> str:
     return ""
 
 
+
+def _matlab_cellstr(values):
+    return np.array([str(v) for v in (values or [])], dtype=object).reshape((-1, 1))
+
+
+def _matlab_datetime_object(dt=None):
+    """Best-effort MATLAB datetime object for MAT export.
+
+    scipy cannot write native MCOS datetime/table objects exactly like MATLAB v7.3,
+    but writing them as MATLAB objects keeps the intended class instead of a plain struct.
+    """
+    dt = dt or datetime.now()
+    if MatlabObject is None:
+        return np.array([dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second], dtype=float)
+    arr = np.empty((1, 1), dtype=[
+        ("year", object), ("month", object), ("day", object),
+        ("hour", object), ("minute", object), ("second", object),
+    ])
+    arr[0, 0] = (
+        np.array([[dt.year]], dtype=float),
+        np.array([[dt.month]], dtype=float),
+        np.array([[dt.day]], dtype=float),
+        np.array([[dt.hour]], dtype=float),
+        np.array([[dt.minute]], dtype=float),
+        np.array([[dt.second + dt.microsecond / 1_000_000.0]], dtype=float),
+    )
+    return MatlabObject(arr, classname="datetime")
+
+
+def _build_roi_table_for_matlab(rois=None):
+    """Build recordResult.ocr.roi_table / roi_table_raw as a MATLAB table object.
+
+    Columns follow OCRExtractor.m naming: name_roi, roi, fmt, max_scale.
+    """
+    rows = []
+    for r in _sanitize_rois(rois if rois is not None else st.session_state.get("rois", [])):
+        rows.append({
+            "name_roi": str(r.get("name", "_") or "_"),
+            "roi": np.array([
+                float(r.get("x", 0.0) or 0.0),
+                float(r.get("y", 0.0) or 0.0),
+                float(r.get("w", 0.0) or 0.0),
+                float(r.get("h", 0.0) or 0.0),
+            ], dtype=float).reshape((1, 4)),
+            "fmt": _normalize_roi_format(r.get("fmt", "any")),
+            "max_scale": float(r.get("max_scale", st.session_state.get("roi_global_scale", 1.2)) or 1.2),
+        })
+    n = len(rows)
+    arr = np.empty((n, 1), dtype=[
+        ("name_roi", object),
+        ("roi", object),
+        ("fmt", object),
+        ("max_scale", object),
+    ])
+    for i, row in enumerate(rows):
+        arr[i, 0] = (
+            row["name_roi"],
+            row["roi"],
+            row["fmt"],
+            np.array([[row["max_scale"]]], dtype=float),
+        )
+    if MatlabObject is None:
+        return arr
+    return MatlabObject(arr, classname="table")
+
+
+def _mat_export_to_jsonable(obj):
+    """Recursively convert the MAT export payload into strict JSON values."""
+    if MatlabObject is not None and isinstance(obj, MatlabObject):
+        return _mat_export_to_jsonable(np.asarray(obj))
+    obj = _mat_scalar(obj)
+    if MatlabObject is not None and isinstance(obj, MatlabObject):
+        return _mat_export_to_jsonable(np.asarray(obj))
+    if isinstance(obj, dict):
+        return {str(k): _mat_export_to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, np.void):
+        if obj.dtype.names:
+            return {name: _mat_export_to_jsonable(obj[name]) for name in obj.dtype.names}
+        return _mat_export_to_jsonable(obj.tolist())
+    if isinstance(obj, np.ndarray):
+        if obj.dtype.names:
+            return [_mat_export_to_jsonable(item) for item in obj.reshape(-1)]
+        return [_mat_export_to_jsonable(v) for v in obj.reshape(-1).tolist()]
+    if isinstance(obj, (list, tuple, set)):
+        return [_mat_export_to_jsonable(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return _mat_export_to_jsonable(obj.item())
+    if isinstance(obj, (datetime, pd.Timestamp)):
+        return obj.isoformat()
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="ignore")
+    return obj
+
 def _ensure_ocr_extractor_ocr_struct(rr: dict) -> dict:
     """Normalize recordResult.ocr for the MATLAB OCRExtractor workflow."""
     ocr = rr.get("ocr", {}) if isinstance(rr.get("ocr", {}), dict) else {}
@@ -1289,19 +1386,19 @@ def _ensure_ocr_extractor_ocr_struct(rr: dict) -> dict:
     params["end_s"] = float(st.session_state.get("t_end", 0.0) or 0.0)
     ocr["params"] = params
 
-    # OCRExtractor.m keeps both the effective table and the raw ROI table. The
-    # backend already builds roi_table; mirror it to roi_table_raw if absent.
-    if "roi_table" in ocr and "roi_table_raw" not in ocr:
-        ocr["roi_table_raw"] = ocr["roi_table"]
-    elif "roi_table_raw" in ocr and "roi_table" not in ocr:
-        ocr["roi_table"] = ocr["roi_table_raw"]
+    # OCRExtractor.m expects table-like ROI parameter blocks. Build both the
+    # effective and raw table from the current ROI editor state; do not leave
+    # scipy's default nested struct representation here.
+    roi_table = _build_roi_table_for_matlab(st.session_state.get("rois", []))
+    ocr["roi_table"] = roi_table
+    ocr["roi_table_raw"] = roi_table
+    ocr["created"] = _matlab_datetime_object(datetime.now())
 
-    # Keep a compact catalog for downstream MATLAB scripts that expect the
-    # known ROI/format options near the OCR parameter block.
-    ocr.setdefault("roi_catalog", {
-        "name_roi": np.array(ROI_NAMES, dtype=object),
-        "fmt": np.array(FMT_OPTIONS, dtype=object),
-    })
+    # Match OCRExtractor.m catalog names exactly.
+    ocr["roi_catalog"] = {
+        "roiNames": _matlab_cellstr(ROI_NAMES),
+        "fmtOptions": _matlab_cellstr(FMT_OPTIONS),
+    }
 
     # Track calibration belongs to OCR because OCRExtractor.m uses
     # recordResult.ocr.trkCalSlim for the minimap/track ROI. If backend did not
@@ -1343,10 +1440,10 @@ def _merge_recordresult_template(mat_struct: dict, template_fields: dict) -> dic
 
     rr = _ensure_ocr_extractor_ocr_struct(rr)
 
-    # These are created by later processing steps, not by ROI Setup. Keep them
-    # empty so MAT Selection correctly shows spectrogram/validation as pending.
-    rr["audio_rpm"] = {}
-    rr["validation"] = {}
+    # audio_rpm and validation are created by later processing steps. Do not
+    # write empty placeholders during ROI setup.
+    rr.pop("audio_rpm", None)
+    rr.pop("validation", None)
 
     out["recordResult"] = rr
     return out
@@ -1388,9 +1485,11 @@ def _save_result_json_and_mat() -> tuple[bool, str, dict]:
     cf = st.session_state.capture_folder or Path(str(st.session_state.video_name or "output")).stem or "output"
     safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(cf)).strip("._") or "output"
     result = build_result_json()
-    json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
+    mat_struct_for_save = _build_save_mat_struct(result)
+    json_payload = _mat_export_to_jsonable(mat_struct_for_save)
+    json_bytes = json.dumps(json_payload, indent=2, ensure_ascii=False, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
     mat_buf = io.BytesIO()
-    sio.savemat(mat_buf, _build_save_mat_struct(result), do_compression=True)
+    sio.savemat(mat_buf, mat_struct_for_save, do_compression=True)
     mat_bytes = mat_buf.getvalue()
     json_name = f"results_{safe_cf}.json"
     mat_name = f"results_{safe_cf}.mat"
@@ -2970,6 +3069,26 @@ def _step_mat_update_once():
         set_status(f"Analyse fuer {total} MAT-Dateien abgeschlossen.", "ok")
 
 
+
+def _render_disabled_mat_overview_table(slot, rows_or_df):
+    df = rows_or_df if isinstance(rows_or_df, pd.DataFrame) else pd.DataFrame(rows_or_df)
+    with slot.container():
+        st.markdown('<div class="mat-selection-disabled">MAT-Auswahl wird aktualisiert ...</div>', unsafe_allow_html=True)
+        try:
+            view = df.style.set_properties(**{
+                "background-color": "#20232b",
+                "color": "#7d8491",
+            })
+        except Exception:
+            view = df
+        st.dataframe(
+            view,
+            width="stretch",
+            hide_index=True,
+            height=MAT_TABLE_HEIGHT,
+            column_config=MAT_OVERVIEW_COLCFG,
+        )
+
 def _status_cell_style(value):
     txt = str(value)
     if (LAMP_GREEN in txt) or txt.endswith("Ja"):
@@ -3119,13 +3238,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
 
         st.session_state.mat_update_idx = done
         if live_table is not None:
-            live_table.dataframe(
-                pd.DataFrame(st.session_state.mat_overview_rows),
-                width="stretch",
-                hide_index=True,
-                height=MAT_TABLE_HEIGHT,
-                column_config=MAT_OVERVIEW_COLCFG,
-            )
+            _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
         if progress is not None and total > 0:
             progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
 
@@ -3160,13 +3273,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                     done += 1
                     st.session_state.mat_update_idx = done
                     if live_table is not None and (done == total or done % 3 == 0 or done <= 2):
-                        live_table.dataframe(
-                            pd.DataFrame(st.session_state.mat_overview_rows),
-                            width="stretch",
-                            hide_index=True,
-                            height=MAT_TABLE_HEIGHT,
-                            column_config=MAT_OVERVIEW_COLCFG,
-                        )
+                        _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
                     if progress is not None and total > 0:
                         progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
 
@@ -3956,7 +4063,7 @@ with tab_mat:
         "Update",
         width="stretch",
         key="mat_update_tab",
-        disabled=not connected,
+        disabled=(not connected) or running or load_running,
     )
     can_load = (
         connected
@@ -3986,9 +4093,11 @@ with tab_mat:
             mat_targets = st.session_state.mat_targets
             st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
             if mat_targets:
+                st.session_state.mat_update_running = True
                 st.session_state.mat_run_state = "running"
                 set_status(f"Analyse gestartet ({len(mat_targets)} Eintraege).", "info")
                 _update_all_mat_overview_rows(mat_targets, live_table=table_slot, progress_slot=progress_slot)
+                st.session_state.mat_update_running = False
                 st.session_state.mat_run_state = "idle"
                 set_status(f"Analyse fuer {len(mat_targets)} Eintraege abgeschlossen.", "ok")
             else:
@@ -3997,8 +4106,10 @@ with tab_mat:
 
     if connected and mat_targets and st.session_state.mat_auto_updated_prefix != st.session_state.r2_prefix and not running:
         st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
+        st.session_state.mat_update_running = True
         st.session_state.mat_run_state = "running"
         _update_all_mat_overview_rows(mat_targets, live_table=table_slot, progress_slot=progress_slot)
+        st.session_state.mat_update_running = False
         st.session_state.mat_run_state = "idle"
         set_status(f"Analyse fuer {len(mat_targets)} Eintraege abgeschlossen.", "ok")
 
@@ -4663,26 +4774,6 @@ with tab_roi:
 
 
 
-        st.markdown('<div class="roi-theme-card"><div class="theme-title">Speicherung</div><div class="theme-text">Speichert die aktuelle ROI- und Track-Konfiguration gemeinsam als JSON und MAT. Bei vorhandener MAT werden nur recordResult.metadata uebernommen; OCR wird neu fuer OCRExtractor.m aufgebaut.</div>', unsafe_allow_html=True)
-        if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn"):
-            ok_save, msg_save, payload_save = _save_result_json_and_mat()
-            st.session_state["_last_save_payload"] = payload_save
-            set_status(msg_save, "ok" if ok_save else "warn")
-            st.rerun()
-
-        if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn"):
-            ok_next, msg_next = _load_next_roi_setup_file()
-            set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
-            st.rerun()
-        _last_save = st.session_state.get("_last_save_payload") or {}
-        if _last_save:
-            targets = " · ".join(str(x) for x in (_last_save.get("targets") or []))
-            st.markdown(f'<div class="save-status-card">Zuletzt gespeichert: <b>{_last_save.get("json_name", "results.json")}</b> + <b>{_last_save.get("mat_name", "results.mat")}</b><br>{targets}</div>', unsafe_allow_html=True)
-            st.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch")
-            st.download_button("MAT herunterladen", _last_save.get("mat_bytes", b""), _last_save.get("mat_name", "results.mat"), "application/octet-stream", width="stretch")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
@@ -5024,6 +5115,27 @@ with tab_track:
     else:
         st.caption("Noch kein Vergleich durchgeführt. Button steht unter Zurücksetzen / Letzten entfernen.")
     st.markdown('</div>',unsafe_allow_html=True)
+
+
+
+    st.markdown('<div class="roi-theme-card"><div class="theme-title">Speicherung</div><div class="theme-text">Speichert die aktuelle ROI-, Zeit- und Track-Konfiguration gemeinsam als JSON und MAT.</div></div>', unsafe_allow_html=True)
+    if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn_bottom"):
+        ok_save, msg_save, payload_save = _save_result_json_and_mat()
+        st.session_state["_last_save_payload"] = payload_save
+        set_status(msg_save, "ok" if ok_save else "warn")
+        st.rerun()
+
+    if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn_bottom"):
+        ok_next, msg_next = _load_next_roi_setup_file()
+        set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
+        st.rerun()
+
+    _last_save = st.session_state.get("_last_save_payload") or {}
+    if _last_save:
+        targets = " · ".join(str(x) for x in (_last_save.get("targets") or []))
+        st.markdown(f'<div class="save-status-card">Zuletzt gespeichert: <b>{_last_save.get("json_name", "results.json")}</b> + <b>{_last_save.get("mat_name", "results.mat")}</b><br>{targets}</div>', unsafe_allow_html=True)
+        st.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch", key="json_download_bottom")
+        st.download_button("MAT herunterladen", _last_save.get("mat_bytes", b""), _last_save.get("mat_name", "results.mat"), "application/octet-stream", width="stretch", key="mat_download_bottom")
 
     if False and st.session_state.moving_pt_history:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
