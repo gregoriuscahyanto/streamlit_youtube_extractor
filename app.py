@@ -60,6 +60,7 @@ from roi_utils import (
     roi_from_crop_box,
     seed_drag_roi,
 )
+from ocr_diagnostic import diagnose_roi_ocr, find_tesseract_cmd
 from track_analysis import (
     compare_minimap_to_reference,
     detect_moving_point,
@@ -373,6 +374,7 @@ def init_state():
         roi_click_last_sig="",
         roi_display_meta={},
         roi_editor_df=None,
+        roi_ocr_probe_result=None,
         roi_editor_widget_key="roi_data_editor_v2",
         # Track
         ref_track_img=None, ref_track_pts=None, minimap_pts=None,
@@ -3021,6 +3023,51 @@ with tab_roi:
                     f"#{act_sel} {sr.get('name','')} "
                     f"[{int(sr.get('x',0))},{int(sr.get('y',0))},{int(sr.get('w',0))},{int(sr.get('h',0))}]"
                 )
+
+            _can_ocr_probe = (
+                frame is not None
+                and isinstance(act_sel, int)
+                and 0 <= act_sel < len(st.session_state.rois)
+            )
+            if st.button(
+                "OCR-Test ROI",
+                use_container_width=True,
+                key="roi_ocr_probe_btn",
+                disabled=not _can_ocr_probe,
+            ):
+                tess_cmd = find_tesseract_cmd()
+                if not tess_cmd:
+                    st.error("Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD.")
+                else:
+                    probe_roi = st.session_state.rois[act_sel]
+                    probe = diagnose_roi_ocr(
+                        frame,
+                        probe_roi,
+                        (int(fw), int(fh)),
+                        tmp_root=LOG_DIR / "ocr_tmp",
+                    )
+                    st.session_state.roi_ocr_probe_result = probe
+
+            probe_result = st.session_state.get("roi_ocr_probe_result")
+            if isinstance(probe_result, dict):
+                if probe_result.get("ok"):
+                    st.success(
+                        "OCR OK: "
+                        f"{probe_result.get('value', '')} "
+                        f"(raw='{probe_result.get('raw', '')}', "
+                        f"conf={float(probe_result.get('confidence', 0.0)):.2f}, "
+                        f"scale={probe_result.get('scale')}, "
+                        f"{probe_result.get('variant')})"
+                    )
+                else:
+                    st.warning(
+                        "OCR nicht valide: "
+                        f"{probe_result.get('error', '')} "
+                        f"Best raw='{probe_result.get('raw', '')}', "
+                        f"conf={float(probe_result.get('confidence', 0.0)):.2f}"
+                    )
+                with st.expander("OCR-Test Details", expanded=False):
+                    st.json(probe_result)
 
             if st.button("Ausgew\u00e4hlte ROI l\u00f6schen", use_container_width=True,
                          key="roi_del_btn", disabled=act_sel is None):
