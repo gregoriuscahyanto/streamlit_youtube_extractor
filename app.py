@@ -217,7 +217,7 @@ hr { border-color:#1e2535 !important; }
 .ref-track-fit img { max-height: 340px; object-fit: contain; }
 .track-samples-grid { display:grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap:.65rem; overflow-x:auto; }
 .track-sample-card { background:#0a0c10; border:1px solid #1e2535; border-radius:6px; padding:.45rem; min-width:0; }
-.track-progress-big { font-family:'JetBrains Mono',monospace; font-size:1.35rem; font-weight:800; color:#3ddc84; line-height:1.1; margin:.22rem 0 .08rem; }
+.track-progress-big { font-family:'JetBrains Mono',monospace; font-size:2.05rem; font-weight:800; color:#3ddc84; line-height:1.1; margin:.22rem 0 .08rem; }
 .track-metrics-small { font-family:'JetBrains Mono',monospace; font-size:.62rem; color:#8892a4; line-height:1.35; }
 .mat-analysis-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:.75rem; margin-top:.75rem; }
 .mat-analysis-card { background:#0a0c10; border:1px solid #1e2535; border-radius:7px; padding:.75rem .85rem; }
@@ -1551,6 +1551,20 @@ def _normalize_roi_format(fmt) -> str:
     txt = _mat_to_text(fmt, "any")
     if not txt or txt == "<undefined>":
         txt = "any"
+    txt = str(txt).strip().strip("'\"")
+    low = txt.lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "double": "float", "single": "float", "numeric": "float", "number": "float",
+        "decimal": "float", "float64": "float", "float32": "float",
+        "int": "integer", "uint": "integer", "uint8": "integer", "uint16": "integer",
+        "uint32": "integer", "int8": "integer", "int16": "integer", "int32": "integer",
+        "text": "alnum", "string": "alnum", "char": "alnum",
+        "time": "time_m:ss.SSS", "duration": "time_m:ss.SSS",
+    }
+    if low in aliases:
+        txt = aliases[low]
+    elif low in {o.lower(): o for o in FMT_OPTIONS}:
+        txt = {o.lower(): o for o in FMT_OPTIONS}[low]
     if txt == "custom" or txt not in FMT_OPTIONS:
         return "any"
     return txt
@@ -1651,6 +1665,195 @@ def _parse_roi_value(v):
     return None
 
 
+
+
+def _h5_decode_value(v, f=None, _depth: int = 0):
+    """Best-effort reader for MATLAB v7.3 values, including refs and char arrays."""
+    if _depth > 6:
+        return None
+    try:
+        import h5py
+        if isinstance(v, h5py.Reference):
+            if not v or f is None:
+                return None
+            return _h5_decode_value(f[v], f, _depth + 1)
+        if isinstance(v, h5py.Dataset):
+            data = v[()]
+            return _h5_decode_value(data, v.file, _depth + 1)
+        if isinstance(v, h5py.Group):
+            out = {}
+            for k in v.keys():
+                out[str(k)] = _h5_decode_value(v[k], v.file, _depth + 1)
+            return out
+    except Exception:
+        pass
+    try:
+        arr = np.asarray(v)
+        if arr.dtype == object:
+            vals = []
+            for item in arr.ravel().tolist():
+                vals.append(_h5_decode_value(item, f, _depth + 1))
+            return vals
+        if arr.dtype.kind in ("S", "U"):
+            vals = arr.ravel().tolist()
+            vals = [x.decode("utf-8", errors="ignore") if isinstance(x, bytes) else str(x) for x in vals]
+            if all(len(x) == 1 for x in vals):
+                return "".join(vals).strip()
+            return [x.strip() for x in vals]
+        # MATLAB char arrays in v7.3 are often uint16 numeric matrices.
+        if arr.dtype.kind in ("u", "i") and arr.size and arr.size < 4096:
+            flat = arr.ravel()
+            if np.all((flat >= 0) & (flat < 65536)) and np.any((flat >= 32) & (flat <= 126)):
+                chars = [chr(int(c)) for c in flat if int(c) != 0]
+                txt = "".join(chars).strip()
+                if txt and sum(ch.isprintable() for ch in txt) >= max(1, int(0.8 * len(txt))):
+                    return txt
+        return arr
+    except Exception:
+        return v
+
+
+def _h5_get_path_ci(root, path_parts):
+    cur = root
+    try:
+        for part in path_parts:
+            if part in cur:
+                cur = cur[part]
+                continue
+            low = str(part).lower()
+            match = next((k for k in cur.keys() if str(k).lower() == low), None)
+            if match is None:
+                return None
+            cur = cur[match]
+        return cur
+    except Exception:
+        return None
+
+
+def _h5_to_text_list(v) -> list[str]:
+    v = _h5_decode_value(v)
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, dict):
+        for key in ("data", "values", "categoryNames", "categories"):
+            if key in v:
+                vals = _h5_to_text_list(v[key])
+                if vals:
+                    return vals
+        return []
+    if isinstance(v, np.ndarray):
+        if v.dtype.kind in ("U", "S"):
+            return [str(x).strip() for x in v.ravel().tolist()]
+        return [_mat_to_text(x, "") for x in v.ravel().tolist()]
+    if isinstance(v, list):
+        out = []
+        for item in v:
+            out.extend(_h5_to_text_list(item))
+        return [x for x in out if x]
+    txt = _mat_to_text(v, "")
+    return [txt] if txt else []
+
+
+def _h5_column_values(table_group, names: tuple[str, ...], n_hint: int = 0) -> list:
+    if table_group is None:
+        return []
+    obj = None
+    for name in names:
+        obj = _h5_get_path_ci(table_group, [name])
+        if obj is not None:
+            break
+    if obj is None:
+        return []
+    val = _h5_decode_value(obj)
+    # MATLAB categorical: group with codes + categoryNames/categories.
+    if isinstance(val, dict):
+        codes = val.get("codes", None)
+        if codes is None:
+            codes = val.get("Codes", None)
+        cats = val.get("categoryNames", None)
+        if cats is None:
+            cats = val.get("categories", None)
+        if cats is None:
+            cats = val.get("CategoryNames", None)
+        if codes is not None and cats is not None:
+            labels = _h5_to_text_list(cats)
+            try:
+                code_arr = np.asarray(codes, dtype=float).ravel()
+                out = []
+                for c in code_arr:
+                    idx = int(c) - 1
+                    out.append(labels[idx] if 0 <= idx < len(labels) else "")
+                return out
+            except Exception:
+                pass
+        for key in ("data", "values", "Value", "value"):
+            if key in val:
+                val = val[key]
+                break
+    if isinstance(val, str):
+        return [val]
+    if isinstance(val, list):
+        # Cell array refs typically decode to one value per row.
+        out = []
+        for item in val:
+            if isinstance(item, np.ndarray):
+                if item.size == 4:
+                    out.append(item.astype(float).ravel().tolist())
+                else:
+                    out.append(_mat_to_text(item, "") or item)
+            else:
+                txts = _h5_to_text_list(item)
+                out.append(txts[0] if len(txts) == 1 else (txts or item))
+        return out
+    try:
+        arr = np.asarray(val)
+        if arr.ndim == 2 and 4 in arr.shape and arr.size >= 4 and names[0].lower() == "roi":
+            if arr.shape[0] == 4:
+                return [arr[:, i].astype(float).tolist() for i in range(arr.shape[1])]
+            if arr.shape[1] == 4:
+                return [arr[i, :].astype(float).tolist() for i in range(arr.shape[0])]
+        if arr.ndim == 2 and arr.dtype.kind in ("u", "i") and arr.size < 10000:
+            # char matrix: columns/rows are strings
+            if max(arr.shape) > 1 and min(arr.shape) > 1:
+                rows = []
+                for row in arr.T if arr.shape[0] < arr.shape[1] else arr:
+                    txt = "".join(chr(int(c)) for c in np.asarray(row).ravel() if int(c) != 0).strip()
+                    rows.append(txt)
+                return rows
+        return arr.ravel().tolist()
+    except Exception:
+        return [val]
+
+
+def _extract_rois_from_recordresult_hdf5(mat_path: str) -> list[dict]:
+    try:
+        import h5py
+        with h5py.File(mat_path, "r") as f:
+            tbl = _h5_get_path_ci(f, ["recordResult", "ocr", "roi_table"])
+            if tbl is None:
+                return []
+            names = _h5_column_values(tbl, ("name_roi", "name", "Name"))
+            rois = _h5_column_values(tbl, ("roi", "ROI"))
+            fmts = _h5_column_values(tbl, ("fmt", "format", "Format"))
+            n = max(len(names), len(rois), len(fmts))
+            out = []
+            for i in range(n):
+                xywh = _parse_roi_value(rois[i] if i < len(rois) else None)
+                if not xywh:
+                    continue
+                out.append(dict(
+                    name=_mat_to_text(names[i] if i < len(names) else "_", "_") or "_",
+                    x=float(xywh[0]), y=float(xywh[1]),
+                    w=float(xywh[2]), h=float(xywh[3]),
+                    fmt=_normalize_roi_format(fmts[i] if i < len(fmts) else "any"),
+                    max_scale=float(st.session_state.get("roi_global_scale", 1.2)),
+                ))
+            return out
+    except Exception:
+        return []
+
 def _extract_rois_from_recordresult_mat(mat_path: str) -> list[dict]:
     """Read recordResult.ocr.roi_table directly; fixes MATLAB categorical fmt values."""
     try:
@@ -1677,8 +1880,11 @@ def _extract_rois_from_recordresult_mat(mat_path: str) -> list[dict]:
                 max_scale=float(st.session_state.get("roi_global_scale", 1.2)),
             ))
         return out
+    except NotImplementedError:
+        return _extract_rois_from_recordresult_hdf5(mat_path)
     except Exception:
-        return []
+        h5_rois = _extract_rois_from_recordresult_hdf5(mat_path)
+        return h5_rois or []
 
 
 
@@ -1703,19 +1909,55 @@ def _marker_to_color_range(marker) -> dict | None:
     if marker is None:
         return None
     try:
-        mu = np.asarray(_mat_scalar(_mat_obj_get(marker, "hsv_mu")), dtype=float).ravel()
-        sig = np.asarray(_mat_scalar(_mat_obj_get(marker, "hsv_sig")), dtype=float).ravel()
+        def _first_numeric(*names):
+            for name in names:
+                val = _mat_obj_get(marker, name)
+                if val is not None:
+                    try:
+                        arr = np.asarray(_mat_scalar(val), dtype=float).ravel()
+                        if arr.size:
+                            return arr
+                    except Exception:
+                        pass
+            return np.array([], dtype=float)
+
+        direct = _first_numeric("hsv_range", "range", "HSVRange")
+        if direct.size >= 6:
+            vals = direct[:6].astype(float)
+            # Accept either normalized HSV [0..1] or OpenCV HSV ranges.
+            if np.nanmax(vals) <= 1.5:
+                vals = np.array([vals[0]*179, vals[1]*179, vals[2]*255, vals[3]*255, vals[4]*255, vals[5]*255])
+            return dict(
+                h_lo=int(max(0, round(vals[0]))), h_hi=int(min(179, round(vals[1]))),
+                s_lo=int(max(0, round(vals[2]))), s_hi=int(min(255, round(vals[3]))),
+                v_lo=int(max(0, round(vals[4]))), v_hi=int(min(255, round(vals[5]))),
+            )
+
+        mu = _first_numeric("hsv_mu", "hsvMean", "hsv_mean", "mu", "HSV_mu", "hsv")
+        sig = _first_numeric("hsv_sig", "hsvStd", "hsv_std", "sigma", "sig", "HSV_sig")
         if mu.size < 3 or not np.all(np.isfinite(mu[:3])):
-            return None
+            rgb = _first_numeric("rgb", "rgb_mu", "color_rgb", "marker_rgb")
+            if rgb.size >= 3:
+                rgb = np.clip(rgb[:3], 0, 255).astype(np.uint8)
+                mu = cv2.cvtColor(np.array([[rgb]], dtype=np.uint8), cv2.COLOR_RGB2HSV)[0, 0].astype(float)
+                sig = np.array([15.0, 60.0, 60.0], dtype=float)
+            else:
+                return None
         if sig.size < 3 or not np.all(np.isfinite(sig[:3])):
-            sig = np.array([0.08, 0.20, 0.20], dtype=float)
-        # OCRExtractor.m stores HSV as MATLAB normalized values: H/S/V in [0..1].
-        h = float(mu[0]) * 179.0
-        s = float(mu[1]) * 255.0
-        v = float(mu[2]) * 255.0
-        dh = max(15.0, float(sig[0]) * 179.0 * 3.0)
-        ds = max(35.0, float(sig[1]) * 255.0 * 3.0)
-        dv = max(35.0, float(sig[2]) * 255.0 * 3.0)
+            sig = np.array([0.08, 0.20, 0.20], dtype=float) if np.nanmax(mu[:3]) <= 1.5 else np.array([15.0, 60.0, 60.0], dtype=float)
+
+        if np.nanmax(mu[:3]) <= 1.5:
+            h = float(mu[0]) * 179.0
+            s = float(mu[1]) * 255.0
+            v = float(mu[2]) * 255.0
+            dh = max(15.0, float(sig[0]) * 179.0 * 3.0)
+            ds = max(35.0, float(sig[1]) * 255.0 * 3.0)
+            dv = max(35.0, float(sig[2]) * 255.0 * 3.0)
+        else:
+            h, s, v = float(mu[0]), float(mu[1]), float(mu[2])
+            dh = max(15.0, float(sig[0]) * 3.0)
+            ds = max(35.0, float(sig[1]) * 3.0)
+            dv = max(35.0, float(sig[2]) * 3.0)
         return dict(
             h_lo=int(max(0, round(h - dh))), h_hi=int(min(179, round(h + dh))),
             s_lo=int(max(0, round(s - ds))), s_hi=int(min(255, round(s + ds))),
@@ -1744,10 +1986,121 @@ def _extract_track_cal_from_recordresult_mat(mat_path: str) -> dict:
         cr = _marker_to_color_range(_mat_obj_get(trk, "marker"))
         if cr:
             out["moving_pt_color_range"] = cr
+    except NotImplementedError:
+        return _extract_track_cal_from_recordresult_hdf5(mat_path)
+    except Exception:
+        h5_out = _extract_track_cal_from_recordresult_hdf5(mat_path)
+        if h5_out:
+            return h5_out
+    return out
+
+
+
+
+def _extract_track_cal_from_recordresult_hdf5(mat_path: str) -> dict:
+    out = {}
+    try:
+        import h5py
+        with h5py.File(mat_path, "r") as f:
+            trk = _h5_get_path_ci(f, ["recordResult", "ocr", "trkCalSlim"])
+            if trk is None:
+                return out
+            roi_obj = _h5_get_path_ci(trk, ["roi"])
+            roi = _parse_roi_value(_h5_decode_value(roi_obj) if roi_obj is not None else None)
+            if roi and len(roi) >= 4 and roi[2] > 0 and roi[3] > 0:
+                out["track_roi"] = [float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])]
+            pts_obj = _h5_get_path_ci(trk, ["ptsMini"])
+            pts = _pts_from_mat_value(_h5_decode_value(pts_obj) if pts_obj is not None else None)
+            if len(pts) >= 4:
+                out["minimap_pts"] = pts[:8]
+            marker_obj = _h5_get_path_ci(trk, ["marker"])
+            marker_val = _h5_decode_value(marker_obj) if marker_obj is not None else None
+            # _marker_to_color_range expects object-like fields; for decoded dict use a tiny adapter.
+            if isinstance(marker_val, dict):
+                class _Obj: pass
+                obj = _Obj()
+                for k, v in marker_val.items():
+                    setattr(obj, k, v)
+                marker_val = obj
+            cr = _marker_to_color_range(marker_val)
+            if cr:
+                out["moving_pt_color_range"] = cr
     except Exception:
         pass
     return out
 
+
+def _extract_track_name_from_recordresult_mat(mat_path: str) -> str:
+    try:
+        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        rr = _mat_scalar(data.get("recordResult"))
+        ocr = _mat_obj_get(rr, "ocr")
+        trk = _mat_obj_get(ocr, "track")
+        for field in ("name", "track", "trackName", "track_name", "id", "title"):
+            txt = _mat_to_text(_mat_obj_get(trk, field), "")
+            if txt:
+                return txt
+    except NotImplementedError:
+        try:
+            import h5py
+            with h5py.File(mat_path, "r") as f:
+                trk = _h5_get_path_ci(f, ["recordResult", "ocr", "track"])
+                if trk is not None:
+                    for field in ("name", "track", "trackName", "track_name", "id", "title"):
+                        obj = _h5_get_path_ci(trk, [field])
+                        txts = _h5_to_text_list(obj) if obj is not None else []
+                        if txts:
+                            return str(txts[0])
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return ""
+
+
+def _try_auto_load_reference_track_for_name(track_name: str) -> None:
+    """Auto-select Nordschleife reference when recordResult.ocr.track says so."""
+    if st.session_state.get("ref_track_img") is not None:
+        return
+    name = str(track_name or "")
+    prefer_nord = "nordschleife" in name.lower()
+    if not prefer_nord:
+        return
+    candidates = []
+    if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+        pfx = st.session_state.r2_prefix.strip("/")
+        ref_dir = (pfx + "/reference_track_siesmann").strip("/") if pfx else "reference_track_siesmann"
+        ok_ls, ref_items = st.session_state.r2_client.list_files(ref_dir)
+        if ok_ls and isinstance(ref_items, list):
+            mats = [f for f in ref_items if str(f).lower().endswith(".mat")]
+            mats = sorted(
+                mats,
+                key=lambda f: (
+                    0 if "nordschleife" in Path(str(f)).stem.lower() and Path(str(f)).stem.lower().endswith("_slim") else
+                    1 if "nordschleife" in Path(str(f)).stem.lower() else 2,
+                    Path(str(f)).name.lower(),
+                ),
+            )
+            if mats and "nordschleife" in Path(str(mats[0])).stem.lower():
+                _load_centerline_from_r2(f"{ref_dir}/{mats[0]}", str(mats[0]))
+                return
+    # Local fallback for project folder / reference files next to the app.
+    try:
+        search_roots = [Path.cwd(), Path(__file__).resolve().parent, Path('/mnt/data')]
+        seen = set()
+        for root in search_roots:
+            if not root.exists() or root in seen:
+                continue
+            seen.add(root)
+            for fp in root.rglob("*.mat"):
+                nm = fp.name.lower()
+                if "nordschleife" in nm:
+                    candidates.append(fp)
+        candidates = sorted(candidates, key=lambda fp: (0 if fp.stem.lower().endswith("_slim") else 1, fp.name.lower()))
+        if candidates:
+            _apply_centerline_to_session(str(candidates[0]), candidates[0].name)
+    except Exception:
+        pass
 
 def _upsert_track_minimap_roi_from_mat(track_roi: list[float]) -> None:
     if not track_roi or len(track_roi) < 4:
@@ -2529,6 +2882,10 @@ def _load_mat_from_r2(remote_key):
             st.session_state.minimap_next_pt_idx = len(track_cfg["minimap_pts"])
         if track_cfg.get("moving_pt_color_range"):
             st.session_state.moving_pt_color_range = track_cfg["moving_pt_color_range"]
+        _track_name = _extract_track_name_from_recordresult_mat(tmp.name)
+        if _track_name:
+            st.session_state["loaded_track_name"] = _track_name
+            _try_auto_load_reference_track_for_name(_track_name)
         set_status("MAT geladen OK","ok")
         return tmp.name
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
@@ -3823,6 +4180,9 @@ with tab_track:
     track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
     has_vid   = _has_media_source()
     fw=st.session_state.vid_width; fh=st.session_state.vid_height
+    can_cmp = (has_ref and track_roi and has_vid and
+               _has_valid_8_points(st.session_state.ref_track_pts) and
+               _has_valid_8_points(st.session_state.minimap_pts))
 
     if not has_ref:
         st.info("[i] Referenz-Track fehlt. Bitte im linken Bereich unten laden (Cloud oder lokal).")
@@ -4046,6 +4406,10 @@ with tab_track:
                         st.session_state.minimap_pts = mm_pts[:next_idx-1]
                         st.session_state.minimap_next_pt_idx = next_idx-1
                         st.rerun()
+                if st.button("Vergleich 5 Zeiten", type="primary", width="stretch", key="cmp_5_times_btn", disabled=not can_cmp):
+                    st.session_state["_run_compare_5_times"] = True
+                if not can_cmp:
+                    st.caption("Benötigt: Referenztrack, track_minimap ROI, Video und je 8 Punkte.")
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
                         'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
@@ -4089,21 +4453,13 @@ with tab_track:
         )
         try:
             if overlay is not None and overlay.shape == crop.shape:
-                return cv2.addWeighted(crop, 0.62, overlay, 0.38, 0)
+                return cv2.addWeighted(crop, 0.38, overlay, 0.62, 0)
         except Exception:
             pass
         return overlay
 
-    st.markdown('<div class="section-card">',unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Vergleich | Ueberlagerung | Bewegende Punkte</div>',
-                unsafe_allow_html=True)
-    cv1, cv2_ = st.columns([1, 3], gap="medium")
-
-    can_cmp = (has_ref and track_roi and has_vid and
-               _has_valid_8_points(st.session_state.ref_track_pts) and
-               _has_valid_8_points(st.session_state.minimap_pts))
-    with cv1:
-        if can_cmp and st.button("Vergleich 5 Zeiten", type="primary", width="stretch", key="cmp_5_times_btn"):
+    if st.session_state.pop("_run_compare_5_times", False) and can_cmp:
+        with st.spinner("Vergleich 5 Zeiten läuft ..."):
             rng = np.random.default_rng(12345)
             lo, hi = float(st.session_state.t_start), float(st.session_state.t_end)
             times = sorted(rng.uniform(lo, hi, size=5).tolist()) if hi > lo else [lo] * 5
@@ -4133,25 +4489,28 @@ with tab_track:
                 })
             st.session_state.track_comparison_samples = results
             set_status(f"Vergleich fuer {len(results)} Zeiten durchgefuehrt.", "ok")
-            st.rerun()
-        elif not can_cmp:
-            st.caption("Benötigt: Referenztrack, track_minimap ROI, Video und je 8 Punkte.")
+        st.rerun()
 
-    with cv2_:
-        _samples = st.session_state.get("track_comparison_samples") or []
-        if _samples:
-            st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
-            _cols = st.columns(len(_samples))
-            for _col, _res in zip(_cols, _samples):
-                _col.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
-                _c = _res.get("cmp", {})
-                _mp = _res.get("mp")
-                _progress = _res.get("progress_pct")
-                _pos_txt = f"Pos={_progress:.1f}%" if _progress is not None else "Pos=n/a"
-                _col.caption(
-                    f"Ø={_c.get('mean_dist_px', 0.0):.1f}px | Max={_c.get('max_dist_px', 0.0):.1f}px | "
-                    f"Pt={'ja' if _mp else 'nein'} | {_pos_txt}"
-                )
+    st.markdown('<div class="section-card">',unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Vergleich | Ueberlagerung | Bewegende Punkte</div>',
+                unsafe_allow_html=True)
+    _samples = st.session_state.get("track_comparison_samples") or []
+    if _samples:
+        st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
+        _cols = st.columns(5)
+        for _col, _res in zip(_cols, _samples[:5]):
+            _col.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
+            _c = _res.get("cmp", {})
+            _mp = _res.get("mp")
+            _progress = _res.get("progress_pct")
+            _pos_html = f"<div class='track-progress-big'>{_progress:.1f}%</div>" if _progress is not None else "<div class='track-progress-big'>n/a</div>"
+            _col.markdown(_pos_html, unsafe_allow_html=True)
+            _col.caption(
+                f"ø={_c.get('mean_dist_px', 0.0):.1f}px · max={_c.get('max_dist_px', 0.0):.1f}px · "
+                f"pt={'ja' if _mp else 'nein'}"
+            )
+    else:
+        st.caption("Noch kein Vergleich durchgeführt. Button steht unter Zurücksetzen / Letzten entfernen.")
     st.markdown('</div>',unsafe_allow_html=True)
 
     if False and st.session_state.moving_pt_history:
