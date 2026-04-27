@@ -4,6 +4,7 @@ Backend helpers shared by Streamlit GUI (app.py) and CLI (cli.py).
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 import io
 from datetime import datetime
@@ -220,42 +221,447 @@ def config_from_json_payload(data: dict, vid_duration: float = 0.0) -> dict:
     return out
 
 
+def _parse_roi_coords(r) -> list[float] | None:
+    """Parse ROI value as either a numeric array or a space-separated string like '41 52 105 52'."""
+    try:
+        arr = np.atleast_1d(r).astype(float)
+        if arr.size >= 4:
+            return [float(v) for v in arr.flat[:4]]
+    except (ValueError, TypeError):
+        pass
+    try:
+        nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", str(r))]
+        if len(nums) >= 4:
+            return nums[:4]
+    except Exception:
+        pass
+    return None
+
+
+def _atleast_1d_cell(val) -> list:
+    """Convert a squeezed MATLAB cell-array value to a Python list, handling scalar strings."""
+    arr = np.atleast_1d(val)
+    # A 1-D numeric array of exactly 4 elements is a single ROI stored flat — wrap it.
+    if arr.ndim == 1 and arr.dtype.kind in ("i", "u", "f") and arr.size == 4:
+        return [arr]
+    return list(arr)
+
+
 def config_from_mat_file(mat_path: str, vid_duration: float = 0.0) -> dict:
     out: dict = {"rois": [], "t_start": 0.0, "t_end": float(vid_duration)}
-    mat = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
-    rr = mat.get("recordResult")
-    if not rr:
+    try:
+        mat = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        rr = mat.get("recordResult")
+        if not rr:
+            return out
+        ocr = getattr(rr, "ocr", None)
+        if not ocr:
+            return out
+        prm = getattr(ocr, "params", None)
+        if prm:
+            out["t_start"] = float(getattr(prm, "start_s", 0))
+            out["t_end"] = float(getattr(prm, "end_s", vid_duration))
+        roi_tbl = getattr(ocr, "roi_table", None)
+        if roi_tbl:
+            names    = _atleast_1d_cell(getattr(roi_tbl, "name_roi", []))
+            rois_r   = _atleast_1d_cell(getattr(roi_tbl, "roi", []))
+            fmts     = _atleast_1d_cell(getattr(roi_tbl, "fmt", []))
+            patterns = _atleast_1d_cell(getattr(roi_tbl, "pattern", []))
+            scales   = _atleast_1d_cell(getattr(roi_tbl, "max_scale", []))
+            rois = []
+            for i, (n, r, f) in enumerate(zip(names, rois_r, fmts)):
+                coords = _parse_roi_coords(r)
+                if coords:
+                    x, y, w, h = coords
+                    pat = str(patterns[i]).strip() if i < len(patterns) else ""
+                    ms  = float(scales[i])         if i < len(scales)   else 1.2
+                    rois.append(dict(
+                        name=str(n).strip(), x=x, y=y, w=w, h=h,
+                        fmt=str(f).strip(), pattern=pat, max_scale=ms,
+                    ))
+            out["rois"] = rois
+        trk = getattr(ocr, "trkCalSlim", None)
+        if trk:
+            ref_pts = getattr(trk, "ref_pts", None)
+            minimap_pts = getattr(trk, "minimap_pts", None)
+            if ref_pts is not None and np.size(ref_pts) > 0:
+                out["ref_track_pts"] = np.atleast_2d(ref_pts).astype(float).tolist()
+            if minimap_pts is not None and np.size(minimap_pts) > 0:
+                out["minimap_pts"] = np.atleast_2d(minimap_pts).astype(float).tolist()
+    except NotImplementedError:
+        # MATLAB -v7.3 files need HDF5 parsing.
+        return _config_from_mat_file_v73(mat_path, vid_duration=vid_duration)
+    except Exception:
         return out
-    ocr = getattr(rr, "ocr", None)
-    if not ocr:
+    return out
+
+
+def _h5_matlab_class(obj: Any) -> str:
+    try:
+        cls = obj.attrs.get("MATLAB_class", b"")
+        if isinstance(cls, bytes):
+            return cls.decode("utf-8", errors="ignore")
+        return str(cls)
+    except Exception:
+        return ""
+
+
+def _h5_decode_char_dataset(ds: Any) -> str:
+    try:
+        arr = np.array(ds[()]).reshape(-1)
+        chars: list[str] = []
+        for v in arr:
+            try:
+                iv = int(v)
+            except Exception:
+                continue
+            if iv > 0:
+                chars.append(chr(iv))
+        return "".join(chars)
+    except Exception:
+        return ""
+
+
+def _h5_decode_cell_char_list(h5f: Any, ds: Any) -> list[str]:
+    out: list[str] = []
+    try:
+        arr = np.array(ds[()]).reshape(-1)
+    except Exception:
         return out
-    prm = getattr(ocr, "params", None)
-    if prm:
-        out["t_start"] = float(getattr(prm, "start_s", 0))
-        out["t_end"] = float(getattr(prm, "end_s", vid_duration))
-    roi_tbl = getattr(ocr, "roi_table", None)
-    if roi_tbl:
-        names = list(np.atleast_1d(getattr(roi_tbl, "name_roi", [])))
-        rois_r = list(np.atleast_1d(getattr(roi_tbl, "roi", [])))
-        fmts = list(np.atleast_1d(getattr(roi_tbl, "fmt", [])))
-        rois = []
-        for n, r, f in zip(names, rois_r, fmts):
-            pos = np.atleast_1d(r).astype(float)
-            if len(pos) == 4:
-                rois.append(dict(
-                    name=str(n), x=float(pos[0]), y=float(pos[1]),
-                    w=float(pos[2]), h=float(pos[3]),
-                    fmt=str(f), pattern="", max_scale=1.2,
-                ))
-        out["rois"] = rois
-    trk = getattr(ocr, "trkCalSlim", None)
-    if trk:
-        ref_pts = getattr(trk, "ref_pts", None)
-        minimap_pts = getattr(trk, "minimap_pts", None)
-        if ref_pts is not None and np.size(ref_pts) > 0:
-            out["ref_track_pts"] = np.atleast_2d(ref_pts).astype(float).tolist()
-        if minimap_pts is not None and np.size(minimap_pts) > 0:
-            out["minimap_pts"] = np.atleast_2d(minimap_pts).astype(float).tolist()
+    for ref in arr:
+        try:
+            obj = h5f[ref]
+        except Exception:
+            out.append("")
+            continue
+        if _h5_matlab_class(obj) == "char":
+            out.append(_h5_decode_char_dataset(obj))
+        else:
+            out.append("")
+    return out
+
+
+def _h5_decode_numeric_codes(ds: Any) -> list[int]:
+    try:
+        raw = np.array(ds[()])
+        if raw.dtype.fields and "real" in raw.dtype.fields:
+            raw = np.array(raw["real"])
+        arr = raw.reshape(-1)
+        out: list[int] = []
+        for v in arr:
+            try:
+                out.append(int(round(float(v))))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _h5_decode_float_values(ds: Any) -> list[float]:
+    try:
+        raw = np.array(ds[()])
+        if raw.dtype.fields and "real" in raw.dtype.fields:
+            raw = np.array(raw["real"])
+        arr = raw.reshape(-1)
+        out: list[float] = []
+        for v in arr:
+            try:
+                out.append(float(v))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _h5_object_name(obj: Any) -> str:
+    try:
+        return str(obj.name)
+    except Exception:
+        return ""
+
+
+def _h5_valid_category_codes(
+    codes: list[int],
+    categories: list[str],
+    row_count: int,
+) -> list[int]:
+    if row_count <= 0 or not categories or len(codes) < row_count:
+        return []
+    out: list[int] = []
+    for raw in codes[:row_count]:
+        try:
+            code = int(raw)
+        except Exception:
+            return []
+        if code < 1 or code > len(categories):
+            return []
+        out.append(code)
+    return out
+
+
+def _h5_category_labels(categories: list[str], codes: list[int]) -> list[str]:
+    labels: list[str] = []
+    for code in codes:
+        if 1 <= int(code) <= len(categories):
+            labels.append(str(categories[int(code) - 1]).strip())
+        else:
+            labels.append("")
+    return labels
+
+
+def _h5_non_default_fmt_score(categories: list[str], codes: list[int]) -> int:
+    labels = _h5_category_labels(categories, codes)
+    return sum(1 for label in labels if label and label not in ("any", "<undefined>"))
+
+
+def _h5_decode_u64_string_rows(ds: Any) -> list[str]:
+    """
+    Decode MATLAB v7.3 uint64-packed UTF-16 string vectors used in ROI table raw data.
+    """
+    try:
+        vals = [int(v) for v in np.array(ds[()]).reshape(-1).astype(np.uint64)]
+    except Exception:
+        return []
+    if len(vals) < 5 or vals[0] != 1 or vals[1] != 2:
+        return []
+    n_rows = max(1, int(vals[2]))
+    if len(vals) < 4 + n_rows:
+        return []
+    lengths = [max(0, int(v)) for v in vals[4:4 + n_rows]]
+    data_vals = vals[4 + n_rows:]
+
+    chars: list[str] = []
+    for word in data_vals:
+        w = int(word)
+        for _ in range(4):
+            u = w & 0xFFFF
+            if u != 0:
+                chars.append(chr(u))
+            w >>= 16
+    flat = "".join(chars)
+
+    rows: list[str] = []
+    pos = 0
+    for ln in lengths:
+        if ln <= 0:
+            rows.append("")
+            continue
+        rows.append(flat[pos:pos + ln])
+        pos += ln
+    if not rows and flat:
+        rows = [flat]
+    return rows
+
+
+def _h5_read_scalar_float(h5f: Any, path: str, default: float) -> float:
+    try:
+        if path not in h5f:
+            return float(default)
+        arr = np.array(h5f[path][()])
+        if arr.dtype.fields and "real" in arr.dtype.fields:
+            arr = np.array(arr["real"])
+        vals = arr.reshape(-1)
+        if vals.size == 0:
+            return float(default)
+        return float(vals[0])
+    except Exception:
+        return float(default)
+
+
+def _h5_extract_rois_from_roi_table_raw(h5f: Any) -> list[dict]:
+    """
+    Extract ROI rows from MATLAB v7.3 recordResult.ocr.roi_table_raw.
+    Works for OCRExtractor-generated files where roi_table_raw is stored as table/object.
+    """
+    if "recordResult/ocr/roi_table_raw" not in h5f or "#subsystem#/MCOS" not in h5f:
+        return []
+    try:
+        desc = np.array(h5f["recordResult/ocr/roi_table_raw"][()]).reshape(-1)
+        if len(desc) < 5:
+            return []
+        base_idx = int(desc[4])
+        mcos = h5f["#subsystem#/MCOS"][()]
+    except Exception:
+        return []
+
+    def mcos_obj(idx: int) -> Any | None:
+        try:
+            if idx < 0:
+                return None
+            ref = mcos[0, idx]
+            return h5f[ref]
+        except Exception:
+            return None
+
+    data_cell = mcos_obj(base_idx + 2)
+    if data_cell is None or _h5_matlab_class(data_cell) != "cell":
+        return []
+    try:
+        data_refs = np.array(data_cell[()]).reshape(-1)
+        if len(data_refs) < 5:
+            return []
+    except Exception:
+        return []
+
+    try:
+        d_name_cat = np.array(h5f[data_refs[0]][()]).reshape(-1)
+        d_name_codes = np.array(h5f[data_refs[1]][()]).reshape(-1)
+        d_roi_rows = np.array(h5f[data_refs[2]][()]).reshape(-1)
+        d_fmt_cat = np.array(h5f[data_refs[3]][()]).reshape(-1)
+    except Exception:
+        return []
+
+    def desc_idx(arr: np.ndarray) -> int | None:
+        try:
+            if arr.size < 5:
+                return None
+            return int(arr[4])
+        except Exception:
+            return None
+
+    idx_name_cat = desc_idx(d_name_cat)
+    idx_name_codes = desc_idx(d_name_codes)
+    idx_roi_rows = desc_idx(d_roi_rows)
+    idx_fmt_cat = desc_idx(d_fmt_cat)
+    if None in (idx_name_cat, idx_name_codes, idx_roi_rows, idx_fmt_cat):
+        return []
+
+    obj_name_cat = mcos_obj(int(idx_name_cat))
+    obj_name_codes = mcos_obj(int(idx_name_codes))
+    obj_roi_rows = mcos_obj(int(idx_roi_rows))
+    obj_fmt_cat = mcos_obj(int(idx_fmt_cat))
+    obj_fmt_codes = mcos_obj(base_idx + 3)
+    obj_max_scale = h5f[data_refs[4]] if len(data_refs) >= 5 else None
+
+    if obj_name_cat is None or obj_name_codes is None or obj_roi_rows is None:
+        return []
+
+    name_categories = _h5_decode_cell_char_list(h5f, obj_name_cat)
+    name_codes = _h5_decode_numeric_codes(obj_name_codes)
+    roi_rows = _h5_decode_u64_string_rows(obj_roi_rows)
+    fmt_categories = _h5_decode_cell_char_list(h5f, obj_fmt_cat) if obj_fmt_cat is not None else []
+    max_scales = _h5_decode_float_values(obj_max_scale) if obj_max_scale is not None else []
+
+    if not roi_rows and not name_codes:
+        return []
+
+    rois: list[dict] = []
+    row_count = max(len(name_codes), len(roi_rows), len(max_scales), 1)
+
+    excluded_code_sources = {
+        _h5_object_name(obj_name_cat),
+        _h5_object_name(obj_name_codes),
+        _h5_object_name(obj_roi_rows),
+        _h5_object_name(obj_fmt_cat),
+        _h5_object_name(obj_max_scale),
+    }
+    primary_fmt_codes: list[int] = []
+    if (
+        obj_fmt_codes is not None
+        and _h5_object_name(obj_fmt_codes) not in excluded_code_sources
+    ):
+        primary_fmt_codes = _h5_valid_category_codes(
+            _h5_decode_numeric_codes(obj_fmt_codes),
+            fmt_categories,
+            row_count,
+        )
+
+    fmt_codes = primary_fmt_codes
+    if fmt_categories and (
+        not fmt_codes or _h5_non_default_fmt_score(fmt_categories, fmt_codes) == 0
+    ):
+        best_codes = fmt_codes
+        best_score = _h5_non_default_fmt_score(fmt_categories, best_codes)
+        try:
+            n_mcos = int(mcos.shape[1])
+        except Exception:
+            n_mcos = 0
+        for idx in range(n_mcos):
+            candidate_obj = mcos_obj(idx)
+            candidate_name = _h5_object_name(candidate_obj)
+            if candidate_obj is None or candidate_name in excluded_code_sources:
+                continue
+            candidate_codes = _h5_valid_category_codes(
+                _h5_decode_numeric_codes(candidate_obj),
+                fmt_categories,
+                row_count,
+            )
+            if not candidate_codes:
+                continue
+            score = _h5_non_default_fmt_score(fmt_categories, candidate_codes)
+            if score > best_score:
+                best_codes = candidate_codes
+                best_score = score
+        fmt_codes = best_codes
+
+    for i in range(row_count):
+        code = name_codes[i] if i < len(name_codes) else 1
+        if 1 <= code <= len(name_categories):
+            name = name_categories[code - 1] or "_"
+        else:
+            name = "_"
+
+        roi_txt = roi_rows[i] if i < len(roi_rows) else ""
+        nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", roi_txt)]
+        if len(nums) >= 4:
+            x, y, w, h = nums[:4]
+        else:
+            x, y, w, h = 0.0, 0.0, 100.0, 50.0
+
+        fmt = "any"
+        fmt_code = None
+        if i < len(fmt_codes):
+            fmt_code = fmt_codes[i]
+        elif fmt_codes:
+            fmt_code = fmt_codes[0]
+        if fmt_code is not None and 1 <= int(fmt_code) <= len(fmt_categories):
+            fmt = fmt_categories[int(fmt_code) - 1] or "any"
+
+        if i < len(max_scales):
+            max_scale = float(max_scales[i])
+        elif max_scales:
+            max_scale = float(max_scales[0])
+        else:
+            max_scale = 1.2
+
+        rois.append(
+            dict(
+                name=str(name),
+                x=float(x),
+                y=float(y),
+                w=float(w),
+                h=float(h),
+                fmt=str(fmt),
+                pattern="",
+                max_scale=float(max_scale),
+            )
+        )
+    return rois
+
+
+def _config_from_mat_file_v73(mat_path: str, vid_duration: float = 0.0) -> dict:
+    out: dict = {"rois": [], "t_start": 0.0, "t_end": float(vid_duration)}
+    if h5py is None:
+        return out
+    try:
+        with h5py.File(mat_path, "r") as h5f:
+            out["t_start"] = _h5_read_scalar_float(
+                h5f,
+                "recordResult/ocr/params/start_s",
+                default=0.0,
+            )
+            out["t_end"] = _h5_read_scalar_float(
+                h5f,
+                "recordResult/ocr/params/end_s",
+                default=float(vid_duration),
+            )
+            rois = _h5_extract_rois_from_roi_table_raw(h5f)
+            if rois:
+                out["rois"] = rois
+    except Exception:
+        return out
     return out
 
 

@@ -1897,6 +1897,7 @@ def _load_mat_from_r2(remote_key):
         cfg = config_from_mat_file(tmp.name, vid_duration=st.session_state.vid_duration)
         st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
         st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
+        st.session_state.t_current = float(st.session_state.t_start)
         st.session_state.rois = cfg.get("rois", st.session_state.rois)
         st.session_state.selected_roi = None
         st.session_state.roi_draw_armed = False
@@ -2571,13 +2572,15 @@ with tab_mat:
         )
         with st.spinner("Lade MAT + Video ..."):
             _analyze_mat_from_r2(selected)
-            _load_mat_from_r2(selected)
             summary = st.session_state.mat_selected_summary or {}
             capture_folder = summary.get("capture_folder") or _mat_capture_guess_from_key(selected)
             video_ok = _try_load_video_for_capture_folder(capture_folder)
             if video_ok:
                 st.session_state.capture_folder = capture_folder
-            else:
+            mat_loaded = _load_mat_from_r2(selected)
+            if mat_loaded is None:
+                set_status("MAT konnte nicht geladen werden.", "warn")
+            elif not video_ok:
                 set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
         st.session_state.mat_load_running = False
         st.session_state.tab_default = "ROI Setup"
