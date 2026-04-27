@@ -231,6 +231,13 @@ hr { border-color:#1e2535 !important; }
 .track-sample-card { background:#0a0c10; border:1px solid #1e2535; border-radius:6px; padding:.55rem; }
 .track-progress-big { font-family:'JetBrains Mono',monospace; font-size:1.55rem; font-weight:800; color:#3ddc84; line-height:1.1; margin:.25rem 0 .1rem; }
 .track-metrics-small { font-family:'JetBrains Mono',monospace; font-size:.62rem; color:#8892a4; line-height:1.35; }
+.mat-analysis-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:.75rem; margin-top:.75rem; }
+.mat-analysis-card { background:#0a0c10; border:1px solid #1e2535; border-radius:7px; padding:.75rem .85rem; }
+.mat-analysis-title { font-family:'JetBrains Mono',monospace; font-size:.64rem; color:#8892a4; letter-spacing:.08em; text-transform:uppercase; margin-bottom:.4rem; }
+.mat-analysis-value { font-family:'JetBrains Mono',monospace; font-size:1.28rem; font-weight:800; color:#e8eaf0; line-height:1.05; }
+.mat-analysis-sub { font-family:'JetBrains Mono',monospace; font-size:.62rem; color:#4a90a4; margin-top:.25rem; }
+.mat-progress-outer { height:9px; border-radius:999px; background:#1e2535; overflow:hidden; margin-top:.55rem; }
+.mat-progress-inner { height:100%; border-radius:999px; background:#3ddc84; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -2569,6 +2576,89 @@ def _normalize_overview_lamps(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].map(_norm_cell)
     return out
 
+
+def _overview_bool_value(v) -> bool:
+    s = str(v or "")
+    cur = s
+    def _decode_once(x: str) -> str:
+        try:
+            return x.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
+        except Exception:
+            return x
+    for _ in range(3):
+        nxt = _decode_once(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    cur = cur.strip()
+    return cur in (LAMP_GREEN, MOJIBAKE_GREEN, "Ja", "True", "true", "1", "OK")
+
+
+def _render_mat_selection_analysis(df_overview: pd.DataFrame) -> None:
+    """Render compact completion analytics under the MAT overview table."""
+    if df_overview is None or df_overview.empty:
+        return
+
+    df = _normalize_overview_lamps(df_overview.copy())
+    total = int(len(df))
+    metrics = [
+        ("Audio+Video", "audio_video_vorhanden"),
+        ("ROI", "roi_ausgewaehlt"),
+        ("Track", "track_ausgewaehlt"),
+        ("Start/Ende", "anfang_ende_ausgewaehlt"),
+        ("OCR ausgewertet", "ocr_durchgefuehrt"),
+        ("OCR vollstaendig", "ocr_vollstaendig"),
+        ("Audioanalyse", "audioanalyse_spektrogramm"),
+        ("Validierung", "validierung"),
+    ]
+    rows = []
+    for label, col in metrics:
+        if col not in df.columns:
+            ok_count = 0
+        else:
+            ok_count = int(df[col].map(_overview_bool_value).sum())
+        pct = int(round((ok_count / total) * 100)) if total else 0
+        rows.append({"label": label, "ok": ok_count, "missing": max(0, total - ok_count), "pct": pct})
+
+    st.markdown('<div class="section-title" style="margin-top:1rem;">Analyse</div>', unsafe_allow_html=True)
+    st.caption(f"Ueberblick fuer {total} Eintraege in der MAT-Auswahl.")
+
+    html = ['<div class="mat-analysis-grid">']
+    for r in rows:
+        pct_safe = max(0, min(100, int(r["pct"])))
+        html.append(
+            '<div class="mat-analysis-card">'
+            f'<div class="mat-analysis-title">{r["label"]}</div>'
+            f'<div class="mat-analysis-value">{r["pct"]}%</div>'
+            f'<div class="mat-analysis-sub">{r["ok"]}/{total} vorhanden</div>'
+            '<div class="mat-progress-outer">'
+            f'<div class="mat-progress-inner" style="width:{pct_safe}%;"></div>'
+            '</div></div>'
+        )
+    html.append('</div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+    chart_df = pd.DataFrame(rows).sort_values("pct", ascending=True)
+    try:
+        st.bar_chart(
+            chart_df.set_index("label")[["ok", "missing"]],
+            horizontal=True,
+            height=max(260, min(520, 38 * len(chart_df) + 90)),
+        )
+    except TypeError:
+        st.bar_chart(chart_df.set_index("label")[["ok", "missing"]], height=360)
+
+    detail_df = pd.DataFrame([
+        {
+            "Kriterium": r["label"],
+            "Vorhanden": r["ok"],
+            "Fehlt": r["missing"],
+            "Quote": f'{r["pct"]}%',
+        }
+        for r in rows
+    ])
+    with st.expander("Details als Tabelle", expanded=False):
+        st.dataframe(detail_df, width="stretch", hide_index=True)
 def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progress_slot=None):
     """
     Backward-compatible synchronous updater for MAT overview rows.
@@ -3390,6 +3480,7 @@ with tab_mat:
                 height=MAT_TABLE_HEIGHT,
                 column_config=MAT_OVERVIEW_COLCFG,
             )
+        _render_mat_selection_analysis(df_overview)
     else:
         table_slot.empty()
         st.caption("Noch keine MAT analysiert.")
