@@ -163,6 +163,16 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
   overflow-y: auto;
   overflow-x: hidden;
 }
+.mat-selection-disabled {
+  opacity: .48;
+  filter: grayscale(1);
+  pointer-events: none;
+  user-select: none;
+}
+.mat-selection-disabled [data-testid="stDataFrame"] {
+  background: #20232b !important;
+  border-radius: 6px;
+}
 .st-key-cloud_access_card,
 .st-key-cloud_root_card,
 .st-key-cloud_access_card [data-testid="stVerticalBlockBorderWrapper"],
@@ -1190,6 +1200,172 @@ def build_mat_struct(result):
     return backend_build_mat_struct(result, video_name=st.session_state.video_name)
 
 
+def _mat_struct_to_plain(obj):
+    """Convert scipy/h5 decoded MATLAB structs to savemat-friendly plain dicts."""
+    obj = _mat_scalar(obj)
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return {str(k): _mat_struct_to_plain(v) for k, v in obj.items() if not str(k).startswith("#")}
+    fields = getattr(obj, "_fieldnames", None)
+    if fields:
+        return {str(k): _mat_struct_to_plain(getattr(obj, k)) for k in fields}
+    if isinstance(obj, np.ndarray):
+        if obj.dtype == object:
+            return np.array([_mat_struct_to_plain(v) for v in obj.ravel().tolist()], dtype=object).reshape(obj.shape)
+        return obj
+    if isinstance(obj, (np.generic,)):
+        return obj.item()
+    return obj
+
+
+def _load_recordresult_template_fields(mat_path: str) -> dict:
+    """Load only reusable recordResult.metadata from an existing MAT file.
+
+    OCR/audio/validation are intentionally not copied: ROI Setup creates a new
+    OCRExtractor-compatible OCR parameter block, while audio_rpm and validation
+    are produced later by spectrogram analysis and validation.
+    """
+    out = {}
+    if not mat_path:
+        return out
+    try:
+        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        rr = _mat_scalar(data.get("recordResult"))
+        if rr is None:
+            return out
+        meta = _mat_obj_get(rr, "metadata")
+        if meta is not None:
+            out["metadata"] = _mat_struct_to_plain(meta)
+        return out
+    except NotImplementedError:
+        pass
+    except Exception:
+        return out
+
+    try:
+        import h5py
+        with h5py.File(mat_path, "r") as f:
+            rr = _h5_get_path_ci(f, ["recordResult"])
+            if rr is None:
+                return out
+            obj = _h5_get_path_ci(rr, ["metadata"])
+            if obj is not None:
+                val = _h5_decode_value(obj)
+                if val is not None:
+                    out["metadata"] = _mat_struct_to_plain(val)
+    except Exception:
+        pass
+    return out
+
+
+def _download_template_mat_for_save() -> str:
+    key = str(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
+    if key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+        tmp.close()
+        ok, _msg = st.session_state.r2_client.download_file(key, tmp.name)
+        if ok:
+            return tmp.name
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    # Developer/project-folder fallback for local testing.
+    for candidate in (Path.cwd() / "results_20251117_020622.mat", Path("/mnt/data/results_20251117_020622.mat")):
+        try:
+            if candidate.exists():
+                return str(candidate)
+        except Exception:
+            pass
+    return ""
+
+
+def _ensure_ocr_extractor_ocr_struct(rr: dict) -> dict:
+    """Normalize recordResult.ocr for the MATLAB OCRExtractor workflow."""
+    ocr = rr.get("ocr", {}) if isinstance(rr.get("ocr", {}), dict) else {}
+    params = ocr.get("params", {}) if isinstance(ocr.get("params", {}), dict) else {}
+    params["start_s"] = float(st.session_state.get("t_start", 0.0) or 0.0)
+    params["end_s"] = float(st.session_state.get("t_end", 0.0) or 0.0)
+    ocr["params"] = params
+
+    # OCRExtractor.m keeps both the effective table and the raw ROI table. The
+    # backend already builds roi_table; mirror it to roi_table_raw if absent.
+    if "roi_table" in ocr and "roi_table_raw" not in ocr:
+        ocr["roi_table_raw"] = ocr["roi_table"]
+    elif "roi_table_raw" in ocr and "roi_table" not in ocr:
+        ocr["roi_table"] = ocr["roi_table_raw"]
+
+    # Keep a compact catalog for downstream MATLAB scripts that expect the
+    # known ROI/format options near the OCR parameter block.
+    ocr.setdefault("roi_catalog", {
+        "name_roi": np.array(ROI_NAMES, dtype=object),
+        "fmt": np.array(FMT_OPTIONS, dtype=object),
+    })
+
+    # Track calibration belongs to OCR because OCRExtractor.m uses
+    # recordResult.ocr.trkCalSlim for the minimap/track ROI. If backend did not
+    # already create it, build a minimal OCRExtractor-compatible struct.
+    if "trkCalSlim" not in ocr:
+        track_roi = next((r for r in st.session_state.get("rois", []) if str(r.get("name", "")) == "track_minimap"), None)
+        if track_roi is not None:
+            marker = dict(st.session_state.get("moving_pt_color_range", {}) or {})
+            ocr["trkCalSlim"] = {
+                "roi": np.array([
+                    float(track_roi.get("x", 0.0) or 0.0),
+                    float(track_roi.get("y", 0.0) or 0.0),
+                    float(track_roi.get("w", 0.0) or 0.0),
+                    float(track_roi.get("h", 0.0) or 0.0),
+                ], dtype=float),
+                "ptsMini": np.array(st.session_state.get("minimap_pts") or [], dtype=float),
+                "marker": marker,
+            }
+    rr["ocr"] = ocr
+    return rr
+
+
+def _merge_recordresult_template(mat_struct: dict, template_fields: dict) -> dict:
+    out = dict(mat_struct or {})
+    rr = _mat_struct_to_plain(out.get("recordResult", {}))
+    if not isinstance(rr, dict):
+        rr = {"data": rr}
+
+    # Only metadata is inherited from the original MAT file; it may be extended
+    # below with current Streamlit/video information. Do not copy OCR results,
+    # audio_rpm, or validation from another processing stage.
+    if isinstance(template_fields.get("metadata"), dict):
+        inherited_meta = dict(template_fields["metadata"])
+        current_meta = rr.get("metadata", {}) if isinstance(rr.get("metadata", {}), dict) else {}
+        inherited_meta.update(current_meta)
+        rr["metadata"] = inherited_meta
+    else:
+        rr.setdefault("metadata", {})
+
+    rr = _ensure_ocr_extractor_ocr_struct(rr)
+
+    # These are created by later processing steps, not by ROI Setup. Keep them
+    # empty so MAT Selection correctly shows spectrogram/validation as pending.
+    rr["audio_rpm"] = {}
+    rr["validation"] = {}
+
+    out["recordResult"] = rr
+    return out
+
+
+def _build_save_mat_struct(result):
+    mat_struct = build_mat_struct(result)
+    template_path = _download_template_mat_for_save()
+    try:
+        template_fields = _load_recordresult_template_fields(template_path) if template_path else {}
+        return _merge_recordresult_template(mat_struct, template_fields)
+    finally:
+        try:
+            if template_path and str(template_path).startswith(tempfile.gettempdir()):
+                Path(template_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _upload_bytes_compat(client, key: str, data: bytes, content_type: str) -> tuple[bool, str]:
     try:
         if hasattr(client, "upload_bytes"):
@@ -1214,7 +1390,7 @@ def _save_result_json_and_mat() -> tuple[bool, str, dict]:
     result = build_result_json()
     json_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
     mat_buf = io.BytesIO()
-    sio.savemat(mat_buf, build_mat_struct(result), do_compression=True)
+    sio.savemat(mat_buf, _build_save_mat_struct(result), do_compression=True)
     mat_bytes = mat_buf.getvalue()
     json_name = f"results_{safe_cf}.json"
     mat_name = f"results_{safe_cf}.mat"
@@ -3507,6 +3683,8 @@ with tab_setup:
                 f'<div class="breadcrumb">Lokaler Basispfad: {st.session_state.local_base_path if st.session_state.local_connected else "(noch nicht gesetzt)"}</div>',
                 unsafe_allow_html=True,
             )
+
+
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -3872,13 +4050,22 @@ with tab_mat:
                     current_selected_key = str(styled_df.iloc[idx0].get("remote_key", "") or "")
                     st.session_state.mat_pending_selected_key = current_selected_key
         else:
-            table_slot.dataframe(
-                styled_df,
-                width="stretch",
-                hide_index=True,
-                height=MAT_TABLE_HEIGHT,
-                column_config=MAT_OVERVIEW_COLCFG,
-            )
+            with table_slot.container():
+                st.markdown('<div class="mat-selection-disabled">MAT-Auswahl wird aktualisiert ...</div>', unsafe_allow_html=True)
+                try:
+                    disabled_view = styled_df.style.set_properties(**{
+                        "background-color": "#20232b",
+                        "color": "#7d8491",
+                    })
+                except Exception:
+                    disabled_view = styled_df
+                st.dataframe(
+                    disabled_view,
+                    width="stretch",
+                    hide_index=True,
+                    height=MAT_TABLE_HEIGHT,
+                    column_config=MAT_OVERVIEW_COLCFG,
+                )
         _render_mat_selection_analysis(
             display_df,
             title_suffix=" (gefilterte Ansicht)" if filter_missing_roi else "",
@@ -4474,26 +4661,26 @@ with tab_roi:
                     set_status("ROI gel\u00f6scht.", "info")
                     st.rerun()
 
-            st.markdown('<div class="roi-theme-card"><div class="theme-title">Speicherung</div><div class="theme-text">Speichert die aktuelle ROI- und Track-Konfiguration gemeinsam als JSON und MAT. Die MAT-Struktur wird ueber build_mat_struct erzeugt, damit die Formatierung konsistent bleibt.</div>', unsafe_allow_html=True)
-            if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn"):
-                ok_save, msg_save, payload_save = _save_result_json_and_mat()
-                st.session_state["_last_save_payload"] = payload_save
-                set_status(msg_save, "ok" if ok_save else "warn")
-                st.rerun()
 
-            if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn"):
-                ok_next, msg_next = _load_next_roi_setup_file()
-                set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
-                st.rerun()
-            _last_save = st.session_state.get("_last_save_payload") or {}
-            if _last_save:
-                targets = " · ".join(str(x) for x in (_last_save.get("targets") or []))
-                st.markdown(f'<div class="save-status-card">Zuletzt gespeichert: <b>{_last_save.get("json_name", "results.json")}</b> + <b>{_last_save.get("mat_name", "results.mat")}</b><br>{targets}</div>', unsafe_allow_html=True)
-                dlc1, dlc2 = st.columns(2)
-                dlc1.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch")
-                dlc2.download_button("MAT herunterladen", _last_save.get("mat_bytes", b""), _last_save.get("mat_name", "results.mat"), "application/octet-stream", width="stretch")
-            st.markdown('</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="roi-theme-card"><div class="theme-title">Speicherung</div><div class="theme-text">Speichert die aktuelle ROI- und Track-Konfiguration gemeinsam als JSON und MAT. Bei vorhandener MAT werden nur recordResult.metadata uebernommen; OCR wird neu fuer OCRExtractor.m aufgebaut.</div>', unsafe_allow_html=True)
+        if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn"):
+            ok_save, msg_save, payload_save = _save_result_json_and_mat()
+            st.session_state["_last_save_payload"] = payload_save
+            set_status(msg_save, "ok" if ok_save else "warn")
+            st.rerun()
+
+        if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn"):
+            ok_next, msg_next = _load_next_roi_setup_file()
+            set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
+            st.rerun()
+        _last_save = st.session_state.get("_last_save_payload") or {}
+        if _last_save:
+            targets = " · ".join(str(x) for x in (_last_save.get("targets") or []))
+            st.markdown(f'<div class="save-status-card">Zuletzt gespeichert: <b>{_last_save.get("json_name", "results.json")}</b> + <b>{_last_save.get("mat_name", "results.mat")}</b><br>{targets}</div>', unsafe_allow_html=True)
+            st.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch")
+            st.download_button("MAT herunterladen", _last_save.get("mat_bytes", b""), _last_save.get("mat_name", "results.mat"), "application/octet-stream", width="stretch")
+        st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -4511,8 +4698,6 @@ with tab_track:
                _has_valid_8_points(st.session_state.ref_track_pts) and
                _has_valid_8_points(st.session_state.minimap_pts))
 
-    if not has_ref:
-        st.info("[i] Referenz-Track fehlt. Bitte im linken Bereich unten laden (Cloud oder lokal).")
     if not track_roi:
         st.info("[i] Keine track_minimap ROI -> Tab ROI Setup -> ROI anlegen.")
 
