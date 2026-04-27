@@ -26,3 +26,4 @@ r2_mount/*
 logs/run.log
 logs/*
 *Kopie*
+results_*

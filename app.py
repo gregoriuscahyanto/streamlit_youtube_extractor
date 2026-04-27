@@ -1227,21 +1227,39 @@ def _save_result_json_and_mat() -> tuple[bool, str, dict]:
         saved_targets.append(str(out_dir))
     except Exception as e:
         saved_targets.append(f"lokal fehlgeschlagen: {e}")
+    saved_mat_key = ""
     if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+        # 1) zentrale MAT/JSON-Ablage fuer MAT selection
         res_dir = _results_dir_key().strip("/")
         json_key = f"{res_dir}/{json_name}" if res_dir else json_name
         mat_key = f"{res_dir}/{mat_name}" if res_dir else mat_name
         ok_json, msg_json = _upload_bytes_compat(st.session_state.r2_client, json_key, json_bytes, "application/json")
         ok_mat, msg_mat = _upload_bytes_compat(st.session_state.r2_client, mat_key, mat_bytes, "application/octet-stream")
         if ok_json and ok_mat:
+            saved_mat_key = mat_key
             saved_targets.append(f"R2: {res_dir or '/'}")
             try:
                 st.session_state.mat_summary_cache.pop(mat_key, None)
             except Exception:
                 pass
         else:
-            saved_targets.append(f"R2 fehlgeschlagen: JSON={msg_json or ok_json}, MAT={msg_mat or ok_mat}")
-    payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=saved_targets)
+            saved_targets.append(f"R2 results fehlgeschlagen: JSON={msg_json or ok_json}, MAT={msg_mat or ok_mat}")
+
+        # 2) passende Capture-Cloud-Ablage neben audio_proxy/frames_1fps
+        cap_dir = _capture_results_dir_key(str(cf)).strip("/")
+        if cap_dir and cap_dir != res_dir:
+            cap_json_key = f"{cap_dir}/{json_name}"
+            cap_mat_key = f"{cap_dir}/{mat_name}"
+            ok_cj, msg_cj = _upload_bytes_compat(st.session_state.r2_client, cap_json_key, json_bytes, "application/json")
+            ok_cm, msg_cm = _upload_bytes_compat(st.session_state.r2_client, cap_mat_key, mat_bytes, "application/octet-stream")
+            if ok_cj and ok_cm:
+                saved_targets.append(f"R2: {cap_dir}")
+            else:
+                saved_targets.append(f"R2 capture fehlgeschlagen: JSON={msg_cj or ok_cj}, MAT={msg_cm or ok_cm}")
+
+        if saved_mat_key:
+            _invalidate_and_update_mat_selection_for_capture(str(cf), saved_mat_key)
+    payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=saved_targets, mat_key=saved_mat_key)
     return True, f"Gespeichert: {json_name} + {mat_name}", payload
 
 
@@ -3006,6 +3024,132 @@ def _try_load_video_for_capture_folder(capture_folder: str) -> bool:
     # Cloud workflow: always use reduced frame-pack.
     return _load_framepack_from_r2(capture_folder)
 
+
+def _overview_status_is_green(value) -> bool:
+    txt = str(value or "").strip()
+    return txt in {LAMP_GREEN, MOJIBAKE_GREEN, "Ja", "OK", "True", "true", "1"}
+
+
+def _current_capture_folder() -> str:
+    cf = str(st.session_state.get("capture_folder") or "").strip().strip("/\\")
+    if cf:
+        return cf
+    video_name = str(st.session_state.get("video_name") or "").strip()
+    if video_name:
+        stem = Path(video_name.replace(" [frames_1fps]", "")).stem
+        if stem:
+            return stem
+    selected = str(st.session_state.get("mat_selected_key") or "").strip()
+    if selected:
+        return _mat_capture_guess_from_key(selected) or Path(selected).stem.replace("results_", "", 1)
+    return ""
+
+
+def _capture_results_dir_key(capture_folder: str) -> str:
+    pfx = st.session_state.r2_prefix.strip("/")
+    folder = str(capture_folder or "").strip("/\\")
+    if not folder:
+        return _results_dir_key().strip("/")
+    return f"{pfx}/captures/{folder}" if pfx else f"captures/{folder}"
+
+
+def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_key: str = "") -> None:
+    """Refresh cached MAT-selection status for the saved capture without rescanning everything."""
+    folder = str(capture_folder or "").strip("/\\")
+    key = str(mat_key or "").strip("/")
+    try:
+        if key and isinstance(st.session_state.get("mat_summary_cache"), dict):
+            st.session_state.mat_summary_cache.pop(key, None)
+        if key and st.session_state.get("r2_client") is not None:
+            summary = _get_mat_summary_from_r2(key)
+            row = _summary_to_overview_row(summary, display_folder=folder)
+            rows = list(st.session_state.get("mat_overview_rows") or [])
+            replaced = False
+            for i, old in enumerate(rows):
+                if str(old.get("mat_datei", "")) == folder or str(old.get("remote_key", "")) == key:
+                    rows[i] = row
+                    replaced = True
+                    break
+            if not replaced and rows:
+                rows.insert(0, row)
+            st.session_state.mat_overview_rows = rows
+            st.session_state.mat_selected_key = key
+            st.session_state.mat_pending_selected_key = key
+            st.session_state.mat_selected_summary = summary
+
+            targets = list(st.session_state.get("mat_targets") or [])
+            found = False
+            for t in targets:
+                if str(t.get("folder", "")) == folder:
+                    t["mat_key"] = key
+                    found = True
+                    break
+            if not found and folder:
+                targets.insert(0, {"kind": "folder", "folder": folder, "mat_key": key})
+            st.session_state.mat_targets = targets
+    except Exception as e:
+        set_status(f"MAT Selection konnte nicht aktualisiert werden: {e}", "warn")
+
+
+def _find_next_roi_setup_target() -> dict | None:
+    """Return next capture with reduced audio+video in cloud but without ROI parameters."""
+    rows = list(st.session_state.get("mat_overview_rows") or [])
+    if not rows and st.session_state.get("mat_targets"):
+        try:
+            _update_all_mat_overview_rows(st.session_state.mat_targets)
+            rows = list(st.session_state.get("mat_overview_rows") or [])
+        except Exception:
+            rows = []
+    current = _current_capture_folder()
+    candidates = []
+    for idx, row in enumerate(rows):
+        folder = str(row.get("mat_datei", "") or "").strip()
+        if not folder:
+            folder = _mat_capture_guess_from_key(str(row.get("remote_key", "") or ""))
+        if not folder or folder == current:
+            continue
+        media_ok = _overview_status_is_green(row.get("audio_video_vorhanden"))
+        roi_missing = not _overview_status_is_green(row.get("roi_ausgewaehlt"))
+        if media_ok and roi_missing:
+            candidates.append({"idx": idx, "folder": folder, "remote_key": str(row.get("remote_key", "") or "")})
+    if candidates:
+        return candidates[0]
+
+    for t in list(st.session_state.get("mat_targets") or []):
+        folder = str(t.get("folder", "") or "").strip()
+        if not folder or folder == current:
+            continue
+        key = str(t.get("mat_key", "") or "")
+        try:
+            summary = _get_mat_summary_from_r2(key) if key else _compute_folder_only_summary(folder, st.session_state.r2_client, st.session_state.r2_prefix.strip("/"))
+            if bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists")) and not bool(summary.get("roi_selected")):
+                return {"idx": -1, "folder": folder, "remote_key": key}
+        except Exception:
+            continue
+    return None
+
+
+def _load_next_roi_setup_file() -> tuple[bool, str]:
+    if not st.session_state.get("r2_connected") or st.session_state.get("r2_client") is None:
+        return False, "Cloud ist nicht verbunden."
+    nxt = _find_next_roi_setup_target()
+    if not nxt:
+        return False, "Keine nächste Datei gefunden (Audio+Video vorhanden und ROI fehlt)."
+    folder = str(nxt.get("folder") or "")
+    if not _try_load_video_for_capture_folder(folder):
+        return False, f"Reduzierte Datei konnte nicht geladen werden: {folder}"
+    st.session_state.capture_folder = folder
+    key = str(nxt.get("remote_key") or "")
+    if key:
+        st.session_state.mat_selected_key = key
+        st.session_state.mat_pending_selected_key = key
+        try:
+            _analyze_mat_from_r2(key)
+        except Exception:
+            pass
+    set_status(f"Nächste Datei geladen: {folder}", "ok")
+    return True, folder
+
 def _load_video_from_r2(remote_key):
     client = st.session_state.r2_client
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(remote_key).suffix)
@@ -4105,6 +4249,27 @@ with tab_roi:
             st.markdown('<div class="section-card">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">ROI-Liste</div>', unsafe_allow_html=True)
 
+            if st.button("ROI hinzuf\u00fcgen", type="primary", width="stretch", key="roi_add_btn"):
+                # New ROI starts from a fresh default rectangle (independent from existing ROI).
+                _d = seed_drag_roi(fw, fh)
+                _cx, _cy, _cw, _ch = _clamp_roi_to_video(
+                    int(_d["x"]), int(_d["y"]), int(_d["w"]), int(_d["h"]), fw, fh
+                )
+                st.session_state.rois.append(dict(
+                    name="_", x=float(_cx), y=float(_cy),
+                    w=float(_cw), h=float(_ch), fmt="any", max_scale=float(st.session_state.get("roi_global_scale", 1.2)),
+                ))
+                _ni = len(st.session_state.rois) - 1
+                st.session_state.selected_roi = _ni
+                st.session_state.roi_draw_armed = True
+                st.session_state.drag_roi = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
+                st.session_state.roi_anchor_box = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
+                st.session_state.roi_wait_user_move = True
+                st.session_state.roi_reject_anchor_events = 0
+                st.session_state.roi_editor_df = None
+                set_status("ROI hinzugef\u00fcgt. Name in Tabelle setzen und Position mit K\u00e4stchen anpassen.", "ok")
+                st.rerun()
+
             _rois = st.session_state.rois
             _sel = st.session_state.selected_roi
             _tbl_h = min(220, 38 * (len(_rois) + 1) + 4) if _rois else 80
@@ -4230,27 +4395,6 @@ with tab_roi:
                     if isinstance(_r, dict):
                         _r["max_scale"] = float(_scale_val)
 
-            if st.button("ROI hinzuf\u00fcgen", type="primary", width="stretch", key="roi_add_btn"):
-                # New ROI starts from a fresh default rectangle (independent from existing ROI).
-                _d = seed_drag_roi(fw, fh)
-                _cx, _cy, _cw, _ch = _clamp_roi_to_video(
-                    int(_d["x"]), int(_d["y"]), int(_d["w"]), int(_d["h"]), fw, fh
-                )
-                st.session_state.rois.append(dict(
-                    name="_", x=float(_cx), y=float(_cy),
-                    w=float(_cw), h=float(_ch), fmt="any", max_scale=float(st.session_state.get("roi_global_scale", 1.2)),
-                ))
-                _ni = len(st.session_state.rois) - 1
-                st.session_state.selected_roi = _ni
-                st.session_state.roi_draw_armed = True
-                st.session_state.drag_roi = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
-                st.session_state.roi_anchor_box = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
-                st.session_state.roi_wait_user_move = True
-                st.session_state.roi_reject_anchor_events = 0
-                st.session_state.roi_editor_df = None
-                set_status("ROI hinzugef\u00fcgt. Name in Tabelle setzen und Position mit K\u00e4stchen anpassen.", "ok")
-                st.rerun()
-
             if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
                 sr = st.session_state.rois[act_sel]
                 st.caption(
@@ -4335,6 +4479,11 @@ with tab_roi:
                 ok_save, msg_save, payload_save = _save_result_json_and_mat()
                 st.session_state["_last_save_payload"] = payload_save
                 set_status(msg_save, "ok" if ok_save else "warn")
+                st.rerun()
+
+            if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn"):
+                ok_next, msg_next = _load_next_roi_setup_file()
+                set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
                 st.rerun()
             _last_save = st.session_state.get("_last_save_payload") or {}
             if _last_save:
