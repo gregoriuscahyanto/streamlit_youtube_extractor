@@ -124,10 +124,30 @@ if hasattr(threading, "excepthook"):
 
 
 def _try_jump_to_tab(label: str):
-    # Deprecated components.html removed: Streamlit warns that st.components.v1.html
-    # will be removed after 2026-06-01. Keep this helper as a safe no-op so the
-    # rest of the app can still call it without emitting warnings.
-    return
+    try:
+        js_label = json.dumps(str(label))
+        components.html(
+            f"""
+            <script>
+            (function() {{
+              const target = {js_label};
+              const root = window.parent?.document || document;
+              const tabs = root.querySelectorAll('button[data-baseweb="tab"]');
+              for (const b of tabs) {{
+                const txt = (b.innerText || b.textContent || "").trim();
+                if (txt === target) {{
+                  b.click();
+                  break;
+                }}
+              }}
+            }})();
+            </script>
+            """,
+            height=1,
+            scrolling=False,
+        )
+    except Exception:
+        pass
 
 # ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ Seitenkonfiguration ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬
 st.set_page_config(
@@ -219,17 +239,10 @@ hr { border-color:#1e2535 !important; }
 .stDataFrame [aria-selected="true"] {
   background-color: rgba(74, 144, 164, 0.30) !important;
 }
-.ref-track-fit img { max-height: 220px; object-fit: contain; }
-.loaded-mat-card {
-  background:#0a0c10; border:1px solid #1e2535; border-radius:6px;
-  padding:.55rem .75rem; margin-bottom:.55rem;
-  font-family:'JetBrains Mono',monospace; font-size:.72rem; color:#b7c3d8;
-}
-.loaded-mat-card b { color:#e8eaf0; font-weight:700; }
-.loaded-mat-card span { color:#4a90a4; }
-.track-samples-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:.8rem; }
-.track-sample-card { background:#0a0c10; border:1px solid #1e2535; border-radius:6px; padding:.55rem; }
-.track-progress-big { font-family:'JetBrains Mono',monospace; font-size:1.55rem; font-weight:800; color:#3ddc84; line-height:1.1; margin:.25rem 0 .1rem; }
+.ref-track-fit img { max-height: 340px; object-fit: contain; }
+.track-samples-grid { display:grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap:.65rem; overflow-x:auto; }
+.track-sample-card { background:#0a0c10; border:1px solid #1e2535; border-radius:6px; padding:.45rem; min-width:0; }
+.track-progress-big { font-family:'JetBrains Mono',monospace; font-size:1.35rem; font-weight:800; color:#3ddc84; line-height:1.1; margin:.22rem 0 .08rem; }
 .track-metrics-small { font-family:'JetBrains Mono',monospace; font-size:.62rem; color:#8892a4; line-height:1.35; }
 .mat-analysis-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:.75rem; margin-top:.75rem; }
 .mat-analysis-card { background:#0a0c10; border:1px solid #1e2535; border-radius:7px; padding:.75rem .85rem; }
@@ -238,6 +251,12 @@ hr { border-color:#1e2535 !important; }
 .mat-analysis-sub { font-family:'JetBrains Mono',monospace; font-size:.62rem; color:#4a90a4; margin-top:.25rem; }
 .mat-progress-outer { height:9px; border-radius:999px; background:#1e2535; overflow:hidden; margin-top:.55rem; }
 .mat-progress-inner { height:100%; border-radius:999px; background:#3ddc84; }
+.mat-analysis-bars { display:grid; grid-template-columns: 1fr; gap:.42rem; margin-top:.7rem; }
+.mat-analysis-bar-row { display:grid; grid-template-columns: 190px 1fr 88px; align-items:center; gap:.65rem; font-family:'JetBrains Mono',monospace; font-size:.68rem; color:#b7c3d8; }
+.mat-analysis-bar-track { height:16px; border-radius:999px; background:#1e2535; overflow:hidden; border:1px solid #243049; }
+.mat-analysis-bar-fill { height:100%; border-radius:999px; background:#4a90a4; }
+.mat-analysis-note { font-family:'JetBrains Mono',monospace; font-size:.62rem; color:#4a5060; margin-top:.4rem; }
+@media (max-width: 1100px) { .track-samples-grid { grid-template-columns: repeat(5, minmax(170px, 1fr)); } }
 </style>
 """, unsafe_allow_html=True)
 
@@ -345,9 +364,6 @@ def init_state():
         mat_run_state="idle",
         mat_load_requested=False,
         mat_load_running=False,
-        loaded_mat_key="",
-        loaded_mat_file="",
-        loaded_mat_title="",
         tab_default=None,
         # Datei-Browser
         fb_path="", fb_items=[], fb_selected=None,
@@ -389,7 +405,6 @@ def init_state():
         minimap_next_pt_idx=0,
         track_comparison=None, moving_pt_history=[],
         moving_pt_color_range=dict(h_lo=0,h_hi=30,s_lo=150,s_hi=255,v_lo=150,v_hi=255),
-        moving_pt_color_calibrated=False,
         # Status
         status_msg="Bereit", status_type="info",
     )
@@ -1505,281 +1520,6 @@ def _normalize_roi_format(fmt) -> str:
         return "any"
     return txt
 
-def _h5_decode_text_dataset(ds) -> str:
-    """Decode MATLAB v7.3 char datasets stored as uint16."""
-    try:
-        arr = np.asarray(ds[()])
-        if arr.dtype == np.uint16:
-            return "".join(chr(int(c)) for c in arr.ravel(order="F") if int(c)).strip()
-        if arr.dtype.kind in ("S", "U"):
-            return "".join(str(x) for x in arr.ravel(order="F")).strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _h5_cellstr_dataset(f, ds) -> list[str]:
-    """Decode MATLAB v7.3 cellstr dataset by dereferencing its object refs."""
-    out = []
-    try:
-        arr = np.asarray(ds[()]).ravel(order="F")
-        for ref in arr:
-            try:
-                out.append(_h5_decode_text_dataset(f[ref]))
-            except Exception:
-                out.append("")
-    except Exception:
-        pass
-    return out
-
-
-def _extract_roi_names_formats_from_recordresult_hdf5(mat_path: str) -> list[dict]:
-    """Read recordResult.ocr.roi_table metadata from v7.3 MAT files.
-
-    OCRExtractor stores table variables as MATLAB MCOS objects. The ROI
-    coordinates are already handled by config_from_mat_file for this app; this
-    lightweight reader recovers the categorical codes for name_roi and fmt so
-    the ROI editor shows the exact saved formats instead of falling back to any.
-    """
-    out = []
-    try:
-        import h5py
-        with h5py.File(mat_path, "r") as f:
-            refs = f.get("#refs#")
-            if refs is None:
-                return []
-
-            # In the project MAT files these references are the decoded table
-            # categories/codes for recordResult.ocr.roi_table:
-            #   xc = all ROI names, Xc = selected ROI-name codes
-            #   Zc = all format options, td = selected format codes
-            roi_names = _h5_cellstr_dataset(f, refs.get("xc")) if "xc" in refs else []
-            fmt_names = _h5_cellstr_dataset(f, refs.get("Zc")) if "Zc" in refs else []
-            name_codes = np.asarray(refs["Xc"][()]).astype(int).ravel(order="F") if "Xc" in refs else np.array([], dtype=int)
-            fmt_codes = np.asarray(refs["td"][()]).astype(int).ravel(order="F") if "td" in refs else np.array([], dtype=int)
-
-            n = int(max(len(name_codes), len(fmt_codes)))
-            for i in range(n):
-                name = "_"
-                fmt = "any"
-                if i < len(name_codes) and 1 <= int(name_codes[i]) <= len(roi_names):
-                    name = roi_names[int(name_codes[i]) - 1] or "_"
-                if i < len(fmt_codes) and 1 <= int(fmt_codes[i]) <= len(fmt_names):
-                    fmt = fmt_names[int(fmt_codes[i]) - 1] or "any"
-                out.append({"name": name, "fmt": _normalize_roi_format(fmt)})
-    except Exception:
-        return []
-    return out
-
-
-
-def _h5_numeric_path(f, path: str):
-    try:
-        if path in f:
-            return np.asarray(f[path][()])
-    except Exception:
-        pass
-    return None
-
-
-def _h5_parse_roi_from_path(f, path: str) -> list[float] | None:
-    arr = _h5_numeric_path(f, path)
-    if arr is None:
-        return None
-    try:
-        vals = np.asarray(arr, dtype=float).ravel(order="F")
-        vals = vals[np.isfinite(vals)]
-        if vals.size >= 4 and vals[2] > 0 and vals[3] > 0:
-            return [float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3])]
-    except Exception:
-        pass
-    return None
-
-
-def _h5_pts_from_path(f, path: str) -> list[list[float]]:
-    arr = _h5_numeric_path(f, path)
-    if arr is None:
-        return []
-    try:
-        a = np.asarray(arr, dtype=float)
-        if a.size < 4:
-            return []
-        if a.ndim == 1:
-            a = a.reshape((-1, 2))
-        elif a.shape[0] == 2 and a.shape[1] != 2:
-            a = a.T
-        elif a.shape[1] != 2 and a.shape[0] != 2:
-            a = a.reshape((-1, 2))
-        pts = []
-        for x, y in a[:8, :2]:
-            if np.isfinite(x) and np.isfinite(y):
-                pts.append([float(x), float(y)])
-        return pts
-    except Exception:
-        return []
-
-
-def _h5_marker_to_color_range(f, marker_path: str) -> dict | None:
-    try:
-        mu = _h5_numeric_path(f, f"{marker_path}/hsv_mu")
-        sig = _h5_numeric_path(f, f"{marker_path}/hsv_sig")
-        if mu is None:
-            return None
-        class _MarkerShim:
-            pass
-        marker = _MarkerShim()
-        marker.hsv_mu = np.asarray(mu, dtype=float)
-        marker.hsv_sig = np.asarray(sig, dtype=float) if sig is not None else np.array([0.08, 0.20, 0.20], dtype=float)
-        return _marker_to_color_range(marker)
-    except Exception:
-        return None
-
-
-def _extract_track_cal_from_recordresult_hdf5(mat_path: str) -> dict:
-    """Load recordResult.ocr.trkCalSlim from MATLAB v7.3/HDF5 MAT files."""
-    out = {}
-    try:
-        import h5py
-        with h5py.File(mat_path, "r") as f:
-            base = "recordResult/ocr/trkCalSlim"
-            roi = _h5_parse_roi_from_path(f, f"{base}/roi")
-            if roi:
-                out["track_roi"] = roi
-            pts = _h5_pts_from_path(f, f"{base}/ptsMini")
-            if len(pts) >= 4:
-                out["minimap_pts"] = pts[:8]
-            cr = _h5_marker_to_color_range(f, f"{base}/marker")
-            if cr:
-                out["moving_pt_color_range"] = cr
-            track_name = ""
-            if "recordResult/ocr/track/trackName" in f:
-                track_name = _h5_decode_text_dataset(f["recordResult/ocr/track/trackName"])
-            if track_name:
-                out["track_name"] = track_name
-    except Exception:
-        pass
-    return out
-
-
-def _extract_track_name_from_recordresult_mat(mat_path: str) -> str:
-    try:
-        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
-        rr = _mat_scalar(data.get("recordResult"))
-        ocr = _mat_obj_get(rr, "ocr")
-        track = _mat_obj_get(ocr, "track")
-        return _mat_to_text(_mat_obj_get(track, "trackName"), "")
-    except NotImplementedError:
-        try:
-            return _extract_track_cal_from_recordresult_hdf5(mat_path).get("track_name", "")
-        except Exception:
-            return ""
-    except Exception:
-        return ""
-
-
-def _track_reference_keywords(track_name: str) -> list[str]:
-    txt = str(track_name or "").strip().lower()
-    keys = []
-    if "nordschleife" in txt or "nürburgring" in txt or "nurburgring" in txt:
-        keys.extend(["nordschleife", "nuerburgring", "nürburgring", "nurburgring"])
-    for part in txt.replace("_", " ").replace("-", " ").split():
-        if len(part) >= 5:
-            keys.append(part)
-    # Keep order, remove duplicates.
-    out = []
-    for k in keys:
-        if k and k not in out:
-            out.append(k)
-    return out or ["nordschleife"]
-
-
-def _auto_load_reference_track_for_name(track_name: str) -> bool:
-    """Auto-load the matching reference track; comparison still remains user-triggered."""
-    keys = _track_reference_keywords(track_name)
-    preferred_exact = "nordschleife_2024_08_12_slim.mat"
-
-    def score_name(name: str) -> tuple[int, str]:
-        low = Path(str(name)).name.lower()
-        hit = any(k in low for k in keys)
-        if not hit:
-            return (999, low)
-        exact = 0 if low == preferred_exact else 1
-        slim = 0 if low.endswith("_slim.mat") or "slim" in low else 1
-        return (exact, slim, low)
-
-    # Cloud reference folder first.
-    if st.session_state.r2_connected and st.session_state.r2_client is not None:
-        pfx = st.session_state.r2_prefix.strip("/")
-        ref_dir = (pfx + "/reference_track_siesmann").strip("/") if pfx else "reference_track_siesmann"
-        try:
-            ok_ls, items = st.session_state.r2_client.list_files(ref_dir)
-            if ok_ls and isinstance(items, list):
-                cands = [x for x in items if str(x).lower().endswith(".mat") and any(k in Path(str(x)).name.lower() for k in keys)]
-                if cands:
-                    sel = sorted(cands, key=score_name)[0]
-                    _load_centerline_from_r2(f"{ref_dir}/{sel}", Path(str(sel)).name)
-                    return st.session_state.ref_track_img is not None
-        except Exception:
-            pass
-
-    # Local/project-folder fallback for desktop/local runs.
-    try:
-        search_roots = [Path.cwd(), Path.cwd() / "reference_track_siesmann", Path("/mnt/data")]
-        seen = set()
-        cands = []
-        for root in search_roots:
-            try:
-                root = root.resolve()
-            except Exception:
-                continue
-            if root in seen or not root.exists():
-                continue
-            seen.add(root)
-            iterator = root.rglob("*.mat") if root.is_dir() else []
-            for fp in iterator:
-                low = fp.name.lower()
-                if any(k in low for k in keys):
-                    cands.append(fp)
-        if cands:
-            sel = sorted(cands, key=lambda x: score_name(x.name))[0]
-            _apply_centerline_to_session(str(sel), sel.name)
-            return st.session_state.ref_track_img is not None
-    except Exception:
-        pass
-    return False
-
-def _merge_roi_metadata(rois: list[dict], meta_rows: list[dict]) -> list[dict]:
-    """Apply MAT table name/fmt metadata to ROI rows without changing geometry."""
-    if not rois or not meta_rows:
-        return rois or []
-    merged = [dict(r) for r in rois]
-    used = set()
-
-    # Prefer exact name matches so reordering in the table does not corrupt rows.
-    for i, r in enumerate(merged):
-        r_name = str(r.get("name", "")).strip()
-        for j, m in enumerate(meta_rows):
-            if j in used:
-                continue
-            if r_name and r_name == str(m.get("name", "")).strip():
-                merged[i]["fmt"] = _normalize_roi_format(m.get("fmt", r.get("fmt", "any")))
-                used.add(j)
-                break
-
-    # Fill remaining rows by order as a fallback for legacy configs.
-    for i, r in enumerate(merged):
-        if str(r.get("fmt", "any")) != "any":
-            continue
-        for j, m in enumerate(meta_rows):
-            if j in used:
-                continue
-            merged[i]["name"] = str(m.get("name") or r.get("name") or "_")
-            merged[i]["fmt"] = _normalize_roi_format(m.get("fmt", r.get("fmt", "any")))
-            used.add(j)
-            break
-    return merged
-
-
 
 def _mat_text_list(x) -> list[str]:
     """MATLAB char/cell/string/categorical labels -> list[str]."""
@@ -1951,62 +1691,27 @@ def _marker_to_color_range(marker) -> dict | None:
 
 
 def _extract_track_cal_from_recordresult_mat(mat_path: str) -> dict:
-    """Load recordResult.ocr.trkCalSlim: ROI, 8 minimap points, marker color and track name."""
+    """Load recordResult.ocr.trkCalSlim: ROI, 8 minimap points and marker color."""
     out = {}
     try:
         data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
         rr = _mat_scalar(data.get("recordResult"))
         ocr = _mat_obj_get(rr, "ocr")
         trk = _mat_obj_get(ocr, "trkCalSlim")
-        if trk is not None:
-            roi = _parse_roi_value(_mat_obj_get(trk, "roi"))
-            if roi and len(roi) >= 4 and roi[2] > 0 and roi[3] > 0:
-                out["track_roi"] = [float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])]
-            pts = _pts_from_mat_value(_mat_obj_get(trk, "ptsMini"))
-            if len(pts) >= 4:
-                out["minimap_pts"] = pts[:8]
-            cr = _marker_to_color_range(_mat_obj_get(trk, "marker"))
-            if cr:
-                out["moving_pt_color_range"] = cr
-        track_name = _extract_track_name_from_recordresult_mat(mat_path)
-        if track_name:
-            out["track_name"] = track_name
-    except NotImplementedError:
-        out.update(_extract_track_cal_from_recordresult_hdf5(mat_path))
+        if trk is None:
+            return out
+        roi = _parse_roi_value(_mat_obj_get(trk, "roi"))
+        if roi and len(roi) >= 4 and roi[2] > 0 and roi[3] > 0:
+            out["track_roi"] = [float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])]
+        pts = _pts_from_mat_value(_mat_obj_get(trk, "ptsMini"))
+        if len(pts) >= 4:
+            out["minimap_pts"] = pts[:8]
+        cr = _marker_to_color_range(_mat_obj_get(trk, "marker"))
+        if cr:
+            out["moving_pt_color_range"] = cr
     except Exception:
-        # v7.3 MAT files also land here in some scipy versions.
-        out.update(_extract_track_cal_from_recordresult_hdf5(mat_path))
+        pass
     return out
-
-
-def _extract_recordresult_title_from_mat(mat_path: str) -> str:
-    try:
-        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
-        rr = _mat_scalar(data.get("recordResult"))
-        meta = _mat_obj_get(rr, "metadata")
-        return _mat_to_text(_mat_obj_get(meta, "title"), "")
-    except Exception:
-        return ""
-
-
-def _render_loaded_mat_info() -> None:
-    mat_file = str(st.session_state.get("loaded_mat_file") or "").strip()
-    mat_key = str(st.session_state.get("loaded_mat_key") or "").strip()
-    title = str(st.session_state.get("loaded_mat_title") or "").strip()
-    video_name = str(st.session_state.get("video_name") or "").strip()
-    if not any([mat_file, mat_key, title, video_name]):
-        return
-    details = []
-    if title:
-        details.append(f"<span>Titel:</span> <b>{title}</b>")
-    if video_name:
-        details.append(f"<span>Video:</span> <b>{video_name}</b>")
-    subline = " &nbsp; | &nbsp; ".join(details)
-    mat_label = mat_file or Path(mat_key).name or "-"
-    st.markdown(
-        f"""<div class="loaded-mat-card"><span>Geladene Datei:</span> <b>{mat_label}</b><br>{subline}</div>""",
-        unsafe_allow_html=True,
-    )
 
 
 def _upsert_track_minimap_roi_from_mat(track_roi: list[float]) -> None:
@@ -2576,89 +2281,62 @@ def _normalize_overview_lamps(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].map(_norm_cell)
     return out
 
-
-def _overview_bool_value(v) -> bool:
-    s = str(v or "")
-    cur = s
-    def _decode_once(x: str) -> str:
-        try:
-            return x.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
-        except Exception:
-            return x
-    for _ in range(3):
-        nxt = _decode_once(cur)
-        if nxt == cur:
-            break
-        cur = nxt
-    cur = cur.strip()
-    return cur in (LAMP_GREEN, MOJIBAKE_GREEN, "Ja", "True", "true", "1", "OK")
+def _overview_status_true(value) -> bool:
+    txt = str(value or "").strip()
+    return txt in (LAMP_GREEN, MOJIBAKE_GREEN, "Ja", "True", "true", "1") or LAMP_GREEN in txt
 
 
-def _render_mat_selection_analysis(df_overview: pd.DataFrame) -> None:
-    """Render compact completion analytics under the MAT overview table."""
-    if df_overview is None or df_overview.empty:
+def _render_mat_selection_analysis(df: pd.DataFrame, title_suffix: str = "") -> None:
+    """Render a non-interactive MAT status analysis below the selection table."""
+    if df is None or df.empty:
         return
-
-    df = _normalize_overview_lamps(df_overview.copy())
-    total = int(len(df))
-    metrics = [
+    status_items = [
         ("Audio+Video", "audio_video_vorhanden"),
         ("ROI", "roi_ausgewaehlt"),
         ("Track", "track_ausgewaehlt"),
         ("Start/Ende", "anfang_ende_ausgewaehlt"),
-        ("OCR ausgewertet", "ocr_durchgefuehrt"),
-        ("OCR vollstaendig", "ocr_vollstaendig"),
+        ("OCR", "ocr_durchgefuehrt"),
+        ("OCR vollst.", "ocr_vollstaendig"),
         ("Audioanalyse", "audioanalyse_spektrogramm"),
         ("Validierung", "validierung"),
     ]
+    total = int(len(df))
     rows = []
-    for label, col in metrics:
-        if col not in df.columns:
-            ok_count = 0
-        else:
-            ok_count = int(df[col].map(_overview_bool_value).sum())
-        pct = int(round((ok_count / total) * 100)) if total else 0
-        rows.append({"label": label, "ok": ok_count, "missing": max(0, total - ok_count), "pct": pct})
+    for label, col in status_items:
+        ok = int(df[col].map(_overview_status_true).sum()) if col in df.columns else 0
+        pct = (100.0 * ok / total) if total else 0.0
+        rows.append((label, ok, total, pct))
 
-    st.markdown('<div class="section-title" style="margin-top:1rem;">Analyse</div>', unsafe_allow_html=True)
-    st.caption(f"Ueberblick fuer {total} Eintraege in der MAT-Auswahl.")
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title">MAT-Analyse{title_suffix}</div>', unsafe_allow_html=True)
 
-    html = ['<div class="mat-analysis-grid">']
-    for r in rows:
-        pct_safe = max(0, min(100, int(r["pct"])))
-        html.append(
-            '<div class="mat-analysis-card">'
-            f'<div class="mat-analysis-title">{r["label"]}</div>'
-            f'<div class="mat-analysis-value">{r["pct"]}%</div>'
-            f'<div class="mat-analysis-sub">{r["ok"]}/{total} vorhanden</div>'
-            '<div class="mat-progress-outer">'
-            f'<div class="mat-progress-inner" style="width:{pct_safe}%;"></div>'
-            '</div></div>'
+    kpi_html = ['<div class="mat-analysis-grid">']
+    for label, ok, total_n, pct in rows[:4]:
+        kpi_html.append(
+            f'''<div class="mat-analysis-card">
+                <div class="mat-analysis-title">{label}</div>
+                <div class="mat-analysis-value">{ok}/{total_n}</div>
+                <div class="mat-progress-outer"><div class="mat-progress-inner" style="width:{pct:.1f}%"></div></div>
+                <div class="mat-analysis-sub">{pct:.0f}% vorhanden</div>
+            </div>'''
         )
-    html.append('</div>')
-    st.markdown("".join(html), unsafe_allow_html=True)
+    kpi_html.append('</div>')
+    st.markdown("".join(kpi_html), unsafe_allow_html=True)
 
-    chart_df = pd.DataFrame(rows).sort_values("pct", ascending=True)
-    try:
-        st.bar_chart(
-            chart_df.set_index("label")[["ok", "missing"]],
-            horizontal=True,
-            height=max(260, min(520, 38 * len(chart_df) + 90)),
+    bar_html = ['<div class="mat-analysis-bars">']
+    for label, ok, total_n, pct in rows:
+        bar_html.append(
+            f'''<div class="mat-analysis-bar-row">
+                <div>{label}</div>
+                <div class="mat-analysis-bar-track"><div class="mat-analysis-bar-fill" style="width:{pct:.1f}%"></div></div>
+                <div>{ok}/{total_n} · {pct:.0f}%</div>
+            </div>'''
         )
-    except TypeError:
-        st.bar_chart(chart_df.set_index("label")[["ok", "missing"]], height=360)
+    bar_html.append('</div>')
+    bar_html.append('<div class="mat-analysis-note">Nicht interaktives Balkendiagramm: kein Zoom, kein Pan, keine User-Interaktion.</div>')
+    st.markdown("".join(bar_html), unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    detail_df = pd.DataFrame([
-        {
-            "Kriterium": r["label"],
-            "Vorhanden": r["ok"],
-            "Fehlt": r["missing"],
-            "Quote": f'{r["pct"]}%',
-        }
-        for r in rows
-    ])
-    with st.expander("Details als Tabelle", expanded=False):
-        st.dataframe(detail_df, width="stretch", hide_index=True)
 def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progress_slot=None):
     """
     Backward-compatible synchronous updater for MAT overview rows.
@@ -2793,16 +2471,11 @@ def _load_mat_from_r2(remote_key):
     if not ok: set_status(f"MAT-Download: {msg}", "warn"); return None
     try:
         cfg = config_from_mat_file(tmp.name, vid_duration=st.session_state.vid_duration)
-        st.session_state.loaded_mat_key = str(remote_key)
-        st.session_state.loaded_mat_file = Path(remote_key).name
-        st.session_state.loaded_mat_title = _extract_recordresult_title_from_mat(tmp.name)
         st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
         st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
         st.session_state.t_current = float(st.session_state.t_start)
         direct_rois = _extract_rois_from_recordresult_mat(tmp.name)
-        hdf5_roi_meta = _extract_roi_names_formats_from_recordresult_hdf5(tmp.name)
-        base_rois = direct_rois or cfg.get("rois", st.session_state.rois)
-        st.session_state.rois = _sanitize_rois(_merge_roi_metadata(base_rois, hdf5_roi_meta))
+        st.session_state.rois = _sanitize_rois(direct_rois or cfg.get("rois", st.session_state.rois))
         st.session_state.selected_roi = None
         st.session_state.roi_draw_armed = False
         st.session_state.drag_roi = {}
@@ -2810,7 +2483,6 @@ def _load_mat_from_r2(remote_key):
         st.session_state.roi_anchor_box = {}
         st.session_state.roi_reject_anchor_events = 0
         st.session_state.roi_editor_df = None
-        st.session_state.track_comparison_samples = []
         if cfg.get("ref_track_pts"):
             st.session_state.ref_track_pts = cfg["ref_track_pts"]
         if cfg.get("minimap_pts"):
@@ -2823,9 +2495,6 @@ def _load_mat_from_r2(remote_key):
             st.session_state.minimap_next_pt_idx = len(track_cfg["minimap_pts"])
         if track_cfg.get("moving_pt_color_range"):
             st.session_state.moving_pt_color_range = track_cfg["moving_pt_color_range"]
-            st.session_state.moving_pt_color_calibrated = True
-        if track_cfg.get("track_name") and st.session_state.ref_track_img is None:
-            _auto_load_reference_track_for_name(track_cfg.get("track_name", ""))
         set_status("MAT geladen OK","ok")
         return tmp.name
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
@@ -3448,10 +3117,25 @@ with tab_mat:
     if st.session_state.mat_overview_rows:
         df_overview = pd.DataFrame(st.session_state.mat_overview_rows)
         df_overview = _normalize_overview_lamps(df_overview)
+        filter_missing_roi = st.checkbox(
+            "Nur Fälle anzeigen: ROI fehlt und Audio+Video vorhanden",
+            value=False,
+            key="mat_filter_missing_roi_with_media",
+        )
+        display_df = df_overview
+        if filter_missing_roi:
+            display_df = df_overview[
+                (~df_overview["roi_ausgewaehlt"].map(_overview_status_true))
+                & (df_overview["audio_video_vorhanden"].map(_overview_status_true))
+            ].copy()
+            st.caption(f"Filter aktiv: {len(display_df)} von {len(df_overview)} Fällen angezeigt.")
         is_running_now = bool(st.session_state.mat_update_running)
-        styled_df = df_overview
+        styled_df = display_df
         allow_select = not is_running_now and not load_running
-        if allow_select:
+        if display_df.empty:
+            table_slot.empty()
+            st.info("Keine Fälle passend zum aktuellen Filter.")
+        elif allow_select:
             sel_event = table_slot.dataframe(
                 styled_df,
                 width="stretch",
@@ -3480,7 +3164,10 @@ with tab_mat:
                 height=MAT_TABLE_HEIGHT,
                 column_config=MAT_OVERVIEW_COLCFG,
             )
-        _render_mat_selection_analysis(df_overview)
+        _render_mat_selection_analysis(
+            display_df,
+            title_suffix=" (gefilterte Ansicht)" if filter_missing_roi else "",
+        )
     else:
         table_slot.empty()
         st.caption("Noch keine MAT analysiert.")
@@ -3577,7 +3264,6 @@ with tab_roi:
             unsafe_allow_html=True,
         )
         st.markdown('<div class="roi-compact">', unsafe_allow_html=True)
-        _render_loaded_mat_info()
 
         dur = st.session_state.vid_duration
         fps = st.session_state.vid_fps
@@ -4101,83 +3787,6 @@ with tab_roi:
 # ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
 # TAB ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âº ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“ TRACK-ANALYSE
 # ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
-def _track_centerline_progress_percent(ref_pt, centerline_px) -> float | None:
-    if ref_pt is None or not centerline_px:
-        return None
-    try:
-        p = np.array(ref_pt, dtype=float).reshape(2)
-        cl = np.asarray(centerline_px, dtype=float).reshape(-1, 2)
-        if cl.shape[0] < 2:
-            return None
-        seg = cl[1:] - cl[:-1]
-        seg_len = np.linalg.norm(seg, axis=1)
-        total = float(np.sum(seg_len))
-        if total <= 0:
-            return None
-        best_s = 0.0
-        best_d2 = float("inf")
-        cum = np.concatenate([[0.0], np.cumsum(seg_len)])
-        for i, v in enumerate(seg):
-            l2 = float(np.dot(v, v))
-            if l2 <= 0:
-                continue
-            u = float(np.clip(np.dot(p - cl[i], v) / l2, 0.0, 1.0))
-            q = cl[i] + u * v
-            d2 = float(np.sum((p - q) ** 2))
-            if d2 < best_d2:
-                best_d2 = d2
-                best_s = float(cum[i] + u * seg_len[i])
-        return float(np.clip(100.0 * best_s / total, 0.0, 100.0))
-    except Exception:
-        return None
-
-
-def _run_track_comparison_5_times_from_state(track_roi, fw, fh) -> None:
-    if not (st.session_state.ref_track_img is not None and track_roi and _has_media_source() and
-            _has_valid_8_points(st.session_state.ref_track_pts) and
-            _has_valid_8_points(st.session_state.minimap_pts)):
-        set_status("Vergleich nicht moeglich: Referenztrack, Video, track_minimap ROI und 8 Punkte benoetigt.", "warn")
-        return
-    rng = np.random.default_rng(12345)
-    lo, hi = float(st.session_state.t_start), float(st.session_state.t_end)
-    times = sorted(rng.uniform(lo, hi, size=5).tolist()) if hi > lo else [lo] * 5
-    results = []
-    for _t in times:
-        _frame = _get_media_frame(float(_t))
-        if _frame is None:
-            continue
-        _crop = extract_minimap_crop(_frame, track_roi, fw, fh)
-        _cmp = compare_minimap_to_reference(
-            _crop, st.session_state.ref_track_img,
-            st.session_state.minimap_pts, st.session_state.ref_track_pts,
-        )
-        if _cmp.get("error"):
-            continue
-        _mp = detect_moving_point(_crop, st.session_state.moving_pt_color_range)
-        _ref_pt = None
-        _progress = None
-        if _mp:
-            _ref_pt = project_point_with_homography((_mp["x"], _mp["y"]), _cmp.get("H"))
-            _progress = _track_centerline_progress_percent(_ref_pt, st.session_state.get("centerline_px"))
-        _overlay = draw_comparison_overlay(
-            _crop, st.session_state.ref_track_img,
-            st.session_state.minimap_pts, st.session_state.ref_track_pts,
-            _cmp, st.session_state.moving_pt_color_range,
-        )
-        try:
-            if _overlay is not None and _overlay.shape == _crop.shape:
-                _overlay = cv2.addWeighted(_crop, 0.62, _overlay, 0.38, 0)
-        except Exception:
-            pass
-        results.append({
-            "t": float(_t), "cmp": _cmp, "mp": _mp,
-            "ref_pt": _ref_pt, "progress_pct": _progress,
-            "overlay": _overlay,
-        })
-    st.session_state.track_comparison_samples = results
-    set_status(f"Vergleich fuer {len(results)} Zeiten durchgefuehrt.", "ok")
-
-
 with tab_track:
     has_ref   = st.session_state.ref_track_img is not None
     track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
@@ -4192,10 +3801,6 @@ with tab_track:
     col_a,col_b=st.columns(2,gap="medium")
     clrs=[(255,80,80),(255,160,0),(255,255,0),(80,255,80),
           (0,200,255),(100,100,255),(200,80,255),(255,80,200)]
-    can_cmp_controls = (
-        _has_valid_8_points(st.session_state.minimap_pts) and
-        bool(st.session_state.get("moving_pt_color_calibrated", False))
-    )
 
     with col_a:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
@@ -4205,7 +3810,7 @@ with tab_track:
         if has_ref:
             # P1-P8 already baked into the rendered image by render_centerline_image(); height-limited in this tab.
             st.markdown('<div class="ref-track-fit">', unsafe_allow_html=True)
-            st.image(st.session_state.ref_track_img, width=360,
+            st.image(st.session_state.ref_track_img, width=520,
                      caption="P1–P8 fest aus Streckendatei")
             st.markdown('</div>', unsafe_allow_html=True)
             _sl_c1, _sl_c2 = st.columns(2)
@@ -4320,12 +3925,9 @@ with tab_track:
                         cv2.putText(vis_c, f"P{pi+1}", (px_i+10, py_i+5),
                                     cv2.FONT_HERSHEY_SIMPLEX, .45, clrs[pi%8], 1)
 
-                mm_display_scale = 1.6
-                vis_c_display = cv2.resize(vis_c, None, fx=mm_display_scale, fy=mm_display_scale, interpolation=cv2.INTER_NEAREST)
-
                 if streamlit_image_coordinates is None:
                     st.warning("Bitte installieren: pip install streamlit-image-coordinates")
-                    st.image(vis_c_display, width="stretch", caption=f"Minimap ({cw}x{ch}px)")
+                    st.image(vis_c, width="stretch", caption=f"Minimap ({cw}x{ch}px)")
                 elif next_idx < 8:
                     # ── Kalibrierung: P1 … P8 anklicken ──
                     # Fixed widget key + dedup: avoids image disappearing when key changes.
@@ -4337,11 +3939,11 @@ with tab_track:
                         + _overlay_info
                     )
                     _last_cal = st.session_state.get("_mm_last_click")
-                    click = streamlit_image_coordinates(vis_c_display, key="mm_calibrate")
+                    click = streamlit_image_coordinates(vis_c, key="mm_calibrate")
                     if click and isinstance(click, dict) and click != _last_cal:
                         st.session_state["_mm_last_click"] = click
-                        x = int(round(float(click.get("x", 0)) / mm_display_scale))
-                        y = int(round(float(click.get("y", 0)) / mm_display_scale))
+                        x = int(round(float(click.get("x", 0))))
+                        y = int(round(float(click.get("y", 0))))
                         while len(mm_pts) <= next_idx:
                             mm_pts.append([0, 0])
                         mm_pts[next_idx] = [x, y]
@@ -4376,15 +3978,21 @@ with tab_track:
                         np.array([[[h_m,s_m,v_m]]],dtype=np.uint8),
                         cv2.COLOR_HSV2RGB)[0,0]
 
-                    st.image(swatch, caption="Zielfarbe", width=90)
+                    detected_lbl = "✓ Erkannt" if mp_live else "✗ Nicht erkannt"
+                    sc1, sc2 = st.columns([3,1])
+                    sc1.caption(
+                        f"✓ 8 Punkte  ·  Farberkennung: **{detected_lbl}**  "
+                        f"| 🟡 Blob-Zentrum  🔵 Klick-Position  "
+                        f"— Klicke Marker → Farbe übernehmen"
+                    )
+                    sc2.image(swatch, caption="Zielfarbe", width="stretch")
 
                     _last_col = st.session_state.get("_mm_last_color_click")
-                    vis_detect_display = cv2.resize(vis_detect, None, fx=mm_display_scale, fy=mm_display_scale, interpolation=cv2.INTER_NEAREST)
-                    color_click = streamlit_image_coordinates(vis_detect_display, key="mm_color_pick")
+                    color_click = streamlit_image_coordinates(vis_detect, key="mm_color_pick")
                     if color_click and isinstance(color_click, dict) and color_click != _last_col:
                         st.session_state["_mm_last_color_click"] = color_click
-                        cx = max(0, min(cw-1, int(round(float(color_click.get("x",0)) / mm_display_scale))))
-                        cy = max(0, min(ch-1, int(round(float(color_click.get("y",0)) / mm_display_scale))))
+                        cx = max(0, min(cw-1, int(round(float(color_click.get("x",0))))))
+                        cy = max(0, min(ch-1, int(round(float(color_click.get("y",0))))))
                         st.session_state["_mm_color_click_px"] = (cx, cy)
                         pixel_rgb = crop[cy, cx]
                         hsv_px = cv2.cvtColor(
@@ -4396,7 +4004,6 @@ with tab_track:
                             s_lo=max(0,s-60),   s_hi=min(255,s+60),
                             v_lo=max(0,v-60),   v_hi=min(255,v+60),
                         )
-                        st.session_state.moving_pt_color_calibrated = True
                         set_status(f"Farbe gesetzt: HSV({h},{s},{v})","ok")
                         st.rerun()
 
@@ -4413,25 +4020,7 @@ with tab_track:
                         st.session_state.minimap_pts = mm_pts[:next_idx-1]
                         st.session_state.minimap_next_pt_idx = next_idx-1
                         st.rerun()
-                if st.button(
-                    "Vergleich 5 Zeiten",
-                    type="primary",
-                    width="stretch",
-                    key="cmp_5_times_btn_top",
-                    disabled=not can_cmp_controls,
-                ):
-                    _run_track_comparison_5_times_from_state(track_roi, fw, fh)
-                    st.rerun()
         else:
-            if st.button(
-                "Vergleich 5 Zeiten",
-                type="primary",
-                width="stretch",
-                key="cmp_5_times_btn_top_empty",
-                disabled=not can_cmp_controls,
-            ):
-                _run_track_comparison_5_times_from_state(track_roi, fw, fh)
-                st.rerun()
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
                         'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
         st.markdown('</div>',unsafe_allow_html=True)
@@ -4479,40 +4068,65 @@ with tab_track:
             pass
         return overlay
 
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-card">',unsafe_allow_html=True)
     st.markdown('<div class="section-title">Vergleich | Ueberlagerung | Bewegende Punkte</div>',
                 unsafe_allow_html=True)
+    cv1, cv2_ = st.columns([1, 3], gap="medium")
 
-    if not can_cmp_controls:
-        st.caption("Benötigt: 8 Minimap-Punkte und Farberkennung.")
-    elif not (has_ref and track_roi and has_vid and _has_valid_8_points(st.session_state.ref_track_pts)):
-        st.caption("Für den Vergleich zusätzlich nötig: Referenztrack, Video und track_minimap ROI.")
+    can_cmp = (has_ref and track_roi and has_vid and
+               _has_valid_8_points(st.session_state.ref_track_pts) and
+               _has_valid_8_points(st.session_state.minimap_pts))
+    with cv1:
+        if can_cmp and st.button("Vergleich 5 Zeiten", type="primary", width="stretch", key="cmp_5_times_btn"):
+            rng = np.random.default_rng(12345)
+            lo, hi = float(st.session_state.t_start), float(st.session_state.t_end)
+            times = sorted(rng.uniform(lo, hi, size=5).tolist()) if hi > lo else [lo] * 5
+            results = []
+            for _t in times:
+                _frame = _get_media_frame(float(_t))
+                if _frame is None:
+                    continue
+                _crop = extract_minimap_crop(_frame, track_roi, fw, fh)
+                _cmp = compare_minimap_to_reference(
+                    _crop, st.session_state.ref_track_img,
+                    st.session_state.minimap_pts, st.session_state.ref_track_pts,
+                )
+                if _cmp.get("error"):
+                    continue
+                _mp = detect_moving_point(_crop, st.session_state.moving_pt_color_range)
+                _ref_pt = None
+                _progress = None
+                if _mp:
+                    _ref_pt = project_point_with_homography((_mp["x"], _mp["y"]), _cmp.get("H"))
+                    _progress = _centerline_progress_percent(_ref_pt, st.session_state.get("centerline_px"))
+                _overlay = _comparison_overlay_low_opacity(_crop, _cmp)
+                results.append({
+                    "t": float(_t), "cmp": _cmp, "mp": _mp,
+                    "ref_pt": _ref_pt, "progress_pct": _progress,
+                    "overlay": _overlay,
+                })
+            st.session_state.track_comparison_samples = results
+            set_status(f"Vergleich fuer {len(results)} Zeiten durchgefuehrt.", "ok")
+            st.rerun()
+        elif not can_cmp:
+            st.caption("Benötigt: Referenztrack, track_minimap ROI, Video und je 8 Punkte.")
 
-    _samples = st.session_state.get("track_comparison_samples") or []
-    if _samples:
-        st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
-        st.markdown('<div class="track-samples-grid">', unsafe_allow_html=True)
-        for _i, _res in enumerate(_samples):
-            st.markdown('<div class="track-sample-card">', unsafe_allow_html=True)
-            st.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
-            _c = _res.get("cmp", {})
-            _mp = _res.get("mp")
-            _progress = _res.get("progress_pct")
-            _pos_txt = f"{_progress:.1f}%" if _progress is not None else "n/a"
-            st.markdown(
-                f"""
-                <div class="track-progress-big">Position: {_pos_txt}</div>
-                <div class="track-metrics-small">
-                  ø={_c.get('mean_dist_px', 0.0):.1f}px &nbsp;|&nbsp;
-                  max={_c.get('max_dist_px', 0.0):.1f}px &nbsp;|&nbsp;
-                  pt={'ja' if _mp else 'nein'}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    with cv2_:
+        _samples = st.session_state.get("track_comparison_samples") or []
+        if _samples:
+            st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
+            _cols = st.columns(len(_samples))
+            for _col, _res in zip(_cols, _samples):
+                _col.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
+                _c = _res.get("cmp", {})
+                _mp = _res.get("mp")
+                _progress = _res.get("progress_pct")
+                _pos_txt = f"Pos={_progress:.1f}%" if _progress is not None else "Pos=n/a"
+                _col.caption(
+                    f"Ø={_c.get('mean_dist_px', 0.0):.1f}px | Max={_c.get('max_dist_px', 0.0):.1f}px | "
+                    f"Pt={'ja' if _mp else 'nein'} | {_pos_txt}"
+                )
+    st.markdown('</div>',unsafe_allow_html=True)
 
     if False and st.session_state.moving_pt_history:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)

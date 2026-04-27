@@ -21,6 +21,7 @@ Thumbs.db
 
 # Andere
 r2_mount/*
-logs/*.log
 *.pptx
 *.docx
+logs/run.log
+logs/*
