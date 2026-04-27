@@ -239,6 +239,7 @@ hr { border-color:#1e2535 !important; }
 .stDataFrame [aria-selected="true"] {
   background-color: rgba(74, 144, 164, 0.30) !important;
 }
+.ref-track-fit img { max-height: calc(100vh - 360px); object-fit: contain; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -258,7 +259,7 @@ FMT_OPTIONS = [
     "time_hh:mm:ss","time_hh:mm:ss.S","time_hh:mm:ss.SS","time_hh:mm:ss.SSS",
     "time_hh:mm:ss.SSSS","time_hh:mm:ss.SSSSSS",
     "integer","int_1","int_2","int_3","int_4","int_min2_max3","int_min3_max4",
-    "float","alnum","custom",
+    "float","alnum",
 ]
 MAT_OVERVIEW_COLCFG = {
     "mat_datei": st.column_config.TextColumn("mat_datei", width="medium"),
@@ -379,7 +380,8 @@ def init_state():
         roi_display_meta={},
         roi_editor_df=None,
         roi_ocr_probe_result=None,
-        roi_editor_widget_key="roi_data_editor_v2",
+        roi_global_scale=1.2,
+        roi_editor_widget_key="roi_data_editor_v3",
         # Track
         ref_track_img=None, ref_track_pts=None, minimap_pts=None,
         centerline=None, centerline_px=None, ref_track_mat_name="",
@@ -397,7 +399,7 @@ init_state()
 
 # One-time migration for legacy ROI editor widget state keys that could hold
 # incompatible column schema/dtypes.
-for _legacy_roi_key in ("roi_data_editor", "roi_data_editor_v1"):
+for _legacy_roi_key in ("roi_data_editor", "roi_data_editor_v1", "roi_data_editor_v2"):
     if _legacy_roi_key in st.session_state:
         st.session_state.pop(_legacy_roi_key, None)
 
@@ -990,6 +992,44 @@ def _has_valid_8_points(points):
     return True
 
 
+
+def _progress_on_centerline_percent(ref_pt, centerline_px=None):
+    """Return position on rendered reference track centerline in percent (0..100)."""
+    if ref_pt is None:
+        return None
+    if centerline_px is None:
+        centerline_px = st.session_state.get("centerline_px")
+    if centerline_px is None:
+        return None
+    try:
+        cl = np.asarray(centerline_px, dtype=np.float64)
+        pt = np.asarray(ref_pt, dtype=np.float64).reshape(2)
+    except Exception:
+        return None
+    if cl.ndim != 2 or cl.shape[0] < 2 or cl.shape[1] < 2:
+        return None
+    cl = cl[:, :2]
+    seg = cl[1:] - cl[:-1]
+    seg_len = np.linalg.norm(seg, axis=1)
+    valid = seg_len > 1e-9
+    if not np.any(valid):
+        return None
+    seg_valid = seg[valid]
+    start_valid = cl[:-1][valid]
+    len_valid = seg_len[valid]
+    t = np.sum((pt - start_valid) * seg_valid, axis=1) / (len_valid ** 2)
+    t = np.clip(t, 0.0, 1.0)
+    proj = start_valid + seg_valid * t[:, None]
+    dist2 = np.sum((proj - pt) ** 2, axis=1)
+    best = int(np.argmin(dist2))
+    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+    valid_idx = np.flatnonzero(valid)[best]
+    arc = float(cum[valid_idx] + t[best] * seg_len[valid_idx])
+    total = float(cum[-1])
+    if total <= 1e-9:
+        return None
+    return max(0.0, min(100.0, 100.0 * arc / total))
+
 def _clamp_roi_to_video(x, y, w, h, vid_w, vid_h):
     return clamp_roi_to_video(x, y, w, h, vid_w, vid_h)
 
@@ -1158,6 +1198,19 @@ def _pick_roi_with_cv_window(frame_rgb):
         return False, "Keine ROI ausgewaehlt.", None
     return True, "", {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
 
+def _sanitize_rois(rois):
+    out = []
+    for r in rois or []:
+        if not isinstance(r, dict):
+            continue
+        nr = dict(r)
+        if str(nr.get("fmt", "any")) == "custom":
+            nr["fmt"] = "any"
+        nr.pop("pattern", None)
+        nr["max_scale"] = float(st.session_state.get("roi_global_scale", 1.2))
+        out.append(nr)
+    return out
+
 def build_result_json():
     return build_result_payload(
         t_start=st.session_state.t_start,
@@ -1183,7 +1236,7 @@ def load_json_config(data):
     cfg = config_from_json_payload(data, vid_duration=st.session_state.vid_duration)
     st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
     st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
-    st.session_state.rois = cfg.get("rois", [])
+    st.session_state.rois = _sanitize_rois(cfg.get("rois", []))
     if cfg.get("ref_track_pts"):
         st.session_state.ref_track_pts = cfg["ref_track_pts"]
     if cfg.get("minimap_pts"):
@@ -1424,6 +1477,208 @@ def _download_mat_to_temp(remote_key: str):
     return True, "", tmp.name
 
 
+def _mat_obj_get(obj, field: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(field, default)
+    if hasattr(obj, field):
+        return getattr(obj, field)
+    try:
+        if isinstance(obj, np.ndarray) and obj.dtype.names and field in obj.dtype.names:
+            return _mat_scalar(obj[field])
+    except Exception:
+        pass
+    return default
+
+
+def _mat_scalar(x):
+    try:
+        while isinstance(x, np.ndarray) and x.size == 1:
+            x = x.item()
+    except Exception:
+        pass
+    return x
+
+
+def _mat_is_nonempty(x) -> bool:
+    if x is None:
+        return False
+    x = _mat_scalar(x)
+    try:
+        if isinstance(x, np.ndarray):
+            return x.size > 0
+        if isinstance(x, (str, bytes)):
+            return len(x) > 0
+        if isinstance(x, (list, tuple, dict)):
+            return len(x) > 0
+        return True
+    except Exception:
+        return True
+
+
+def _mat_to_float(x, default=np.nan) -> float:
+    try:
+        x = _mat_scalar(x)
+        if isinstance(x, np.ndarray):
+            x = np.asarray(x, dtype=float).ravel()
+            return float(x[0]) if x.size else default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _mat_table_height(tbl) -> int:
+    tbl = _mat_scalar(tbl)
+    if tbl is None:
+        return 0
+    try:
+        if isinstance(tbl, np.ndarray):
+            return int(tbl.shape[0]) if tbl.ndim > 0 else int(tbl.size)
+        for name in getattr(tbl, "_fieldnames", []) or []:
+            val = _mat_obj_get(tbl, name)
+            if isinstance(val, np.ndarray):
+                return int(val.size if val.ndim == 1 else val.shape[0])
+        return 1 if _mat_is_nonempty(tbl) else 0
+    except Exception:
+        return 0
+
+
+def _mat_table_column(tbl, *names):
+    tbl = _mat_scalar(tbl)
+    for name in names:
+        val = _mat_obj_get(tbl, name)
+        if val is not None:
+            return val
+    return None
+
+
+def _mat_numeric_vector(x):
+    try:
+        arr = np.asarray(_mat_scalar(x), dtype=float).ravel()
+        return arr[np.isfinite(arr)]
+    except Exception:
+        return np.array([], dtype=float)
+
+
+def _mat_roi_table_has_track(roi_table) -> bool:
+    names = _mat_table_column(roi_table, "name_roi", "name", "Name")
+    if names is None:
+        return False
+    try:
+        vals = np.asarray(names).ravel().tolist()
+        joined = " ".join(str(_mat_scalar(v)).lower() for v in vals)
+        return "track_minimap" in joined
+    except Exception:
+        return False
+
+
+def _summarize_record_result_hdf5(mat_path: str) -> dict:
+    out = {}
+    try:
+        import h5py
+        paths = []
+        shapes = {}
+        with h5py.File(mat_path, "r") as f:
+            def visitor(name, obj):
+                lname = str(name).lower()
+                paths.append(lname)
+                if hasattr(obj, "shape"):
+                    shapes[lname] = tuple(int(v) for v in obj.shape)
+            f.visititems(visitor)
+        joined = "\n".join(paths)
+        def has(*needles):
+            return any(n.lower() in joined for n in needles)
+        def nonempty_path(*needles):
+            for p, sh in shapes.items():
+                if any(n.lower() in p for n in needles):
+                    if not sh or int(np.prod(sh)) > 0:
+                        return True
+            return False
+        out["roi_selected"] = has("recordresult/ocr/roi_table", "roi_table")
+        out["track_selected"] = has("recordresult/ocr/track", "recordresult/ocr/trkcalslim", "track_minimap")
+        out["start_end_selected"] = has("recordresult/ocr/params/start_s") and has("recordresult/ocr/params/end_s")
+        out["ocr_done"] = nonempty_path("recordresult/ocr/table", "recordresult/ocr/cleaned")
+        out["ocr_complete"] = bool(out.get("ocr_done") and out.get("start_end_selected"))
+        out["audio_spectrogram_done"] = nonempty_path("recordresult/audio_rpm/processed", "recordresult/audio_rpm/params")
+        out["validation_done"] = nonempty_path("recordresult/validation/results")
+    except Exception:
+        pass
+    return out
+
+
+def _summarize_record_result_mat(mat_path: str) -> dict:
+    out = {}
+    try:
+        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        rr = _mat_scalar(data.get("recordResult"))
+        if rr is None:
+            return out
+        meta = _mat_obj_get(rr, "metadata")
+        ocr = _mat_obj_get(rr, "ocr")
+        audio_rpm = _mat_obj_get(rr, "audio_rpm")
+        validation = _mat_obj_get(rr, "validation")
+
+        video_path = _mat_obj_get(meta, "video") or _mat_obj_get(rr, "video")
+        audio_path = _mat_obj_get(meta, "audio") or _mat_obj_get(rr, "audio")
+        out["recordresult_video_path"] = str(_mat_scalar(video_path) or "")
+        out["recordresult_audio_path"] = str(_mat_scalar(audio_path) or "")
+
+        params = _mat_obj_get(ocr, "params")
+        start_s = _mat_to_float(_mat_obj_get(params, "start_s"))
+        end_s = _mat_to_float(_mat_obj_get(params, "end_s"))
+        out["start_end_selected"] = bool(np.isfinite(start_s) and np.isfinite(end_s) and end_s > start_s)
+        out["t_start"] = start_s if np.isfinite(start_s) else None
+        out["t_end"] = end_s if np.isfinite(end_s) else None
+
+        roi_table = _mat_obj_get(ocr, "roi_table")
+        roi_rows = _mat_table_height(roi_table)
+        out["roi_selected"] = bool(roi_rows > 0)
+        out["roi_count"] = int(roi_rows)
+
+        track_obj = _mat_obj_get(ocr, "track")
+        trk_slim = _mat_obj_get(ocr, "trkCalSlim")
+        track_obj_ok = _mat_is_nonempty(track_obj) and (
+            _mat_obj_get(track_obj, "roi") is not None
+            or _mat_obj_get(track_obj, "trackName") is not None
+            or _mat_obj_get(track_obj, "centerline") is not None
+        )
+        trk_slim_ok = _mat_is_nonempty(trk_slim) and (
+            _mat_obj_get(trk_slim, "roi") is not None
+            or _mat_obj_get(trk_slim, "fixedPts") is not None
+            or _mat_obj_get(trk_slim, "movingColor") is not None
+        )
+        out["track_selected"] = bool(track_obj_ok or trk_slim_ok or _mat_roi_table_has_track(roi_table))
+
+        raw_table = _mat_obj_get(ocr, "table")
+        cleaned = _mat_obj_get(ocr, "cleaned")
+        raw_rows = _mat_table_height(raw_table)
+        clean_rows = _mat_table_height(cleaned)
+        out["ocr_done"] = bool(raw_rows > 0 or clean_rows > 0)
+        out["ocr_row_count"] = int(max(raw_rows, clean_rows))
+
+        time_col = _mat_table_column(raw_table, "time_s", "t_s")
+        if time_col is None:
+            time_col = _mat_table_column(cleaned, "time_s", "t_s")
+        times = _mat_numeric_vector(time_col)
+        if out["ocr_done"] and np.isfinite(end_s) and times.size:
+            out["ocr_complete"] = bool(np.nanmax(times) >= (end_s - 1.0))
+        else:
+            out["ocr_complete"] = bool(out["ocr_done"] and not np.isfinite(end_s))
+
+        ar_processed = _mat_obj_get(audio_rpm, "processed")
+        ar_params = _mat_obj_get(audio_rpm, "params")
+        out["audio_spectrogram_done"] = bool(_mat_table_height(ar_processed) > 0 or _mat_is_nonempty(ar_params))
+
+        v_results = _mat_obj_get(validation, "results")
+        out["validation_done"] = bool(_mat_is_nonempty(v_results))
+    except NotImplementedError:
+        out.update(_summarize_record_result_hdf5(mat_path))
+    except Exception:
+        pass
+    return out
+
+
 def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
     tmp.close()
@@ -1431,15 +1686,38 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
     if not ok:
         return {"mat_file": Path(remote_key).name, "remote_key": remote_key, "error": f"Download: {msg}"}
 
+    _mat_keys = set()
+    record_summary = {}
     try:
         summary = summarize_mat_file(tmp.name)
+        record_summary = _summarize_record_result_mat(tmp.name)
+        try:
+            _mat_keys = set(sio.loadmat(tmp.name, squeeze_me=True, struct_as_record=False).keys())
+        except Exception:
+            _mat_keys = set()
     except Exception as e:
         summary = {"error": f"{e.__class__.__name__}: {e}"}
+        record_summary = _summarize_record_result_mat(tmp.name)
     finally:
         try:
             Path(tmp.name).unlink(missing_ok=True)
         except Exception:
             pass
+
+    def _mat_has_any(keys):
+        lk = {str(k).lower() for k in _mat_keys}
+        return any(str(k).lower() in lk for k in keys)
+
+    for k, v in record_summary.items():
+        if v is not None:
+            summary[k] = v
+    summary["roi_selected"] = bool(summary.get("roi_selected") or _mat_has_any(["rois", "roi", "roi_table", "roitable"]))
+    summary["track_selected"] = bool(summary.get("track_selected") or _mat_has_any(["track", "track_minimap", "minimap_pts", "ref_track_pts", "centerline"]))
+    summary["start_end_selected"] = bool(summary.get("start_end_selected") or _mat_has_any(["t_start", "t_end", "start_time", "end_time", "startend", "time_range"]))
+    summary["ocr_done"] = bool(summary.get("ocr_done") or _mat_has_any(["ocr_results", "ocr_values", "results_table"]))
+    summary["ocr_complete"] = bool(summary.get("ocr_complete") or (summary.get("ocr_done") and not _mat_has_any(["ocr_missing", "ocr_errors", "missing_values"])))
+    summary["audio_spectrogram_done"] = bool(summary.get("audio_spectrogram_done") or _mat_has_any(["spectrogram", "audio_spectrogram", "audioanalysis", "audio_analysis", "pxx", "audio_rpm"]))
+    summary["validation_done"] = bool(summary.get("validation_done") or _mat_has_any(["validation", "validated", "validierung", "validation_results"]))
 
     summary["mat_file"] = Path(remote_key).name
     summary["remote_key"] = remote_key
@@ -1906,7 +2184,7 @@ def _load_mat_from_r2(remote_key):
         st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
         st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
         st.session_state.t_current = float(st.session_state.t_start)
-        st.session_state.rois = cfg.get("rois", st.session_state.rois)
+        st.session_state.rois = _sanitize_rois(cfg.get("rois", st.session_state.rois))
         st.session_state.selected_roi = None
         st.session_state.roi_draw_armed = False
         st.session_state.drag_roi = {}
@@ -1941,6 +2219,34 @@ def _apply_centerline_to_session(mat_path: str, mat_name: str) -> None:
     set_status(f"Centerline geladen: {mat_name} ({len(cl)} Punkte)", "ok")
 
 
+def _autosave_slim_centerline_to_r2() -> None:
+    if not (st.session_state.centerline is not None and st.session_state.r2_connected and st.session_state.r2_client is not None):
+        return
+    _base = Path(st.session_state.ref_track_mat_name or "track").stem
+    _slim_name = (_base if _base.lower().endswith("_slim") else _base + "_slim") + ".mat"
+    _pfx = st.session_state.r2_prefix.strip("/")
+    _ref_dir = (_pfx + "/reference_track_siesmann").strip("/") if _pfx else "reference_track_siesmann"
+    try:
+        ok_ls, items = st.session_state.r2_client.list_files(_ref_dir)
+        if ok_ls and isinstance(items, list):
+            existing = [Path(str(x)).name for x in items if not str(x).endswith("/")]
+            if _slim_name in existing:
+                return
+        _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+        _tmp.close()
+        save_slim_mat(np.array(st.session_state.centerline, dtype=np.float64), _tmp.name)
+        _ok, _msg = st.session_state.r2_client.upload_file(_tmp.name, f"{_ref_dir}/{_slim_name}")
+        try:
+            Path(_tmp.name).unlink(missing_ok=True)
+        except Exception:
+            pass
+        if _ok:
+            set_status(f"Slim automatisch gespeichert: {_slim_name}", "ok")
+        else:
+            set_status(f"Slim-Auto-Upload fehlgeschlagen: {_msg}", "warn")
+    except Exception as e:
+        set_status(f"Slim-Auto-Upload Fehler: {e}", "warn")
+
 def _load_centerline_from_r2(remote_key: str, mat_name: str) -> None:
     client = st.session_state.r2_client
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
@@ -1948,6 +2254,7 @@ def _load_centerline_from_r2(remote_key: str, mat_name: str) -> None:
     ok, msg = client.download_file(remote_key, tmp.name)
     if ok:
         _apply_centerline_to_session(tmp.name, mat_name)
+        _autosave_slim_centerline_to_r2()
     else:
         set_status(f"Download fehlgeschlagen: {msg}", "warn")
 
@@ -2008,9 +2315,9 @@ with tab_setup:
                 data=log_text.encode("utf-8", errors="ignore"),
                 file_name="app_crash.log",
                 mime="text/plain",
-                use_container_width=True,
+                width="stretch",
             )
-            if c_log2.button("Log leeren", use_container_width=True):
+            if c_log2.button("Log leeren", width="stretch"):
                 try:
                     LOG_FILE.write_text("", encoding="utf-8")
                     set_status("Crash-Log geleert.", "info")
@@ -2071,7 +2378,7 @@ with tab_setup:
                 placeholder="mein-bucket",
             )
 
-            if st.button("Cloud DB verbinden", type="primary", use_container_width=True, key="r2_connect_btn"):
+            if st.button("Cloud DB verbinden", type="primary", width="stretch", key="r2_connect_btn"):
                 if r2_account and r2_key and r2_secret and r2_bucket:
                     with st.spinner("Verbinde Cloud DB ..."):
                         _ok, _msg, _client = connect_r2_client(r2_account, r2_key, r2_secret, r2_bucket)
@@ -2112,7 +2419,7 @@ with tab_setup:
                     st.session_state.r2_prefix = chosen
                     st.session_state.mat_scan_prefix = None
                     set_status(f"Cloud Root: {chosen or '(root)'}", "ok")
-                if st.button("Cloud Liste aktualisieren", use_container_width=True, key="refresh_root"):
+                if st.button("Cloud Liste aktualisieren", width="stretch", key="refresh_root"):
                     st.session_state.r2_prefix_options = get_root_prefixes()
                     st.rerun()
             else:
@@ -2153,7 +2460,7 @@ with tab_setup:
                 unsafe_allow_html=True,
             )
 
-            if st.button("Ordner waehlen (lokal)", use_container_width=True, key="local_pick_btn"):
+            if st.button("Ordner waehlen (lokal)", width="stretch", key="local_pick_btn"):
                 try:
                     ok_pick, picked = _pick_local_folder_dialog(st.session_state.local_base_path_input)
                     if ok_pick and picked:
@@ -2226,21 +2533,21 @@ with tab_sync:
         c_sync_refresh, c_sync_start, c_sync_stop = st.columns([1, 1, 1])
         sync_refresh_clicked = c_sync_refresh.button(
             "Sync Uebersicht aktualisieren",
-            use_container_width=True,
+            width="stretch",
             disabled=True,
             key="sync_refresh_btn_running",
         )
         c_sync_start.button(
             "Auswahl uebernehmen + Sync starten",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=True,
             key="sync_start_btn_running",
         )
         sync_stop_clicked = c_sync_stop.button(
             "Stop",
             type="secondary",
-            use_container_width=True,
+            width="stretch",
             key="sync_stop_btn_running",
         )
 
@@ -2280,18 +2587,18 @@ with tab_sync:
             c_sync_refresh, c_sync_start, c_sync_stop = st.columns([1, 1, 1])
             sync_refresh_clicked = c_sync_refresh.form_submit_button(
                 "Sync Uebersicht aktualisieren",
-                use_container_width=True,
+                width="stretch",
                 disabled=not can_sync_compare,
             )
             sync_start_clicked = c_sync_start.form_submit_button(
                 "Auswahl uebernehmen + Sync starten",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
                 disabled=not can_sync_compare,
             )
             c_sync_stop.form_submit_button(
                 "Stop",
-                use_container_width=True,
+                width="stretch",
                 disabled=True,
             )
 
@@ -2455,7 +2762,7 @@ with tab_mat:
     c1, c2 = st.columns(2)
     update_clicked = c1.button(
         "Update",
-        use_container_width=True,
+        width="stretch",
         key="mat_update_tab",
         disabled=not connected,
     )
@@ -2469,7 +2776,7 @@ with tab_mat:
     load_clicked = c2.button(
         "MAT + Video laden",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="mat_load_all_tab",
         disabled=not can_load,
     )
@@ -2696,11 +3003,15 @@ with tab_roi:
             st.session_state._roi_prev_start = float(st.session_state.t_start)
             st.session_state._roi_prev_end = float(st.session_state.t_end)
 
+            # Sync ROI slider value before widget creation. Streamlit forbids
+            # writing to a widget key after that widget has been instantiated.
+            _cur_for_slider = float(min(max(st.session_state.t_current, st.session_state.t_start), st.session_state.t_end))
+            st.session_state["sl_cur"] = _cur_for_slider
             t_cur = st.slider(
                 "Position [s]",
                 float(st.session_state.t_start),
                 float(st.session_state.t_end),
-                float(min(max(st.session_state.t_current, st.session_state.t_start), st.session_state.t_end)),
+                _cur_for_slider,
                 step=step_s,
                 format="%d s",
                 key="sl_cur",
@@ -2917,21 +3228,22 @@ with tab_roi:
                 {
                     _sel_col: bool(i == _sel),
                     "Name": str(r.get("name", "_")),
-                    "Format": str(r.get("fmt", "any")),
-                    "Pattern": str(r.get("pattern", "")),
-                    "Scale": float(r.get("max_scale", 1.2)),
+                    "Format": str(r.get("fmt", "any")) if str(r.get("fmt", "any")) != "custom" else "any",
+                    "OCR OK": bool(r.get("ocr_test_ok", False)),
+                    "OCR Wert": str(r.get("ocr_test_value", "")),
                 }
                 for i, r in enumerate(_rois)
             ]
-            _base_df = pd.DataFrame(_base_rows, columns=[_sel_col, "Name", "Format", "Pattern", "Scale"])
+            _roi_cols = [_sel_col, "Name", "Format", "OCR OK", "OCR Wert"]
+            _base_df = pd.DataFrame(_base_rows, columns=_roi_cols)
             if _base_df.empty:
                 _base_df = pd.DataFrame(
                     {
                         _sel_col: pd.Series(dtype="bool"),
                         "Name": pd.Series(dtype="object"),
                         "Format": pd.Series(dtype="object"),
-                        "Pattern": pd.Series(dtype="object"),
-                        "Scale": pd.Series(dtype="float64"),
+                        "OCR OK": pd.Series(dtype="bool"),
+                        "OCR Wert": pd.Series(dtype="object"),
                     }
                 )
             else:
@@ -2942,25 +3254,23 @@ with tab_roi:
                 and list(_cached_df.columns) == list(_base_df.columns)
                 and len(_cached_df) == len(_base_df)
             ):
-                df_edit = _cached_df.copy()
-                df_edit = df_edit.reindex(columns=[_sel_col, "Name", "Format", "Pattern", "Scale"])
+                df_edit = _cached_df.copy().reindex(columns=_roi_cols)
                 df_edit[_sel_col] = df_edit[_sel_col].fillna(False).astype(bool)
                 df_edit[_sel_col] = [(i == _sel) for i in range(len(df_edit))]
             else:
                 df_edit = _base_df.copy()
 
-            # Hard type normalization to keep Streamlit data_editor schema stable.
             if _sel_col not in df_edit.columns:
                 df_edit[_sel_col] = False
             df_edit = pd.DataFrame(
                 {
                     _sel_col: pd.Series([bool(v) for v in df_edit[_sel_col].tolist()], dtype="bool"),
                     "Name": pd.Series([str(v) for v in df_edit["Name"].tolist()], dtype="object"),
-                    "Format": pd.Series([str(v) for v in df_edit["Format"].tolist()], dtype="object"),
-                    "Pattern": pd.Series([str(v) for v in df_edit["Pattern"].tolist()], dtype="object"),
-                    "Scale": pd.to_numeric(df_edit["Scale"], errors="coerce").fillna(1.2).astype(float),
+                    "Format": pd.Series([str(v) if str(v) != "custom" else "any" for v in df_edit["Format"].tolist()], dtype="object"),
+                    "OCR OK": pd.Series([bool(v) for v in df_edit.get("OCR OK", pd.Series([False] * len(df_edit))).tolist()], dtype="bool"),
+                    "OCR Wert": pd.Series([str(v) for v in df_edit.get("OCR Wert", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
                 },
-                columns=[_sel_col, "Name", "Format", "Pattern", "Scale"],
+                columns=_roi_cols,
             )
 
             edited_df = st.data_editor(
@@ -2969,17 +3279,16 @@ with tab_roi:
                     _sel_col: st.column_config.CheckboxColumn("", width=42),
                     "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width=150),
                     "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width=170),
-                    "Pattern": st.column_config.TextColumn("Pat.", width=56),
-                    "Scale": st.column_config.NumberColumn("Sc.", min_value=0.1, step=0.1, width=54),
+                    "OCR OK": st.column_config.CheckboxColumn("OCR OK", width=70, disabled=True),
+                    "OCR Wert": st.column_config.TextColumn("OCR Wert", width=110, disabled=True),
                 },
                 num_rows="fixed",
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=_tbl_h,
-                key=str(st.session_state.get("roi_editor_widget_key", "roi_data_editor_v2")),
+                key=str(st.session_state.get("roi_editor_widget_key", "roi_data_editor_v3")),
             )
 
-            # Sync data_editor edits -> session state
             if edited_df is not None and len(edited_df) == len(_rois):
                 if _sel_col in edited_df.columns:
                     edited_df[_sel_col] = edited_df[_sel_col].fillna(False).astype(bool)
@@ -2994,13 +3303,11 @@ with tab_roi:
                     _r = _rois[_i]
                     _nn = str(_row["Name"]) if pd.notna(_row["Name"]) else _r.get("name", "_")
                     _nf = str(_row["Format"]) if pd.notna(_row["Format"]) else _r.get("fmt", "any")
-                    _np = str(_row["Pattern"]) if pd.notna(_row["Pattern"]) else _r.get("pattern", "")
-                    _ns = float(_row["Scale"]) if pd.notna(_row["Scale"]) else float(_r.get("max_scale", 1.2))
-                    if (_r.get("name") != _nn or _r.get("fmt") != _nf
-                            or _r.get("pattern", "") != _np
-                            or abs(float(_r.get("max_scale", 1.2)) - _ns) > 1e-9):
-                        st.session_state.rois[_i] = {**_r, "name": _nn, "fmt": _nf,
-                                                      "pattern": _np, "max_scale": _ns}
+                    if _nf == "custom":
+                        _nf = "any"
+                    if (_r.get("name") != _nn or _r.get("fmt") != _nf):
+                        st.session_state.rois[_i] = {**_r, "name": _nn, "fmt": _nf}
+                        st.session_state.rois[_i].pop("pattern", None)
                         _meta_changed = True
                 if isinstance(_newly_sel, int) and _newly_sel != _sel and 0 <= _newly_sel < len(st.session_state.rois):
                     st.session_state.selected_roi = _newly_sel
@@ -3019,7 +3326,22 @@ with tab_roi:
                     st.rerun()
             act_sel = st.session_state.selected_roi
 
-            if st.button("ROI hinzuf\u00fcgen", type="primary", use_container_width=True, key="roi_add_btn"):
+            _scale_val = st.number_input(
+                "OCR Scale fuer alle ROIs",
+                min_value=0.1,
+                max_value=5.0,
+                value=float(st.session_state.get("roi_global_scale", 1.2)),
+                step=0.1,
+                key="roi_global_scale_input",
+                help="Gemeinsamer Scale-Wert fuer OCR; gilt fuer alle ROIs.",
+            )
+            if abs(float(st.session_state.get("roi_global_scale", 1.2)) - float(_scale_val)) > 1e-9:
+                st.session_state.roi_global_scale = float(_scale_val)
+                for _r in st.session_state.rois:
+                    if isinstance(_r, dict):
+                        _r["max_scale"] = float(_scale_val)
+
+            if st.button("ROI hinzuf\u00fcgen", type="primary", width="stretch", key="roi_add_btn"):
                 # New ROI starts from a fresh default rectangle (independent from existing ROI).
                 _d = seed_drag_roi(fw, fh)
                 _cx, _cy, _cw, _ch = _clamp_roi_to_video(
@@ -3027,7 +3349,7 @@ with tab_roi:
                 )
                 st.session_state.rois.append(dict(
                     name="_", x=float(_cx), y=float(_cy),
-                    w=float(_cw), h=float(_ch), fmt="any", pattern="", max_scale=1.2,
+                    w=float(_cw), h=float(_ch), fmt="any", max_scale=float(st.session_state.get("roi_global_scale", 1.2)),
                 ))
                 _ni = len(st.session_state.rois) - 1
                 st.session_state.selected_roi = _ni
@@ -3054,7 +3376,7 @@ with tab_roi:
             )
             if st.button(
                 "OCR-Test ROI",
-                use_container_width=True,
+                width="stretch",
                 key="roi_ocr_probe_btn",
                 disabled=not _can_ocr_probe,
             ):
@@ -3062,7 +3384,7 @@ with tab_roi:
                 if not tess_cmd:
                     st.error("Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD.")
                 else:
-                    probe_roi = st.session_state.rois[act_sel]
+                    probe_roi = {**st.session_state.rois[act_sel], "max_scale": float(st.session_state.get("roi_global_scale", 1.2))}
                     probe = diagnose_roi_ocr(
                         frame,
                         probe_roi,
@@ -3070,6 +3392,15 @@ with tab_roi:
                         tmp_root=LOG_DIR / "ocr_tmp",
                     )
                     st.session_state.roi_ocr_probe_result = probe
+                    st.session_state.rois[act_sel] = {
+                        **st.session_state.rois[act_sel],
+                        "ocr_test_ok": bool(probe.get("ok")),
+                        "ocr_test_value": probe.get("value", ""),
+                        "ocr_test_raw": probe.get("raw", ""),
+                        "ocr_test_confidence": float(probe.get("confidence", 0.0) or 0.0),
+                        "ocr_test_error": probe.get("error", ""),
+                    }
+                    st.session_state.roi_editor_df = None
 
             probe_result = st.session_state.get("roi_ocr_probe_result")
             if isinstance(probe_result, dict):
@@ -3092,7 +3423,7 @@ with tab_roi:
                 with st.expander("OCR-Test Details", expanded=False):
                     st.json(probe_result)
 
-            if st.button("Ausgew\u00e4hlte ROI l\u00f6schen", use_container_width=True,
+            if st.button("Ausgew\u00e4hlte ROI l\u00f6schen", width="stretch",
                          key="roi_del_btn", disabled=act_sel is None):
                 if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
                     st.session_state.rois.pop(act_sel)
@@ -3116,7 +3447,7 @@ with tab_roi:
                     result_str,
                     f"results_{cf}.json",
                     "application/json",
-                    use_container_width=True,
+                    width="stretch",
                 )
                 mat_buf = io.BytesIO()
                 sio.savemat(mat_buf, build_mat_struct(result))
@@ -3125,7 +3456,7 @@ with tab_roi:
                     mat_buf.getvalue(),
                     f"results_{cf}.mat",
                     "application/octet-stream",
-                    use_container_width=True,
+                    width="stretch",
                 )
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -3156,43 +3487,19 @@ with tab_track:
         _ref_title = f"Referenz-Track | {_mat_name}" if _mat_name else "Referenz-Track | Centerline [m]"
         st.markdown(f'<div class="section-title">{_ref_title}</div>', unsafe_allow_html=True)
         if has_ref:
-            # P1-P8 already baked into the rendered image by render_centerline_image()
+            # P1-P8 already baked into the rendered image by render_centerline_image(); height-limited in this tab.
+            st.markdown('<div class="ref-track-fit">', unsafe_allow_html=True)
             st.image(st.session_state.ref_track_img, width="stretch",
                      caption="P1–P8 fest aus Streckendatei")
+            st.markdown('</div>', unsafe_allow_html=True)
             _sl_c1, _sl_c2 = st.columns(2)
-            if _sl_c1.button("Neu laden", use_container_width=True, key="reload_mat_btn"):
+            if _sl_c1.button("Neu laden", width="stretch", key="reload_mat_btn"):
                 st.session_state.ref_track_img = None
                 st.session_state.ref_track_pts = None
                 st.session_state.centerline = None
                 st.session_state.ref_track_mat_name = ""
                 st.rerun()
-            _can_slim = (
-                st.session_state.centerline is not None
-                and st.session_state.r2_connected
-                and st.session_state.r2_client is not None
-            )
-            if _sl_c2.button(
-                "Slim → Cloud",
-                use_container_width=True,
-                key="save_slim_btn",
-                disabled=not _can_slim,
-                help="Speichert nur die Centerline (~KB) in die Cloud — ersetzt die 30 MB Datei",
-            ):
-                _cl = np.array(st.session_state.centerline, dtype=np.float64)
-                _base = Path(st.session_state.ref_track_mat_name or "track").stem
-                _slim_name = _base + "_slim.mat"
-                _pfx = st.session_state.r2_prefix.strip("/")
-                _ref_dir = (_pfx + "/reference_track_siesmann").strip("/") if _pfx else "reference_track_siesmann"
-                _remote = f"{_ref_dir}/{_slim_name}"
-                _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
-                _tmp.close()
-                save_slim_mat(_cl, _tmp.name)
-                _ok, _msg = st.session_state.r2_client.upload_file(_tmp.name, _remote)
-                if _ok:
-                    set_status(f"Slim gespeichert: {_slim_name}", "ok")
-                else:
-                    set_status(f"Upload fehlgeschlagen: {_msg}", "warn")
-                st.rerun()
+            _sl_c2.caption("Slim-Datei wird automatisch gespeichert, falls sie in der Cloud fehlt.")
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:.5rem 0;">'
                         'Keine Streckenkarte geladen</div>', unsafe_allow_html=True)
@@ -3210,7 +3517,7 @@ with tab_track:
                             key="ref_track_sel",
                             label_visibility="collapsed",
                         )
-                        if st.button("Aus Cloud laden", use_container_width=True, key="ref_track_load_btn"):
+                        if st.button("Aus Cloud laden", width="stretch", key="ref_track_load_btn"):
                             _load_centerline_from_r2(f"{ref_dir}/{sel}", sel)
                             st.rerun()
                     else:
@@ -3226,6 +3533,17 @@ with tab_track:
         st.markdown('<div class="section-title">Minimap | Kalibrierung + Farberkennung</div>',
                     unsafe_allow_html=True)
         if has_vid and track_roi:
+            _track_t = st.slider(
+                "Zeit fuer Farberkennung / Track [s]",
+                float(st.session_state.t_start),
+                float(st.session_state.t_end),
+                float(min(max(st.session_state.t_current, st.session_state.t_start), st.session_state.t_end)),
+                step=round(1 / max(float(st.session_state.vid_fps or 25.0), 1.0), 4),
+                format="%d s",
+                key="track_color_time_slider",
+            )
+            st.session_state.t_current = float(_track_t)
+            # sl_cur is synchronized before the ROI slider is created.
             frame=_get_media_frame(st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
@@ -3365,13 +3683,13 @@ with tab_track:
 
                 # Reset / Undo buttons
                 rb1, rb2 = st.columns(2)
-                if rb1.button("Zurücksetzen", use_container_width=True, key="mm_pts_reset"):
+                if rb1.button("Zurücksetzen", width="stretch", key="mm_pts_reset"):
                     st.session_state.minimap_pts = []
                     st.session_state.minimap_next_pt_idx = 0
                     st.session_state["_mm_last_click"] = None
                     st.session_state["_mm_last_color_click"] = None
                     st.rerun()
-                if rb2.button("Letzten entfernen", use_container_width=True, key="mm_pts_undo"):
+                if rb2.button("Letzten entfernen", width="stretch", key="mm_pts_undo"):
                     if next_idx > 0:
                         st.session_state.minimap_pts = mm_pts[:next_idx-1]
                         st.session_state.minimap_next_pt_idx = next_idx-1
@@ -3390,7 +3708,7 @@ with tab_track:
              _has_valid_8_points(st.session_state.ref_track_pts) and
              _has_valid_8_points(st.session_state.minimap_pts))
     with cv1:
-        if can_cmp and st.button("> Vergleich",type="primary",use_container_width=True):
+        if can_cmp and st.button("> Vergleich",type="primary",width="stretch"):
             frame=_get_media_frame(st.session_state.t_current)
             if frame is not None:
                 crop=extract_minimap_crop(frame,track_roi,fw,fh)
@@ -3403,26 +3721,50 @@ with tab_track:
                 mp=detect_moving_point(crop,st.session_state.moving_pt_color_range)
                 if mp:
                     ref_pt = project_point_with_homography((mp["x"], mp["y"]), cmp.get("H"))
+                    progress_pct = _progress_on_centerline_percent(ref_pt)
                     st.session_state.moving_pt_history.append({
                         "t": st.session_state.t_current,
                         "x_minimap": mp["x"],
                         "y_minimap": mp["y"],
                         "x_ref": ref_pt[0] if ref_pt else None,
                         "y_ref": ref_pt[1] if ref_pt else None,
+                        "track_pos_pct": progress_pct,
                         "confidence": mp.get("confidence", 0.0),
                     })
                 set_status("Vergleich durchgefuehrt.","ok"); st.rerun()
+        if can_cmp and st.button("Vergleich 5 Zeiten", width="stretch", key="cmp_5_times_btn"):
+            rng = np.random.default_rng(12345)
+            lo, hi = float(st.session_state.t_start), float(st.session_state.t_end)
+            times = sorted(rng.uniform(lo, hi, size=5).tolist()) if hi > lo else [lo] * 5
+            results = []
+            for _t in times:
+                _frame = _get_media_frame(float(_t))
+                if _frame is None:
+                    continue
+                _crop = extract_minimap_crop(_frame, track_roi, fw, fh)
+                _cmp = compare_minimap_to_reference(_crop, st.session_state.ref_track_img, st.session_state.minimap_pts, st.session_state.ref_track_pts)
+                if _cmp.get("error"):
+                    continue
+                _mp = detect_moving_point(_crop, st.session_state.moving_pt_color_range)
+                _ref_pt = None
+                _progress_pct = None
+                if _mp:
+                    _ref_pt = project_point_with_homography((_mp["x"], _mp["y"]), _cmp.get("H"))
+                    _progress_pct = _progress_on_centerline_percent(_ref_pt)
+                _overlay = draw_comparison_overlay(_crop, st.session_state.ref_track_img, st.session_state.minimap_pts, st.session_state.ref_track_pts, _cmp, st.session_state.moving_pt_color_range)
+                results.append({"t": float(_t), "cmp": _cmp, "mp": _mp, "ref_pt": _ref_pt, "progress_pct": _progress_pct, "overlay": _overlay})
+            st.session_state.track_comparison_samples = results
+            set_status(f"Vergleich fuer {len(results)} Zeiten durchgefuehrt.", "ok")
+            st.rerun()
         cmp=st.session_state.track_comparison
         if cmp:
             if cmp.get("error"):
                 st.warning(cmp["error"])
-            m1,m2,m3=st.columns(3)
-            for col,val,lbl in [(m1,cmp["mean_dist_px"],"O px"),
-                                 (m2,cmp["max_dist_px"],"Max px"),
-                                 (m3,cmp["homography_err"],"H-Err")]:
-                col.markdown(f'<div class="metric-box"><div class="metric-val">'
-                             f'{val:.2f}</div><div class="metric-lbl">{lbl}</div></div>',
-                             unsafe_allow_html=True)
+            st.caption(
+                f"Qualitaet: Ø-Abstand={cmp.get('mean_dist_px', 0.0):.2f}px, "
+                f"Max-Abstand={cmp.get('max_dist_px', 0.0):.2f}px, "
+                f"Homographie-Fehler={cmp.get('homography_err', 0.0):.2f}px"
+            )
     with cv2_:
         cmp=st.session_state.track_comparison
         if cmp and has_ref and track_roi and has_vid:
@@ -3434,9 +3776,23 @@ with tab_track:
                     cmp,st.session_state.moving_pt_color_range)
                 st.image(overlay, width="stretch",
                          caption="Minimap (blau) vs. Referenz (gruen)")
+    _samples = st.session_state.get("track_comparison_samples") or []
+    if _samples:
+        st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
+        _cols = st.columns(len(_samples))
+        for _col, _res in zip(_cols, _samples):
+            _col.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
+            _c = _res.get("cmp", {})
+            _mp = _res.get("mp")
+            _pct = _res.get("progress_pct")
+            _pct_txt = f"{_pct:.1f}%" if _pct is not None else "n/a"
+            _col.caption(
+                f"Ø={_c.get('mean_dist_px', 0.0):.1f}px | Max={_c.get('max_dist_px', 0.0):.1f}px | "
+                f"Pt={'ja' if _mp else 'nein'} | Pos={_pct_txt}"
+            )
     st.markdown('</div>',unsafe_allow_html=True)
 
-    if st.session_state.moving_pt_history:
+    if False and st.session_state.moving_pt_history:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
         st.markdown('<div class="section-title">Verlauf bewegender Punkt</div>',
                     unsafe_allow_html=True)
