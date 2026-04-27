@@ -1827,6 +1827,177 @@ def _h5_column_values(table_group, names: tuple[str, ...], n_hint: int = 0) -> l
         return [val]
 
 
+
+
+def _h5_decode_cell_dataset_to_list(ds, f=None) -> list:
+    """Decode a MATLAB v7.3 cell dataset to a flat Python list."""
+    try:
+        arr = np.asarray(ds[()])
+        if arr.dtype != object:
+            return []
+        out = []
+        for item in arr.ravel().tolist():
+            out.append(_h5_decode_value(item, f or getattr(ds, "file", None)))
+        return out
+    except Exception:
+        return []
+
+
+def _h5_collect_mcos_reference_values(f) -> list:
+    """Return decoded MCOS reference payloads used by MATLAB v7.3 table/categorical objects."""
+    vals = []
+    try:
+        mcos = _h5_get_path_ci(f, ["#subsystem#", "MCOS"])
+        if mcos is None:
+            return vals
+        arr = np.asarray(mcos[()]).ravel().tolist()
+        for ref in arr:
+            try:
+                vals.append(_h5_decode_value(ref, f))
+            except Exception:
+                vals.append(None)
+    except Exception:
+        pass
+    return vals
+
+
+def _looks_like_roi_name_catalog(vals: list[str]) -> bool:
+    low = {str(v).strip().lower() for v in vals}
+    return "track_minimap" in low and ("t_s" in low or "v_fzg_kmph" in low)
+
+
+def _looks_like_fmt_catalog(vals: list[str]) -> bool:
+    low = {str(v).strip().lower() for v in vals}
+    return "any" in low and ("integer" in low or "float" in low or "time_m:ss" in low)
+
+
+def _h5_mcos_table_categorical_columns(f) -> dict:
+    """
+    Best-effort decoder for MATLAB v7.3 table variables saved as MCOS objects.
+    This is intentionally used as supplemental metadata: it recovers categorical
+    name_roi/fmt columns when recordResult.ocr.roi_table itself is a MATLAB table
+    dataset instead of a navigable HDF5 group.
+    """
+    out = {"names": [], "fmts": []}
+    vals = _h5_collect_mcos_reference_values(f)
+    if not vals:
+        return out
+
+    catalogs = []
+    code_arrays = []
+    for idx, val in enumerate(vals):
+        if isinstance(val, list) and val and all(isinstance(x, str) for x in val):
+            cleaned = [str(x).strip() for x in val if str(x).strip()]
+            if _looks_like_roi_name_catalog(cleaned) or _looks_like_fmt_catalog(cleaned):
+                catalogs.append((idx, cleaned))
+        else:
+            try:
+                arr = np.asarray(val)
+                if arr.size > 0 and arr.size <= 200 and arr.dtype.kind in ("u", "i"):
+                    flat = arr.astype(int).ravel()
+                    if np.all(flat >= 0):
+                        code_arrays.append((idx, flat.tolist()))
+            except Exception:
+                pass
+
+    roi_cats = next((c for _, c in catalogs if _looks_like_roi_name_catalog(c)), [])
+    fmt_cats = next((c for _, c in catalogs if _looks_like_fmt_catalog(c)), [])
+
+    def decode_codes(codes, cats, default=""):
+        decoded = []
+        for c in codes:
+            try:
+                ci = int(c)
+                decoded.append(cats[ci - 1] if 1 <= ci <= len(cats) else default)
+            except Exception:
+                decoded.append(default)
+        return decoded
+
+    selected_roi_codes = None
+    if roi_cats:
+        roi_candidates = []
+        for _, codes in code_arrays:
+            if 1 <= len(codes) <= 100 and max(codes or [0]) <= len(roi_cats):
+                dec = decode_codes(codes, roi_cats, "")
+                if any(str(x).strip().lower() in {"track_minimap", "t_s", "v_fzg_kmph"} for x in dec):
+                    roi_candidates.append((dec, list(codes)))
+        if roi_candidates:
+            # Prefer the column that includes track_minimap and has no blanks.
+            roi_candidates.sort(key=lambda item: ("track_minimap" not in [str(x).lower() for x in item[0]], item[0].count(""), len(item[0])))
+            out["names"] = roi_candidates[0][0]
+            selected_roi_codes = roi_candidates[0][1]
+
+    if fmt_cats:
+        target_len = len(out.get("names") or [])
+        fmt_candidates = []
+        for _, codes in code_arrays:
+            if 1 <= len(codes) <= 100 and max(codes or [0]) <= len(fmt_cats):
+                if target_len and len(codes) != target_len:
+                    continue
+                # Important: MATLAB v7.3 table/categorical data can expose several
+                # MCOS code arrays. The name_roi codes also decode to valid-looking
+                # format strings when applied to the fmt category catalog
+                # (e.g. t_s -> time_m:ss). Do not reuse the code vector that was
+                # already identified as the ROI-name categorical column.
+                if selected_roi_codes is not None and list(codes) == selected_roi_codes:
+                    continue
+                dec = decode_codes(codes, fmt_cats, "any")
+                if any(str(x).strip().lower() in {"any", "integer", "float"} or str(x).startswith("time_") or str(x).startswith("int_") for x in dec):
+                    fmt_candidates.append((dec, list(codes)))
+        if fmt_candidates:
+            # Prefer mixed/specific OCR formats over accidental low-index category
+            # vectors; the real fmt vector often contains int_* / time_mm / any.
+            def score(item):
+                xs = item[0]
+                specific = sum(1 for x in xs if str(x).startswith("int_") or str(x).startswith("time_mm") or str(x).startswith("time_hh"))
+                useful = sum(1 for x in xs if str(x).startswith("time_") or str(x).startswith("int_") or str(x) in ("any", "integer", "float", "alnum"))
+                return (-specific, -useful, xs.count("any"), len(xs))
+            fmt_candidates.sort(key=score)
+            out["fmts"] = fmt_candidates[0][0]
+
+    return out
+
+
+def _extract_roi_format_map_from_recordresult_hdf5(mat_path: str) -> dict[str, str]:
+    """Recover ROI format values from a v7.3 MATLAB table/categorical roi_table."""
+    try:
+        import h5py
+        with h5py.File(mat_path, "r") as f:
+            tbl = _h5_get_path_ci(f, ["recordResult", "ocr", "roi_table"])
+            if tbl is None:
+                return {}
+            names = _h5_column_values(tbl, ("name_roi", "name", "Name"))
+            fmts = _h5_column_values(tbl, ("fmt", "format", "Format"))
+            if not names or not fmts:
+                recovered = _h5_mcos_table_categorical_columns(f)
+                names = names or recovered.get("names") or []
+                fmts = fmts or recovered.get("fmts") or []
+            out = {}
+            for i, nm in enumerate(names):
+                name = _mat_to_text(nm, "").strip()
+                if not name:
+                    continue
+                fmt = _normalize_roi_format(fmts[i] if i < len(fmts) else "any")
+                out[name] = fmt or "any"
+            return out
+    except Exception:
+        return {}
+
+
+def _apply_roi_format_map(rois: list[dict], fmt_map: dict[str, str]) -> list[dict]:
+    if not rois or not fmt_map:
+        return rois
+    out = []
+    for r in rois:
+        nr = dict(r)
+        nm = str(nr.get("name", "")).strip()
+        if nm in fmt_map:
+            nr["fmt"] = _normalize_roi_format(fmt_map.get(nm) or "any")
+        elif not nr.get("fmt"):
+            nr["fmt"] = "any"
+        out.append(nr)
+    return out
+
 def _extract_rois_from_recordresult_hdf5(mat_path: str) -> list[dict]:
     try:
         import h5py
@@ -1837,6 +2008,10 @@ def _extract_rois_from_recordresult_hdf5(mat_path: str) -> list[dict]:
             names = _h5_column_values(tbl, ("name_roi", "name", "Name"))
             rois = _h5_column_values(tbl, ("roi", "ROI"))
             fmts = _h5_column_values(tbl, ("fmt", "format", "Format"))
+            if (not names) or (not fmts):
+                recovered = _h5_mcos_table_categorical_columns(f)
+                names = names or recovered.get("names") or []
+                fmts = fmts or recovered.get("fmts") or []
             n = max(len(names), len(rois), len(fmts))
             out = []
             for i in range(n):
@@ -2862,7 +3037,10 @@ def _load_mat_from_r2(remote_key):
         st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
         st.session_state.t_current = float(st.session_state.t_start)
         direct_rois = _extract_rois_from_recordresult_mat(tmp.name)
-        st.session_state.rois = _sanitize_rois(direct_rois or cfg.get("rois", st.session_state.rois))
+        use_rois = direct_rois or cfg.get("rois", st.session_state.rois)
+        if not direct_rois:
+            use_rois = _apply_roi_format_map(use_rois, _extract_roi_format_map_from_recordresult_hdf5(tmp.name))
+        st.session_state.rois = _sanitize_rois(use_rois)
         st.session_state.selected_roi = None
         st.session_state.roi_draw_armed = False
         st.session_state.drag_roi = {}
@@ -4453,7 +4631,7 @@ with tab_track:
         )
         try:
             if overlay is not None and overlay.shape == crop.shape:
-                return cv2.addWeighted(crop, 0.38, overlay, 0.62, 0)
+                return cv2.addWeighted(crop, 0.15, overlay, 0.85, 0)
         except Exception:
             pass
         return overlay
