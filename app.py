@@ -379,6 +379,7 @@ def init_state():
         mat_load_requested=False,
         mat_load_running=False,
         roi_save_running=False,
+        roi_ocr_probe_running=False,
         roi_saved_once=False,
         roi_scroll_top_once=False,
         tab_default=None,
@@ -459,6 +460,8 @@ def _render_blocking_overlay(text: str):
 
 if bool(st.session_state.get("roi_save_running", False)):
     _render_blocking_overlay("Speichern läuft ...")
+if bool(st.session_state.get("roi_ocr_probe_running", False)):
+    _render_blocking_overlay("OCR-Test ROI läuft ...")
 
 
 def _scroll_to_top_once(flag_key: str = "roi_scroll_top_once"):
@@ -1246,6 +1249,19 @@ def _sanitize_rois(rois):
         nr["max_scale"] = float(st.session_state.get("roi_global_scale", 1.2))
         out.append(nr)
     return out
+
+def _roi_ocr_probe_indices() -> list[int]:
+    return [
+        i for i, r in enumerate(st.session_state.get("rois", []) or [])
+        if str(r.get("name", "")).strip().lower() != "track_minimap"
+    ]
+
+
+def _roi_ocr_all_ok() -> bool:
+    rois = st.session_state.get("rois", []) or []
+    indices = _roi_ocr_probe_indices()
+    return bool(indices) and all(bool(rois[i].get("ocr_test_ok", False)) for i in indices)
+
 
 def build_result_json():
     return build_result_payload(
@@ -4768,67 +4784,76 @@ with tab_roi:
                     f"[{int(sr.get('x',0))},{int(sr.get('y',0))},{int(sr.get('w',0))},{int(sr.get('h',0))}]"
                 )
 
-            _ocr_probe_indices = [
-                _i for _i, _r in enumerate(st.session_state.rois)
-                if str(_r.get("name", "")).strip().lower() != "track_minimap"
-            ]
+            _ocr_probe_indices = _roi_ocr_probe_indices()
             _can_ocr_probe = frame is not None and bool(_ocr_probe_indices)
-            _all_ocr_probe_ok = bool(_ocr_probe_indices) and all(
-                bool(st.session_state.rois[_i].get("ocr_test_ok", False)) for _i in _ocr_probe_indices
-            )
+            _all_ocr_probe_ok = _roi_ocr_all_ok()
             if _all_ocr_probe_ok:
                 st.markdown('<style>.st-key-roi_ocr_probe_btn button{background:#3ddc84!important;border-color:#3ddc84!important;color:#07100b!important;box-shadow:0 0 14px rgba(61,220,132,.22)!important;}</style>', unsafe_allow_html=True)
+
+            if bool(st.session_state.get("roi_ocr_probe_running", False)):
+                st.session_state.tab_default = "ROI Setup"
+                _render_blocking_overlay("OCR-Test ROI läuft ...")
+                tess_cmd = find_tesseract_cmd()
+                if not tess_cmd:
+                    st.session_state.roi_ocr_probe_running = False
+                    st.session_state.roi_ocr_probe_result = None
+                    set_status("Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD.", "warn")
+                    st.rerun()
+                all_probe_results = []
+                for _idx in _ocr_probe_indices:
+                    probe_roi = {
+                        **st.session_state.rois[_idx],
+                        "max_scale": float(st.session_state.get("roi_global_scale", 1.2)),
+                    }
+                    probe = diagnose_roi_ocr(
+                        frame,
+                        probe_roi,
+                        (int(fw), int(fh)),
+                        tmp_root=LOG_DIR / "ocr_tmp",
+                    )
+                    _conf = float(probe.get("confidence", 0.0) or 0.0)
+                    _scale = probe.get("scale", "")
+                    _fr_up = probe.get("frUp", probe.get("fr_up", probe.get("variant", "")))
+                    _details = (
+                        f"raw={probe.get('raw', '')}; "
+                        f"conf={_conf:.2f}; "
+                        f"scale={_scale}; "
+                        f"frUp={_fr_up}"
+                    )
+                    st.session_state.rois[_idx] = {
+                        **st.session_state.rois[_idx],
+                        "ocr_test_ok": bool(probe.get("ok")),
+                        "ocr_test_value": probe.get("value", ""),
+                        "ocr_test_raw": probe.get("raw", ""),
+                        "ocr_test_confidence": _conf,
+                        "ocr_test_scale": _scale,
+                        "ocr_test_frUp": _fr_up,
+                        "ocr_test_error": probe.get("error", ""),
+                        "ocr_test_details": _details,
+                    }
+                    all_probe_results.append({
+                        "idx": _idx,
+                        "name": st.session_state.rois[_idx].get("name", ""),
+                        **probe,
+                    })
+                st.session_state.roi_ocr_probe_result = all_probe_results
+                st.session_state.roi_editor_df = None
+                st.session_state.roi_ocr_probe_running = False
+                st.session_state.tab_default = "ROI Setup"
+                st.rerun()
+
             if st.button(
                 "OCR-Test ROI",
                 width="stretch",
                 key="roi_ocr_probe_btn",
-                disabled=not _can_ocr_probe,
+                disabled=(not _can_ocr_probe) or bool(st.session_state.get("roi_ocr_probe_running", False)),
                 help="Testet alle ROIs außer track_minimap.",
             ):
-                tess_cmd = find_tesseract_cmd()
-                if not tess_cmd:
-                    st.error("Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD.")
-                else:
-                    all_probe_results = []
-                    for _idx in _ocr_probe_indices:
-                        probe_roi = {
-                            **st.session_state.rois[_idx],
-                            "max_scale": float(st.session_state.get("roi_global_scale", 1.2)),
-                        }
-                        probe = diagnose_roi_ocr(
-                            frame,
-                            probe_roi,
-                            (int(fw), int(fh)),
-                            tmp_root=LOG_DIR / "ocr_tmp",
-                        )
-                        _conf = float(probe.get("confidence", 0.0) or 0.0)
-                        _scale = probe.get("scale", "")
-                        _fr_up = probe.get("frUp", probe.get("fr_up", probe.get("variant", "")))
-                        _details = (
-                            f"raw={probe.get('raw', '')}; "
-                            f"conf={_conf:.2f}; "
-                            f"scale={_scale}; "
-                            f"frUp={_fr_up}"
-                        )
-                        st.session_state.rois[_idx] = {
-                            **st.session_state.rois[_idx],
-                            "ocr_test_ok": bool(probe.get("ok")),
-                            "ocr_test_value": probe.get("value", ""),
-                            "ocr_test_raw": probe.get("raw", ""),
-                            "ocr_test_confidence": _conf,
-                            "ocr_test_scale": _scale,
-                            "ocr_test_frUp": _fr_up,
-                            "ocr_test_error": probe.get("error", ""),
-                            "ocr_test_details": _details,
-                        }
-                        all_probe_results.append({
-                            "idx": _idx,
-                            "name": st.session_state.rois[_idx].get("name", ""),
-                            **probe,
-                        })
-                    st.session_state.roi_ocr_probe_result = all_probe_results
-                    st.session_state.roi_editor_df = None
-                    st.rerun()
+                for _idx in _ocr_probe_indices:
+                    st.session_state.rois[_idx]["ocr_test_ok"] = False
+                st.session_state.roi_ocr_probe_running = True
+                st.session_state.tab_default = "ROI Setup"
+                st.rerun()
 
             if st.button("Ausgew\u00e4hlte ROI l\u00f6schen", width="stretch",
                          key="roi_del_btn", disabled=act_sel is None):
@@ -5196,6 +5221,8 @@ with tab_track:
     st.markdown('<div class="roi-theme-card"><div class="theme-title">Speicherung</div><div class="theme-text">Speichert die aktuelle ROI-, Zeit- und Track-Konfiguration gemeinsam als JSON und MAT.</div></div>', unsafe_allow_html=True)
     _has_any_roi = len(st.session_state.get("rois") or []) > 0
     _save_busy = bool(st.session_state.get("roi_save_running", False))
+    _ocr_probe_busy = bool(st.session_state.get("roi_ocr_probe_running", False))
+    _ocr_ready_to_save = _roi_ocr_all_ok()
 
     if _save_busy:
         st.session_state.tab_default = "ROI Setup"
@@ -5208,12 +5235,12 @@ with tab_track:
         set_status(msg_save, "ok" if ok_save else "warn")
         st.rerun()
 
-    if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn_bottom", disabled=(_save_busy or not _has_any_roi)):
+    if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn_bottom", disabled=(_save_busy or _ocr_probe_busy or not _has_any_roi or not _ocr_ready_to_save), help="Erst aktiv, wenn der OCR-Test ROI grün ist."):
         st.session_state.roi_save_running = True
         st.session_state.tab_default = "ROI Setup"
         st.rerun()
 
-    _next_disabled = _save_busy or (not bool(st.session_state.get("roi_saved_once", False)))
+    _next_disabled = _save_busy or _ocr_probe_busy or (not bool(st.session_state.get("roi_saved_once", False)))
     if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn_bottom", disabled=_next_disabled):
         ok_next, msg_next = _load_next_roi_setup_file()
         set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
