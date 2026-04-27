@@ -2941,11 +2941,11 @@ with tab_roi:
             edited_df = st.data_editor(
                 df_edit,
                 column_config={
-                    _sel_col: st.column_config.CheckboxColumn("", width="small"),
-                    "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width="medium"),
-                    "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width="medium"),
-                    "Pattern": st.column_config.TextColumn("Pattern", width="small"),
-                    "Scale": st.column_config.NumberColumn("Scale", min_value=0.1, step=0.1, width="small"),
+                    _sel_col: st.column_config.CheckboxColumn("", width=42),
+                    "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width=150),
+                    "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width=170),
+                    "Pattern": st.column_config.TextColumn("Pat.", width=56),
+                    "Scale": st.column_config.NumberColumn("Sc.", min_value=0.1, step=0.1, width=54),
                 },
                 num_rows="fixed",
                 use_container_width=True,
