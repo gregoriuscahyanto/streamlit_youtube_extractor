@@ -227,6 +227,10 @@ hr { border-color:#1e2535 !important; }
 }
 .loaded-mat-card b { color:#e8eaf0; font-weight:700; }
 .loaded-mat-card span { color:#4a90a4; }
+.track-samples-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:.8rem; }
+.track-sample-card { background:#0a0c10; border:1px solid #1e2535; border-radius:6px; padding:.55rem; }
+.track-progress-big { font-family:'JetBrains Mono',monospace; font-size:1.55rem; font-weight:800; color:#3ddc84; line-height:1.1; margin:.25rem 0 .1rem; }
+.track-metrics-small { font-family:'JetBrains Mono',monospace; font-size:.62rem; color:#8892a4; line-height:1.35; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1561,6 +1565,182 @@ def _extract_roi_names_formats_from_recordresult_hdf5(mat_path: str) -> list[dic
     return out
 
 
+
+def _h5_numeric_path(f, path: str):
+    try:
+        if path in f:
+            return np.asarray(f[path][()])
+    except Exception:
+        pass
+    return None
+
+
+def _h5_parse_roi_from_path(f, path: str) -> list[float] | None:
+    arr = _h5_numeric_path(f, path)
+    if arr is None:
+        return None
+    try:
+        vals = np.asarray(arr, dtype=float).ravel(order="F")
+        vals = vals[np.isfinite(vals)]
+        if vals.size >= 4 and vals[2] > 0 and vals[3] > 0:
+            return [float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3])]
+    except Exception:
+        pass
+    return None
+
+
+def _h5_pts_from_path(f, path: str) -> list[list[float]]:
+    arr = _h5_numeric_path(f, path)
+    if arr is None:
+        return []
+    try:
+        a = np.asarray(arr, dtype=float)
+        if a.size < 4:
+            return []
+        if a.ndim == 1:
+            a = a.reshape((-1, 2))
+        elif a.shape[0] == 2 and a.shape[1] != 2:
+            a = a.T
+        elif a.shape[1] != 2 and a.shape[0] != 2:
+            a = a.reshape((-1, 2))
+        pts = []
+        for x, y in a[:8, :2]:
+            if np.isfinite(x) and np.isfinite(y):
+                pts.append([float(x), float(y)])
+        return pts
+    except Exception:
+        return []
+
+
+def _h5_marker_to_color_range(f, marker_path: str) -> dict | None:
+    try:
+        mu = _h5_numeric_path(f, f"{marker_path}/hsv_mu")
+        sig = _h5_numeric_path(f, f"{marker_path}/hsv_sig")
+        if mu is None:
+            return None
+        class _MarkerShim:
+            pass
+        marker = _MarkerShim()
+        marker.hsv_mu = np.asarray(mu, dtype=float)
+        marker.hsv_sig = np.asarray(sig, dtype=float) if sig is not None else np.array([0.08, 0.20, 0.20], dtype=float)
+        return _marker_to_color_range(marker)
+    except Exception:
+        return None
+
+
+def _extract_track_cal_from_recordresult_hdf5(mat_path: str) -> dict:
+    """Load recordResult.ocr.trkCalSlim from MATLAB v7.3/HDF5 MAT files."""
+    out = {}
+    try:
+        import h5py
+        with h5py.File(mat_path, "r") as f:
+            base = "recordResult/ocr/trkCalSlim"
+            roi = _h5_parse_roi_from_path(f, f"{base}/roi")
+            if roi:
+                out["track_roi"] = roi
+            pts = _h5_pts_from_path(f, f"{base}/ptsMini")
+            if len(pts) >= 4:
+                out["minimap_pts"] = pts[:8]
+            cr = _h5_marker_to_color_range(f, f"{base}/marker")
+            if cr:
+                out["moving_pt_color_range"] = cr
+            track_name = ""
+            if "recordResult/ocr/track/trackName" in f:
+                track_name = _h5_decode_text_dataset(f["recordResult/ocr/track/trackName"])
+            if track_name:
+                out["track_name"] = track_name
+    except Exception:
+        pass
+    return out
+
+
+def _extract_track_name_from_recordresult_mat(mat_path: str) -> str:
+    try:
+        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        rr = _mat_scalar(data.get("recordResult"))
+        ocr = _mat_obj_get(rr, "ocr")
+        track = _mat_obj_get(ocr, "track")
+        return _mat_to_text(_mat_obj_get(track, "trackName"), "")
+    except NotImplementedError:
+        try:
+            return _extract_track_cal_from_recordresult_hdf5(mat_path).get("track_name", "")
+        except Exception:
+            return ""
+    except Exception:
+        return ""
+
+
+def _track_reference_keywords(track_name: str) -> list[str]:
+    txt = str(track_name or "").strip().lower()
+    keys = []
+    if "nordschleife" in txt or "nürburgring" in txt or "nurburgring" in txt:
+        keys.extend(["nordschleife", "nuerburgring", "nürburgring", "nurburgring"])
+    for part in txt.replace("_", " ").replace("-", " ").split():
+        if len(part) >= 5:
+            keys.append(part)
+    # Keep order, remove duplicates.
+    out = []
+    for k in keys:
+        if k and k not in out:
+            out.append(k)
+    return out or ["nordschleife"]
+
+
+def _auto_load_reference_track_for_name(track_name: str) -> bool:
+    """Auto-load the matching reference track; comparison still remains user-triggered."""
+    keys = _track_reference_keywords(track_name)
+    preferred_exact = "nordschleife_2024_08_12_slim.mat"
+
+    def score_name(name: str) -> tuple[int, str]:
+        low = Path(str(name)).name.lower()
+        hit = any(k in low for k in keys)
+        if not hit:
+            return (999, low)
+        exact = 0 if low == preferred_exact else 1
+        slim = 0 if low.endswith("_slim.mat") or "slim" in low else 1
+        return (exact, slim, low)
+
+    # Cloud reference folder first.
+    if st.session_state.r2_connected and st.session_state.r2_client is not None:
+        pfx = st.session_state.r2_prefix.strip("/")
+        ref_dir = (pfx + "/reference_track_siesmann").strip("/") if pfx else "reference_track_siesmann"
+        try:
+            ok_ls, items = st.session_state.r2_client.list_files(ref_dir)
+            if ok_ls and isinstance(items, list):
+                cands = [x for x in items if str(x).lower().endswith(".mat") and any(k in Path(str(x)).name.lower() for k in keys)]
+                if cands:
+                    sel = sorted(cands, key=score_name)[0]
+                    _load_centerline_from_r2(f"{ref_dir}/{sel}", Path(str(sel)).name)
+                    return st.session_state.ref_track_img is not None
+        except Exception:
+            pass
+
+    # Local/project-folder fallback for desktop/local runs.
+    try:
+        search_roots = [Path.cwd(), Path.cwd() / "reference_track_siesmann", Path("/mnt/data")]
+        seen = set()
+        cands = []
+        for root in search_roots:
+            try:
+                root = root.resolve()
+            except Exception:
+                continue
+            if root in seen or not root.exists():
+                continue
+            seen.add(root)
+            iterator = root.rglob("*.mat") if root.is_dir() else []
+            for fp in iterator:
+                low = fp.name.lower()
+                if any(k in low for k in keys):
+                    cands.append(fp)
+        if cands:
+            sel = sorted(cands, key=lambda x: score_name(x.name))[0]
+            _apply_centerline_to_session(str(sel), sel.name)
+            return st.session_state.ref_track_img is not None
+    except Exception:
+        pass
+    return False
+
 def _merge_roi_metadata(rois: list[dict], meta_rows: list[dict]) -> list[dict]:
     """Apply MAT table name/fmt metadata to ROI rows without changing geometry."""
     if not rois or not meta_rows:
@@ -1764,26 +1944,31 @@ def _marker_to_color_range(marker) -> dict | None:
 
 
 def _extract_track_cal_from_recordresult_mat(mat_path: str) -> dict:
-    """Load recordResult.ocr.trkCalSlim: ROI, 8 minimap points and marker color."""
+    """Load recordResult.ocr.trkCalSlim: ROI, 8 minimap points, marker color and track name."""
     out = {}
     try:
         data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
         rr = _mat_scalar(data.get("recordResult"))
         ocr = _mat_obj_get(rr, "ocr")
         trk = _mat_obj_get(ocr, "trkCalSlim")
-        if trk is None:
-            return out
-        roi = _parse_roi_value(_mat_obj_get(trk, "roi"))
-        if roi and len(roi) >= 4 and roi[2] > 0 and roi[3] > 0:
-            out["track_roi"] = [float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])]
-        pts = _pts_from_mat_value(_mat_obj_get(trk, "ptsMini"))
-        if len(pts) >= 4:
-            out["minimap_pts"] = pts[:8]
-        cr = _marker_to_color_range(_mat_obj_get(trk, "marker"))
-        if cr:
-            out["moving_pt_color_range"] = cr
+        if trk is not None:
+            roi = _parse_roi_value(_mat_obj_get(trk, "roi"))
+            if roi and len(roi) >= 4 and roi[2] > 0 and roi[3] > 0:
+                out["track_roi"] = [float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])]
+            pts = _pts_from_mat_value(_mat_obj_get(trk, "ptsMini"))
+            if len(pts) >= 4:
+                out["minimap_pts"] = pts[:8]
+            cr = _marker_to_color_range(_mat_obj_get(trk, "marker"))
+            if cr:
+                out["moving_pt_color_range"] = cr
+        track_name = _extract_track_name_from_recordresult_mat(mat_path)
+        if track_name:
+            out["track_name"] = track_name
+    except NotImplementedError:
+        out.update(_extract_track_cal_from_recordresult_hdf5(mat_path))
     except Exception:
-        pass
+        # v7.3 MAT files also land here in some scipy versions.
+        out.update(_extract_track_cal_from_recordresult_hdf5(mat_path))
     return out
 
 
@@ -2535,6 +2720,7 @@ def _load_mat_from_r2(remote_key):
         st.session_state.roi_anchor_box = {}
         st.session_state.roi_reject_anchor_events = 0
         st.session_state.roi_editor_df = None
+        st.session_state.track_comparison_samples = []
         if cfg.get("ref_track_pts"):
             st.session_state.ref_track_pts = cfg["ref_track_pts"]
         if cfg.get("minimap_pts"):
@@ -2548,6 +2734,8 @@ def _load_mat_from_r2(remote_key):
         if track_cfg.get("moving_pt_color_range"):
             st.session_state.moving_pt_color_range = track_cfg["moving_pt_color_range"]
             st.session_state.moving_pt_color_calibrated = True
+        if track_cfg.get("track_name") and st.session_state.ref_track_img is None:
+            _auto_load_reference_track_for_name(track_cfg.get("track_name", ""))
         set_status("MAT geladen OK","ok")
         return tmp.name
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
@@ -4200,33 +4388,40 @@ with tab_track:
             pass
         return overlay
 
-    st.markdown('<div class="section-card">',unsafe_allow_html=True)
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Vergleich | Ueberlagerung | Bewegende Punkte</div>',
                 unsafe_allow_html=True)
-    cv1, cv2_ = st.columns([1, 3], gap="medium")
 
-    with cv1:
-        if not can_cmp_controls:
-            st.caption("Benötigt: 8 Minimap-Punkte und Farberkennung.")
-        elif not (has_ref and track_roi and has_vid and _has_valid_8_points(st.session_state.ref_track_pts)):
-            st.caption("Für den Vergleich zusätzlich nötig: Referenztrack, Video und track_minimap ROI.")
+    if not can_cmp_controls:
+        st.caption("Benötigt: 8 Minimap-Punkte und Farberkennung.")
+    elif not (has_ref and track_roi and has_vid and _has_valid_8_points(st.session_state.ref_track_pts)):
+        st.caption("Für den Vergleich zusätzlich nötig: Referenztrack, Video und track_minimap ROI.")
 
-    with cv2_:
-        _samples = st.session_state.get("track_comparison_samples") or []
-        if _samples:
-            st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
-            _cols = st.columns(len(_samples))
-            for _col, _res in zip(_cols, _samples):
-                _col.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
-                _c = _res.get("cmp", {})
-                _mp = _res.get("mp")
-                _progress = _res.get("progress_pct")
-                _pos_txt = f"Pos={_progress:.1f}%" if _progress is not None else "Pos=n/a"
-                _col.caption(
-                    f"Ø={_c.get('mean_dist_px', 0.0):.1f}px | Max={_c.get('max_dist_px', 0.0):.1f}px | "
-                    f"Pt={'ja' if _mp else 'nein'} | {_pos_txt}"
-                )
-    st.markdown('</div>',unsafe_allow_html=True)
+    _samples = st.session_state.get("track_comparison_samples") or []
+    if _samples:
+        st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
+        st.markdown('<div class="track-samples-grid">', unsafe_allow_html=True)
+        for _i, _res in enumerate(_samples):
+            st.markdown('<div class="track-sample-card">', unsafe_allow_html=True)
+            st.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
+            _c = _res.get("cmp", {})
+            _mp = _res.get("mp")
+            _progress = _res.get("progress_pct")
+            _pos_txt = f"{_progress:.1f}%" if _progress is not None else "n/a"
+            st.markdown(
+                f"""
+                <div class="track-progress-big">Position: {_pos_txt}</div>
+                <div class="track-metrics-small">
+                  ø={_c.get('mean_dist_px', 0.0):.1f}px &nbsp;|&nbsp;
+                  max={_c.get('max_dist_px', 0.0):.1f}px &nbsp;|&nbsp;
+                  pt={'ja' if _mp else 'nein'}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
     if False and st.session_state.moving_pt_history:
         st.markdown('<div class="section-card">',unsafe_allow_html=True)
