@@ -3,7 +3,6 @@ OCR Extractor - Streamlit App v4
 Tab 1: Cloudflare R2-Verbindung, Prefix waehlen, Datei-Browser
 Tab 2: Video laden, Start/Ende, ROI-Auswahl
 Tab 3: Track-Minimap Analyse - 8-Punkte + Farberkennung
-Tab 4: Audio Auswertung - Python-Spektrogramm
 """
 
 import streamlit as st
@@ -387,8 +386,9 @@ def init_state():
         roi_delete_confirm_idx=None,
         roi_scroll_top_once=False,
         tab_default=None,
-        track_color_detection_done=False,
         audio_analysis_result=None,
+        audio_vehicle_title="",
+        audio_last_mat_path="",
         # Datei-Browser
         fb_path="", fb_items=[], fb_selected=None,
         # Aufnahme
@@ -1685,7 +1685,6 @@ def load_json_config(data):
         st.session_state.minimap_pts = cfg["minimap_pts"]
     if cfg.get("moving_pt_color_range"):
         st.session_state.moving_pt_color_range = cfg["moving_pt_color_range"]
-        st.session_state.track_color_detection_done = True
 
 def _apply_video(local_path, display_name):
     info = get_video_info(local_path)
@@ -1701,9 +1700,7 @@ def _apply_video(local_path, display_name):
         selected_roi=None, drag_roi={}, roi_draw_armed=False,
         roi_wait_user_move=False, roi_anchor_box={}, roi_reject_anchor_events=0,
         roi_editor_df=None,
-        roi_saved_once=False,
-        track_color_detection_done=False,
-        audio_analysis_result=None)
+        roi_saved_once=False)
     if not st.session_state.capture_folder:
         st.session_state.capture_folder = Path(display_name).stem
     get_frame.clear(); get_video_info.clear()
@@ -1776,8 +1773,6 @@ def _load_framepack_from_r2(capture_folder: str) -> bool:
         roi_reject_anchor_events=0,
         roi_editor_df=None,
         roi_saved_once=False,
-        track_color_detection_done=False,
-        audio_analysis_result=None,
     )
     set_status(f"Frame-Pack geladen: {capture_folder} ({len(frame_files)} Frames)", "ok")
     return True
@@ -3672,7 +3667,8 @@ def _load_mat_from_r2(remote_key):
             st.session_state.minimap_next_pt_idx = len(track_cfg["minimap_pts"])
         if track_cfg.get("moving_pt_color_range"):
             st.session_state.moving_pt_color_range = track_cfg["moving_pt_color_range"]
-            st.session_state.track_color_detection_done = True
+        st.session_state.audio_last_mat_path = tmp.name
+        st.session_state.audio_vehicle_title = _extract_vehicle_title_from_mat(tmp.name)
         _track_name = _extract_track_name_from_recordresult_mat(tmp.name)
         if _track_name:
             st.session_state["loaded_track_name"] = _track_name
@@ -3681,6 +3677,401 @@ def _load_mat_from_r2(remote_key):
         return tmp.name
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
     return None
+
+
+def _extract_vehicle_title_from_mat(mat_path: str) -> str:
+    """Best-effort display name from recordResult.metadata so vehicle/setup is visible in Audio tab."""
+    if not mat_path:
+        return ""
+    keys = (
+        "title", "titel", "vehicle", "vehicle_name", "fahrzeug", "car", "car_name",
+        "name", "display_name", "project", "description", "video", "audio"
+    )
+    try:
+        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        rr = _mat_scalar(data.get("recordResult"))
+        meta = _mat_obj_get(rr, "metadata")
+        vals = []
+        for k in keys:
+            txt = _mat_to_text(_mat_obj_get(meta, k), "")
+            if txt:
+                vals.append(txt)
+        for txt in vals:
+            if txt and Path(txt).suffix.lower() not in VIDEO_EXTS + AUDIO_EXTS:
+                return txt
+        if vals:
+            return Path(vals[0]).stem
+    except NotImplementedError:
+        try:
+            import h5py
+            with h5py.File(mat_path, "r") as f:
+                meta = _h5_get_path_ci(f, ["recordResult", "metadata"])
+                vals = []
+                for k in keys:
+                    obj = _h5_get_path_ci(meta, [k]) if meta is not None else None
+                    txts = _h5_to_text_list(obj) if obj is not None else []
+                    if txts:
+                        vals.append(str(txts[0]).strip())
+                for txt in vals:
+                    if txt and Path(txt).suffix.lower() not in VIDEO_EXTS + AUDIO_EXTS:
+                        return txt
+                if vals:
+                    return Path(vals[0]).stem
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        return Path(st.session_state.get("video_name") or st.session_state.get("capture_folder") or "").stem
+    except Exception:
+        return ""
+
+
+def _load_audio_for_current_capture() -> tuple[bool, str, int, np.ndarray, str]:
+    """Return ok, msg, sample_rate, mono_audio_float, source_label."""
+    folder = str(st.session_state.get("capture_folder") or "").strip()
+    candidates = []
+    if folder:
+        local_audio = _find_local_audio_file(folder)
+        if local_audio is not None:
+            candidates.append(("local", str(local_audio)))
+    if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None and folder:
+        pfx = st.session_state.r2_prefix.strip("/")
+        key = f"{pfx}/captures/{folder}/{AUDIO_PROXY_NAME}" if pfx else f"captures/{folder}/{AUDIO_PROXY_NAME}"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp.close()
+        ok, msg = st.session_state.r2_client.download_file(key, tmp.name)
+        if ok:
+            candidates.append(("cloud", tmp.name))
+        else:
+            try:
+                Path(tmp.name).unlink(missing_ok=True)
+            except Exception:
+                pass
+    if not candidates:
+        return False, "Keine Audio-Datei gefunden (lokal oder audio_proxy_1k.wav in Cloud).", 0, np.array([], dtype=float), ""
+    last_err = ""
+    for label, path in candidates:
+        try:
+            sr, data = wavfile.read(path)
+            y = np.asarray(data, dtype=np.float32)
+            if y.ndim > 1:
+                y = np.mean(y, axis=1)
+            if np.issubdtype(data.dtype, np.integer):
+                denom = float(np.iinfo(data.dtype).max) or 1.0
+                y = y / denom
+            y = np.nan_to_num(np.asarray(y, dtype=np.float32).reshape(-1).copy())
+            return True, "", int(sr), y, f"{label}: {Path(path).name}"
+        except Exception as e:
+            last_err = str(e)
+    return False, f"Audio konnte nicht gelesen werden: {last_err}", 0, np.array([], dtype=float), ""
+
+
+def _moving_median_nan(x, k: int = 7) -> np.ndarray:
+    x = np.asarray(x, dtype=float).copy()
+    if k <= 1 or x.size < 3:
+        return x
+    k = int(k) | 1
+    pad = k // 2
+    out = x.copy()
+    for i in range(x.size):
+        lo, hi = max(0, i - pad), min(x.size, i + pad + 1)
+        vals = x[lo:hi]
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            out[i] = float(np.median(vals))
+    return out
+
+
+def _interp_nan(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float).copy()
+    idx = np.arange(x.size)
+    good = np.isfinite(x)
+    if good.sum() == 0:
+        return x
+    if good.sum() == 1:
+        x[~good] = x[good][0]
+        return x
+    x[~good] = np.interp(idx[~good], idx[good], x[good])
+    return x
+
+
+def _viterbi_frequency_path(score: np.ndarray, jump_penalty: float = 0.18, max_jump_bins: int = 35) -> np.ndarray:
+    """Find smooth high-energy path through score[freq_bin, time_bin]."""
+    sc = np.asarray(score, dtype=np.float64).copy()
+    if sc.ndim != 2 or sc.size == 0:
+        return np.array([], dtype=int)
+    nf, nt = sc.shape
+    sc = np.nan_to_num(sc, nan=np.nanmin(sc[np.isfinite(sc)]) if np.isfinite(sc).any() else 0.0)
+    # normalize per time so loud/quiet parts are comparable
+    med = np.median(sc, axis=0, keepdims=True)
+    mad = np.median(np.abs(sc - med), axis=0, keepdims=True) + 1e-9
+    scn = (sc - med) / mad
+    dp = np.full((nf, nt), -np.inf, dtype=np.float64)
+    prev = np.zeros((nf, nt), dtype=np.int32)
+    dp[:, 0] = scn[:, 0]
+    bins = np.arange(nf)
+    for t in range(1, nt):
+        for j in range(nf):
+            lo = max(0, j - max_jump_bins)
+            hi = min(nf, j + max_jump_bins + 1)
+            cand_bins = bins[lo:hi]
+            trans = dp[lo:hi, t-1] - jump_penalty * np.abs(cand_bins - j)
+            k = int(np.argmax(trans))
+            prev[j, t] = lo + k
+            dp[j, t] = scn[j, t] + trans[k]
+    path = np.zeros(nt, dtype=np.int32)
+    path[-1] = int(np.argmax(dp[:, -1]))
+    for t in range(nt - 1, 0, -1):
+        path[t-1] = prev[path[t], t]
+    return path
+
+
+def _extract_ocr_series_from_mat(mat_path: str) -> dict:
+    """Load OCR time/v/gear columns if present. Empty dict if unavailable."""
+    out = {}
+    if not mat_path:
+        return out
+    try:
+        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        rr = _mat_scalar(data.get("recordResult"))
+        ocr = _mat_obj_get(rr, "ocr")
+        tbl = _mat_obj_get(ocr, "cleaned")
+        if tbl is None:
+            tbl = _mat_obj_get(ocr, "table")
+        if tbl is None:
+            return out
+        t = _mat_numeric_vector(_mat_table_column(tbl, "time_s", "t_s", "time"))
+        v = _mat_numeric_vector(_mat_table_column(tbl, "v_Fzg_kmph", "v_kmph", "speed_kmph"))
+        gear = _mat_numeric_vector(_mat_table_column(tbl, "numgear_GET", "gear"))
+        n = max(t.size, v.size, gear.size)
+        if t.size and v.size:
+            m = min(t.size, v.size)
+            out["t"] = t[:m]
+            out["v"] = v[:m]
+        if t.size and gear.size:
+            m = min(t.size, gear.size)
+            out["gear_t"] = t[:m]
+            out["gear"] = gear[:m]
+    except Exception:
+        pass
+    return out
+
+
+def _run_robust_audio_rpm_analysis(
+    y: np.ndarray,
+    fs: int,
+    start_s: float,
+    end_s: float,
+    audio_offset_s: float,
+    nfft: int,
+    overlap_pct: float,
+    fmax: float,
+    cyl: int,
+    takt: int,
+    order: float,
+    rpm_min: float,
+    rpm_max: float,
+    method: str = "Auto robust",
+    debug_cb=None,
+    progress_cb=None,
+) -> dict:
+    """Robust frequency/RPM pipeline for noisy engine audio.
+
+    The analysis is always limited to video start/end. The audio time that corresponds
+    to video time t is t + audio_offset_s; displayed spectrogram time is shifted back
+    to video time so overlays align with OCR/video.
+    """
+    t_total0 = time.time()
+    def _dbg(message: str, progress: float | None = None):
+        elapsed = time.time() - t_total0
+        text = f"[{elapsed:6.1f}s] {message}"
+        if callable(debug_cb):
+            try:
+                debug_cb(text)
+            except Exception:
+                pass
+        if progress is not None and callable(progress_cb):
+            try:
+                progress_cb(float(max(0.0, min(1.0, progress))), message)
+            except Exception:
+                pass
+
+    _dbg("Audioanalyse initialisiert", 0.02)
+    y = np.asarray(y, dtype=np.float32).reshape(-1).copy()
+    if y.size == 0 or fs <= 0:
+        raise ValueError("Kein Audio geladen.")
+    _dbg(f"Audio im Speicher: {y.size:,} Samples @ {fs} Hz ({y.size / max(fs,1):.1f}s)", 0.04)
+    start_s = float(max(0.0, start_s))
+    end_s = float(max(start_s + 0.05, end_s))
+    a0 = max(0, int(round((start_s + float(audio_offset_s)) * fs)))
+    a1 = min(y.size, int(round((end_s + float(audio_offset_s)) * fs)))
+    if a1 <= a0 + max(32, int(0.1 * fs)):
+        raise ValueError("Audiosegment ist leer. Bitte Start/Ende oder Audio Offset pruefen.")
+    seg = y[a0:a1].astype(np.float32, copy=True)
+    seg = seg - np.float32(np.nanmedian(seg))
+    peak = float(np.nanmax(np.abs(seg)) or 1.0)
+    if peak > 0:
+        seg = (seg / np.float32(peak)).astype(np.float32, copy=False)
+    _dbg(f"Segment geschnitten: Video {start_s:.2f}-{end_s:.2f}s, Audio-Index {a0:,}:{a1:,}, {seg.size:,} Samples", 0.08)
+
+    # Speicherbremse: fuer lange Segmente wird NFFT/Overlap automatisch reduziert.
+    # Sonst entstehen leicht Arrays im Bereich mehrerer 100 MB, z.B. 8192 x >6000.
+    requested_nfft = int(nfft)
+    nfft = int(max(256, min(requested_nfft, max(256, seg.size))))
+    overlap_pct = float(max(0.0, min(95.0, overlap_pct)))
+    est_cells_limit = 1_800_000
+    while nfft > 512:
+        hop_est = max(1, int(round(nfft * (1.0 - overlap_pct / 100.0))))
+        nt_est = max(1, int(np.ceil(max(1, seg.size - nfft) / hop_est)) + 1)
+        nf_est = nfft // 2 + 1
+        if nf_est * nt_est <= est_cells_limit:
+            break
+        nfft = int(nfft // 2)
+    noverlap = int(max(0, min(nfft - 1, round(nfft * overlap_pct / 100.0))))
+    hop_dbg = max(1, nfft - noverlap)
+    est_frames_dbg = max(1, int(np.ceil(max(1, seg.size - nfft) / hop_dbg)) + 1)
+    _dbg(f"STFT vorbereitet: NFFT effektiv {nfft} (angefragt {requested_nfft}), Overlap {noverlap}/{nfft}, erwartete Frames ~{est_frames_dbg:,}", 0.13)
+
+    # mode='magnitude' vermeidet ein grosses komplexes STFT-Zwischenarray.
+    _dbg("Berechne Spektrogramm (scipy.signal.spectrogram) ...", 0.18)
+    freqs, tt, mag = signal.spectrogram(
+        seg, fs=fs, window='hann', nperseg=nfft, noverlap=noverlap, nfft=nfft,
+        detrend=False, scaling='spectrum', mode='magnitude'
+    )
+    mag = np.asarray(mag, dtype=np.float32)
+    _dbg(f"Spektrogramm fertig: Matrix {mag.shape[0]:,} x {mag.shape[1]:,} ({mag.size * mag.itemsize / 1024 / 1024:.1f} MiB)", 0.35)
+    t_video = tt.astype(np.float32, copy=False) + np.float32(a0 / float(fs) - float(audio_offset_s))
+    fmax = float(max(20.0, min(float(fmax), fs / 2.0)))
+    keep = freqs <= fmax
+    freqs = np.asarray(freqs[keep], dtype=np.float32).copy()
+    mag = mag[keep, :].copy()
+    db = (20.0 * np.log10(np.maximum(mag, np.float32(1e-12)))).astype(np.float32, copy=False)
+
+    cyl = max(1, int(cyl))
+    takt = max(1, int(takt))
+    order = max(0.1, float(order))
+    # firing-event factor: 4-stroke cyl/2, 2-stroke cyl. Generalized = 2*cyl/takt.
+    engine_factor = max(0.1, (2.0 * float(cyl) / float(takt)))
+    f_lo = max(5.0, float(rpm_min) / 60.0 * engine_factor * order)
+    f_hi = min(fmax, float(rpm_max) / 60.0 * engine_factor * order)
+    if f_hi <= f_lo:
+        f_lo, f_hi = max(5.0, min(freqs[-1], 30.0)), min(fmax, max(60.0, freqs[-1]))
+    pad = max(20.0, 0.20 * (f_hi - f_lo))
+    band_mask = (freqs >= max(0.0, f_lo - pad)) & (freqs <= min(fmax, f_hi + pad))
+    if not band_mask.any():
+        band_mask = freqs > 0
+    fb = freqs[band_mask].copy()
+    Sb = db[band_mask, :].copy()
+    Mb = mag[band_mask, :].copy()
+    if fb.size < 3 or Sb.shape[1] < 1:
+        raise ValueError("Zu wenig Spektrogramm-Daten im Suchband.")
+    _dbg(f"Suchband: {float(fb[0]):.1f}-{float(fb[-1]):.1f} Hz, Bandmatrix {Sb.shape[0]:,} x {Sb.shape[1]:,}", 0.42)
+
+    lines = {}
+    # Original peak in physically plausible band
+    _dbg("Methode Original Peak: Maximalenergie pro Zeitspalte ...", 0.45)
+    idx_peak = np.argmax(Sb, axis=0)
+    lines["Original Peak"] = fb[idx_peak]
+
+    # Ridge: smooth Viterbi path through power image
+    _dbg("Methode Ridge Tracking: zusammenhängende Spektrogramm-Linie per Viterbi ...", 0.50)
+    max_jump_hz = max(20.0, (f_hi - f_lo) * 0.16)
+    df = float(np.nanmedian(np.diff(fb))) if fb.size > 1 else 1.0
+    max_jump_bins = int(max(2, min(fb.size - 1, round(max_jump_hz / max(df, 1e-9)))))
+    path = _viterbi_frequency_path(Sb, jump_penalty=0.20, max_jump_bins=max_jump_bins)
+    lines["Ridge Tracking"] = fb[path] if path.size else lines["Original Peak"].copy()
+    _dbg("Ridge Tracking fertig", 0.58)
+
+    # Order tracking: score RPM candidates by multiple harmonics of the expected firing/order line.
+    _dbg("Methode Order Tracking: harmonische Motorordnungen bewerten ...", 0.60)
+    # 700 Kandidaten war bei langen Dateien zu langsam. 260 reicht interaktiv gut aus;
+    # die finale Linie wird danach geglättet.
+    rpm_grid = np.linspace(max(100.0, rpm_min), max(rpm_min + 100.0, rpm_max), 260)
+    f_grid_base = rpm_grid / 60.0 * engine_factor * order
+    harmonics = [1, 2, 3, 4]
+    score = np.zeros((rpm_grid.size, db.shape[1]), dtype=np.float32)
+    for hi, h in enumerate(harmonics):
+        fg = f_grid_base * h
+        valid = fg <= fmax
+        if not np.any(valid):
+            continue
+        _dbg(f"Order Tracking: Harmonik {h}/{harmonics[-1]} mit {int(np.sum(valid))} RPM-Kandidaten", 0.61 + 0.03 * hi)
+        for ti in range(db.shape[1]):
+            score[valid, ti] += np.interp(fg[valid], freqs, db[:, ti], left=np.nanmin(db[:, ti]), right=np.nanmin(db[:, ti])) / float(h)
+    if np.isfinite(score).any():
+        _dbg("Order Tracking: glätte optimalen RPM-Pfad ...", 0.75)
+        rpath = _viterbi_frequency_path(score, jump_penalty=0.10, max_jump_bins=max(3, int(rpm_grid.size * 0.04)))
+        rpm_order = rpm_grid[rpath] if rpath.size else rpm_grid[np.argmax(score, axis=0)]
+        lines["Order Tracking"] = rpm_order / 60.0 * engine_factor * order
+    else:
+        lines["Order Tracking"] = lines["Ridge Tracking"].copy()
+    _dbg("Order Tracking fertig", 0.79)
+
+    # Cepstrum per STFT frame: periodicity in event-frequency range.
+    _dbg("Methode Cepstrum: Periodizität je Zeitfenster suchen ...", 0.80)
+    cep_freq = np.full(db.shape[1], np.nan, dtype=float)
+    hop = max(1, nfft - noverlap)
+    q_lo = 1.0 / max(f_hi + pad, 1e-6)
+    q_hi = 1.0 / max(f_lo - pad, 1e-6) if (f_lo - pad) > 1 else 1.0 / max(f_lo, 1e-6)
+    q_hi = min(q_hi, 0.25)
+    # Cepstrum ist teuer. Bei vielen Frames wird es auf jedem n-ten Frame berechnet
+    # und danach interpoliert. Dadurch bleibt die UI bedienbar.
+    cep_stride = int(max(1, np.ceil(db.shape[1] / 1800)))
+    hann_cache = np.hanning(nfft).astype(np.float32)
+    q = np.arange(nfft // 2 + 1) / float(fs)
+    qm = (q >= q_lo) & (q <= q_hi)
+    for count, ti in enumerate(range(0, db.shape[1], cep_stride)):
+        if count % 250 == 0:
+            _dbg(f"Cepstrum: Frame {ti:,}/{db.shape[1]:,} (Stride {cep_stride})", min(0.91, 0.80 + 0.10 * ti / max(1, db.shape[1])))
+        start = ti * hop
+        frame = seg[start:start + nfft]
+        if frame.size < nfft:
+            continue
+        frame = frame * hann_cache
+        spec = np.abs(np.fft.rfft(frame, n=nfft))
+        log_spec = np.log(spec + 1e-12)
+        cep = np.abs(np.fft.irfft(log_spec, n=nfft))[:q.size]
+        if qm.any():
+            qi = np.argmax(cep[qm])
+            qvals = q[qm]
+            if qvals[qi] > 0:
+                cep_freq[ti] = 1.0 / qvals[qi]
+    lines["Cepstrum"] = _moving_median_nan(_interp_nan(cep_freq), 9)
+    _dbg("Cepstrum fertig", 0.92)
+
+    # Auto robust: prefer order when it is close to ridge; otherwise blend with ridge.
+    _dbg("Auto robust: Methoden fusionieren und RPM glätten ...", 0.94)
+    ridge = np.asarray(lines["Ridge Tracking"], dtype=float)
+    order_line = np.asarray(lines["Order Tracking"], dtype=float)
+    cep = np.asarray(lines["Cepstrum"], dtype=float)
+    auto = ridge.copy()
+    for i in range(auto.size):
+        cands = [v for v in (ridge[i], order_line[i], cep[i]) if np.isfinite(v) and f_lo - pad <= v <= f_hi + pad]
+        if cands:
+            auto[i] = float(np.median(cands))
+    auto = _moving_median_nan(_interp_nan(auto), 11)
+    lines["Auto robust"] = auto
+
+    for k in list(lines.keys()):
+        lines[k] = _moving_median_nan(_interp_nan(np.asarray(lines[k], dtype=float)), 7)
+    selected = method if method in lines else "Auto robust"
+    f_sel = np.asarray(lines[selected], dtype=float)
+    rpm = f_sel * 60.0 / (engine_factor * order)
+    rpm[(rpm < rpm_min * 0.55) | (rpm > rpm_max * 1.45)] = np.nan
+    rpm = _moving_median_nan(_interp_nan(rpm), 9)
+    _dbg("Audioanalyse-Kern fertig", 0.98)
+
+    return dict(
+        fs=int(fs), t=t_video.copy(), freqs=freqs.copy(), db=db.copy(),
+        audio_t=np.arange(a0, a1) / float(fs) - float(audio_offset_s), audio_y=seg.copy(),
+        freq_lines=lines, selected_method=selected, selected_freq=f_sel.copy(), rpm=rpm.copy(),
+        params=dict(start_s=start_s, end_s=end_s, audio_offset_s=float(audio_offset_s), nfft=nfft,
+                    overlap_pct=float(overlap_pct), fmax=float(fmax), cyl=int(cyl), takt=int(takt),
+                    order=float(order), rpm_min=float(rpm_min), rpm_max=float(rpm_max),
+                    engine_factor=float(engine_factor), f_search_lo=float(f_lo), f_search_hi=float(f_hi)),
+    )
+
 
 def _apply_centerline_to_session(mat_path: str, mat_name: str) -> None:
     """Parse .mat → centerline → render image + auto-set fixed ref points."""
@@ -3742,133 +4133,6 @@ def _load_centerline_from_r2(remote_key: str, mat_name: str) -> None:
 
 _try_auto_connect_once()
 _try_auto_connect_local_once()
-
-
-def _download_current_audio_to_temp() -> tuple[bool, str, str]:
-    folder = str(st.session_state.get("capture_folder") or "").strip()
-    if folder and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
-        pfx = st.session_state.r2_prefix.strip("/")
-        cap_dir = f"{pfx}/captures/{folder}" if pfx else f"captures/{folder}"
-        ok_ls, items = st.session_state.r2_client.list_files(cap_dir)
-        if ok_ls and isinstance(items, list):
-            names = [str(x) for x in items if not str(x).endswith("/")]
-            candidates = []
-            if AUDIO_PROXY_NAME in names:
-                candidates.append(AUDIO_PROXY_NAME)
-            candidates += [n for n in names if n.lower().endswith(AUDIO_EXTS) and n != AUDIO_PROXY_NAME]
-            if candidates:
-                name = candidates[0]
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(name).suffix or ".wav")
-                tmp.close()
-                ok_dl, msg_dl = st.session_state.r2_client.download_file(f"{cap_dir}/{name}", tmp.name)
-                if ok_dl:
-                    return True, tmp.name, f"R2: {cap_dir}/{name}"
-                try:
-                    Path(tmp.name).unlink(missing_ok=True)
-                except Exception:
-                    pass
-                return False, f"Audio-Download fehlgeschlagen: {msg_dl}", ""
-    if folder:
-        local_audio = _find_local_audio_file(folder)
-        if local_audio is not None:
-            return True, str(local_audio), f"Lokal: {local_audio.name}"
-    return False, "Keine Audiodatei gefunden (audio_proxy_1k.wav oder lokale Audiodatei).", ""
-
-
-def _read_audio_mono_float(audio_path: str) -> tuple[int, np.ndarray]:
-    ext = Path(audio_path).suffix.lower()
-    if ext == ".wav":
-        sr, data = wavfile.read(audio_path)
-        x = data.astype(np.float32, copy=False)
-        if x.ndim > 1:
-            x = np.mean(x, axis=1)
-        if np.issubdtype(data.dtype, np.integer):
-            max_abs = float(np.iinfo(data.dtype).max)
-            if max_abs > 0:
-                x = x / max_abs
-        return int(sr), np.asarray(x, dtype=np.float32)
-    ffmpeg_exe = shutil.which("ffmpeg")
-    if not ffmpeg_exe:
-        try:
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            ffmpeg_exe = None
-    if not ffmpeg_exe:
-        raise RuntimeError("Kein ffmpeg verfuegbar. Bitte WAV oder audio_proxy_1k.wav verwenden.")
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp.close()
-    try:
-        cmd = [ffmpeg_exe, "-y", "-i", audio_path, "-vn", "-ac", "1", "-ar", str(int(AUDIO_TARGET_SR)), tmp.name]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or proc.stdout or "ffmpeg fehlgeschlagen")[-400:])
-        return _read_audio_mono_float(tmp.name)
-    finally:
-        try:
-            Path(tmp.name).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-def _run_audio_spectrogram_analysis(audio_path: str, f_min: float, f_max: float, nperseg: int, noverlap: int, pulses_per_rev: float) -> dict:
-    sr, x = _read_audio_mono_float(audio_path)
-    if x.size < 8:
-        raise RuntimeError("Audio ist leer oder zu kurz.")
-    x = np.asarray(x, dtype=np.float32) - float(np.mean(x))
-    nperseg = int(max(64, min(int(nperseg), int(x.size))))
-    noverlap = int(max(0, min(int(noverlap), nperseg - 1)))
-    f, t, Sxx = signal.spectrogram(x, fs=float(sr), window="hann", nperseg=nperseg, noverlap=noverlap, detrend=False, scaling="spectrum", mode="magnitude")
-    mask = (f >= float(f_min)) & (f <= float(f_max))
-    if not np.any(mask):
-        raise RuntimeError("Frequenzband enthaelt keine FFT-Bins.")
-    fb = f[mask]
-    Sb = Sxx[mask, :]
-    peak_idx = np.argmax(Sb, axis=0) if Sb.size else np.array([], dtype=int)
-    peak_hz = fb[peak_idx] if peak_idx.size else np.array([], dtype=float)
-    rpm = peak_hz * 60.0 / max(float(pulses_per_rev), 1e-6)
-    return {"sample_rate_hz": int(sr), "duration_s": float(x.size / float(sr)), "times_s": np.asarray(t, dtype=float), "freq_hz": np.asarray(fb, dtype=float), "sxx": np.asarray(Sb, dtype=float), "peak_hz": np.asarray(peak_hz, dtype=float), "rpm": np.asarray(rpm, dtype=float), "params": dict(f_min_hz=float(f_min), f_max_hz=float(f_max), nperseg=int(nperseg), noverlap=int(noverlap), pulses_per_rev=float(pulses_per_rev))}
-
-
-def _audio_result_to_recordresult_struct(res: dict) -> dict:
-    return {"params": res.get("params", {}), "processed": {"t_s": np.asarray(res.get("times_s", []), dtype=float), "f_peak_hz": np.asarray(res.get("peak_hz", []), dtype=float), "rpm": np.asarray(res.get("rpm", []), dtype=float)}, "spectrogram": {"f_hz": np.asarray(res.get("freq_hz", []), dtype=float), "t_s": np.asarray(res.get("times_s", []), dtype=float), "Sxx": np.asarray(res.get("sxx", []), dtype=float)}, "created": datetime.now().isoformat(timespec="seconds")}
-
-
-def _save_audio_analysis_to_selected_mat(res: dict) -> tuple[bool, str]:
-    key = str(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
-    if not key:
-        return False, "Keine MAT-Datei ausgewaehlt."
-    if not (st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None):
-        return False, "R2 ist nicht verbunden."
-    ok, msg, tmp_path = _download_mat_to_temp(key)
-    if not ok or not tmp_path:
-        return False, f"MAT-Download fehlgeschlagen: {msg}"
-    try:
-        try:
-            data = sio.loadmat(tmp_path, squeeze_me=True, struct_as_record=False)
-            rr = _mat_struct_to_plain(_mat_scalar(data.get("recordResult")))
-            if not isinstance(rr, dict):
-                rr = {}
-        except Exception:
-            rr = {}
-        rr["audio_rpm"] = _audio_result_to_recordresult_struct(res)
-        buf = io.BytesIO()
-        sio.savemat(buf, {"recordResult": rr}, do_compression=True)
-        ok_up, msg_up = _upload_bytes_compat(st.session_state.r2_client, key, buf.getvalue(), "application/octet-stream")
-        if not ok_up:
-            return False, f"MAT-Upload fehlgeschlagen: {msg_up}"
-        try:
-            st.session_state.mat_summary_cache.pop(key, None)
-        except Exception:
-            pass
-        if st.session_state.get("capture_folder"):
-            _invalidate_and_update_mat_selection_for_capture(str(st.session_state.capture_folder), key)
-        return True, f"Audioanalyse in MAT gespeichert: {Path(key).name}"
-    finally:
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
 
 # ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ Header + Status ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬
 st.markdown("""
@@ -4574,6 +4838,225 @@ with tab_mat:
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+
+
+
+def _plotly_heatmap_decimated(t, f, z, max_cells: int = 900_000):
+    """Return decimated t/f/z for interactive display without exhausting browser/RAM."""
+    t = np.asarray(t, dtype=np.float32)
+    f = np.asarray(f, dtype=np.float32)
+    z = np.asarray(z, dtype=np.float32)
+    if z.ndim != 2 or z.size == 0:
+        return t, f, z
+    nf, nt = z.shape
+    if nf * nt <= max_cells:
+        return t, f, z
+    f_step = max(1, int(np.ceil(nf / 650)))
+    t_step = max(1, int(np.ceil((nf // f_step) * nt / max_cells)))
+    return t[::t_step], f[::f_step], z[::f_step, ::t_step]
+
+# ==============================
+# TAB AUDIO AUSWERTUNG
+# ==============================
+with tab_audio:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Audio Auswertung / robuste RPM Pipeline</div>', unsafe_allow_html=True)
+
+    title = st.session_state.get("audio_vehicle_title") or _extract_vehicle_title_from_mat(st.session_state.get("audio_last_mat_path", ""))
+    if title:
+        st.info(f"Fahrzeug / Datensatz aus MAT-Metadata: {title}")
+    else:
+        st.caption("Kein Titel in recordResult.metadata gefunden. Nach MAT + Video laden wird hier der Fahrzeug-/Datensatzname angezeigt, falls vorhanden.")
+
+    c_a, c_b, c_c, c_d = st.columns(4)
+    nfft = c_a.number_input("NFFT", min_value=256, max_value=65536, value=8192, step=256, key="aud_nfft")
+    overlap = c_b.slider("Overlap [%]", 0, 95, 75, 5, key="aud_overlap")
+    fmax = c_c.number_input("f max [Hz]", min_value=50.0, max_value=8000.0, value=1000.0, step=50.0, key="aud_fmax")
+    method = c_d.selectbox("Drehzahl Methode", ["Auto robust", "Original Peak", "Ridge Tracking", "Order Tracking", "Cepstrum"], index=0, key="aud_method")
+
+    e1, e2, e3, e4, e5 = st.columns(5)
+    cyl = e1.number_input("Zyl", min_value=1, max_value=16, value=8, step=1, key="aud_cyl")
+    takt = e2.selectbox("Takt", [2, 4], index=1, key="aud_takt")
+    order = e3.number_input("Ordnung", min_value=0.25, max_value=12.0, value=1.0, step=0.25, key="aud_order")
+    rpm_min = e4.number_input("RPM min", min_value=100.0, max_value=20000.0, value=1500.0, step=100.0, key="aud_rpm_min")
+    rpm_max = e5.number_input("RPM max", min_value=500.0, max_value=25000.0, value=8000.0, step=100.0, key="aud_rpm_max")
+
+    g1, g2, g3, g4, g5 = st.columns(5)
+    r_dyn = g1.number_input("r dyn [m]", min_value=0.05, max_value=1.00, value=0.35, step=0.01, key="aud_rdyn")
+    use_ocr_v = g2.checkbox("OCR v verwenden", value=True, key="aud_use_ocr_v")
+    tol_pct = g3.number_input("Toleranz [%]", min_value=0.0, max_value=50.0, value=8.0, step=1.0, key="aud_tol_pct")
+    corr_len = g4.checkbox("Streckenlaenge korrigieren", value=False, key="aud_corr_len")
+    prefer_low = g5.checkbox("niedrigster Gang bevorzugt", value=False, key="aud_prefer_low")
+
+    h1, h2, h3, h4 = st.columns(4)
+    audio_offset = h1.slider("Audio Offset [s]", -10.0, 10.0, 0.0, 0.05, key="aud_offset")
+    a_min = h2.number_input("a min", value=-10.0, step=0.5, key="aud_a_min")
+    a_max = h3.number_input("a max", value=10.0, step=0.5, key="aud_a_max")
+    v_range = h4.slider("v min/max [km/h]", 0.0, 400.0, (30.0, 320.0), 5.0, key="aud_vrange")
+
+    with st.expander("Getriebe (Achsuebersetzung und Gang-i)", expanded=False):
+        axle = st.number_input("Achsuebersetzung", min_value=0.1, max_value=10.0, value=4.059, step=0.001, format="%.3f", key="aud_axle")
+        gear_txt = st.text_input("Gang-i, kommagetrennt", value="3.56, 2.53, 1.68, 1.02, 0.79, 0.76, 0.63", key="aud_gears")
+        try:
+            gears = [float(x.strip()) for x in gear_txt.replace(";", ",").split(",") if x.strip()]
+        except Exception:
+            gears = []
+        if gears:
+            st.caption("Gänge: " + ", ".join(f"{i+1}: {g:.3f}" for i, g in enumerate(gears)))
+        else:
+            st.warning("Keine gültigen Gangübersetzungen erkannt.")
+
+    debug_live = st.checkbox("Live-Debug während Audioanalyse anzeigen", value=True, key="aud_live_debug")
+    run_audio = st.button("Audioanalyse starten", type="primary", width="stretch", key="aud_run")
+    if run_audio:
+        prog = st.progress(0.0, text="Audio wird geladen ...")
+        status_slot = st.empty()
+        debug_slot = st.empty()
+        debug_lines = []
+
+        def _audio_debug(line: str):
+            debug_lines.append(str(line))
+            st.session_state["audio_debug_lines"] = debug_lines[-120:]
+            if debug_live:
+                debug_slot.code("\n".join(debug_lines[-40:]), language="text")
+
+        def _audio_progress(frac: float, text: str):
+            prog.progress(float(max(0.0, min(1.0, frac))), text=str(text))
+
+        _audio_debug("[   0.0s] Button geklickt: Audioanalyse startet")
+        ok, msg, fs, y, source = _load_audio_for_current_capture()
+        if not ok:
+            _audio_debug(f"Audio konnte nicht geladen werden: {msg}")
+            st.error(msg)
+            set_status(msg, "warn")
+            prog.empty()
+        else:
+            try:
+                t0_audio = time.time()
+                _audio_debug(f"Audio geladen: Quelle={source}, fs={fs}, Samples={len(y):,}, Dauer={len(y)/max(fs,1):.1f}s")
+                start_used = float(st.session_state.get("t_start", 0.0) or 0.0)
+                end_used = float(st.session_state.get("t_end", 0.0) or (len(y) / max(fs, 1)))
+                status_slot.info(f"Analysiere Audiosegment {start_used:.2f}-{end_used:.2f} s · Quelle: {source}")
+                _audio_progress(0.10, "Audio geladen. Spektrogramm/Frequenzlinien werden berechnet ...")
+                res = _run_robust_audio_rpm_analysis(
+                    y=y, fs=fs,
+                    start_s=start_used,
+                    end_s=end_used,
+                    audio_offset_s=float(audio_offset),
+                    nfft=int(nfft), overlap_pct=float(overlap), fmax=float(fmax),
+                    cyl=int(cyl), takt=int(takt), order=float(order),
+                    rpm_min=float(rpm_min), rpm_max=float(rpm_max), method=str(method),
+                    debug_cb=_audio_debug, progress_cb=_audio_progress,
+                )
+                _audio_progress(0.96, "OCR-/Gangdaten werden geladen ...")
+                _audio_debug("Lade optionale OCR-v/Gangdaten aus MAT ...")
+                res["source"] = source
+                res["ui"] = dict(r_dyn=float(r_dyn), use_ocr_v=bool(use_ocr_v), tol_pct=float(tol_pct),
+                                 corr_len=bool(corr_len), prefer_low=bool(prefer_low), axle=float(axle), gears=gears,
+                                 a_min=float(a_min), a_max=float(a_max), v_min=float(v_range[0]), v_max=float(v_range[1]))
+                # Optional OCR v/gear overlay only; audio RPM itself remains from audio.
+                mat_path = st.session_state.get("audio_last_mat_path") or ""
+                res["ocr"] = _extract_ocr_series_from_mat(mat_path)
+                st.session_state.audio_analysis_result = res
+                used_nfft = int(res.get("params", {}).get("nfft", nfft))
+                msg_done = f"Audioanalyse abgeschlossen ({time.time() - t0_audio:.1f}s, NFFT effektiv: {used_nfft})."
+                _audio_debug(msg_done)
+                status_slot.success(msg_done)
+                prog.progress(1.0, text="Audioanalyse fertig.")
+                set_status(msg_done, "ok")
+            except MemoryError:
+                st.session_state.audio_analysis_result = None
+                msg_e = "Audioanalyse fehlgeschlagen: zu wenig Arbeitsspeicher. Bitte NFFT kleiner wählen, Overlap reduzieren oder Start/Ende enger setzen."
+                _audio_debug(msg_e)
+                st.error(msg_e)
+                set_status(msg_e, "warn")
+                prog.empty()
+            except Exception as e:
+                st.session_state.audio_analysis_result = None
+                msg_e = f"Audioanalyse fehlgeschlagen: {e}"
+                _audio_debug(msg_e)
+                st.error(msg_e)
+                set_status(msg_e, "warn")
+                prog.empty()
+
+    old_debug = st.session_state.get("audio_debug_lines") or []
+    if old_debug and not run_audio:
+        with st.expander("Letzter Audioanalyse-Debug", expanded=False):
+            st.code("\n".join(str(x) for x in old_debug[-120:]), language="text")
+
+    res = st.session_state.get("audio_analysis_result")
+    if isinstance(res, dict) and res.get("t") is not None:
+        _p = res.get('params', {})
+        st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Suchband: {_p.get('f_search_lo',0):.1f}–{_p.get('f_search_hi',0):.1f} Hz · NFFT effektiv: {_p.get('nfft', '?')} · Start/Ende: {_p.get('start_s',0):.2f}–{_p.get('end_s',0):.2f} s")
+        try:
+            import plotly.graph_objects as go
+            import plotly.express as px
+            # Audio
+            fig_audio = go.Figure()
+            at = np.asarray(res["audio_t"], dtype=float)
+            ay = np.asarray(res["audio_y"], dtype=float)
+            step = max(1, int(len(at) / 12000))
+            fig_audio.add_trace(go.Scattergl(x=at[::step], y=ay[::step], mode="lines", name="Audio"))
+            fig_audio.update_layout(title="Audio", xaxis_title="t [s]", yaxis_title="Amplitude", height=260, template="plotly_dark")
+            st.plotly_chart(fig_audio, width="stretch")
+
+            # Spectrogram with all frequency lines (decimated for interactive browser performance)
+            ht, hf, hz = _plotly_heatmap_decimated(res["t"], res["freqs"], res["db"])
+            fig_spec = go.Figure(data=go.Heatmap(
+                x=ht, y=hf, z=hz, colorscale="Viridis", colorbar=dict(title="dB")))
+            show_lines = st.multiselect(
+                "Frequenzlinien im Spektrogramm anzeigen",
+                list(res.get("freq_lines", {}).keys()),
+                default=[res.get("selected_method", "Auto robust")],
+                key="aud_show_lines",
+            )
+            for name in show_lines:
+                yy = np.asarray(res.get("freq_lines", {}).get(name, []), dtype=float)
+                if yy.size:
+                    fig_spec.add_trace(go.Scatter(x=np.asarray(res["t"], dtype=float), y=yy, mode="lines", name=name, line=dict(width=2)))
+            fig_spec.update_layout(title="Spektrogramm f [Hz] über t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
+            st.plotly_chart(fig_spec, width="stretch")
+
+            colp1, colp2 = st.columns(2)
+            fig_rpm = go.Figure()
+            fig_rpm.add_trace(go.Scatter(x=np.asarray(res["t"], dtype=float), y=np.asarray(res["rpm"], dtype=float), mode="lines", name="Audio RPM"))
+            fig_rpm.update_layout(title="RPM", xaxis_title="t [s]", yaxis_title="1/min", height=360, template="plotly_dark")
+            colp1.plotly_chart(fig_rpm, width="stretch")
+
+            fig_v = go.Figure()
+            ocr = res.get("ocr") or {}
+            if bool(use_ocr_v) and "t" in ocr and "v" in ocr:
+                fig_v.add_trace(go.Scatter(x=np.asarray(ocr["t"], dtype=float), y=np.asarray(ocr["v"], dtype=float), mode="lines", name="OCR v"))
+            fig_v.update_layout(title="v", xaxis_title="t [s]", yaxis_title="km/h", height=360, template="plotly_dark")
+            colp2.plotly_chart(fig_v, width="stretch")
+
+            fig_g = go.Figure()
+            ocr = res.get("ocr") or {}
+            if "gear_t" in ocr and "gear" in ocr:
+                fig_g.add_trace(go.Scatter(x=np.asarray(ocr["gear_t"], dtype=float), y=np.asarray(ocr["gear"], dtype=float), mode="lines", name="OCR Gang"))
+            elif gears and bool(use_ocr_v) and "t" in ocr and "v" in ocr:
+                # Estimate gear from OCR v + audio RPM using configured ratios.
+                t_r = np.asarray(res["t"], dtype=float)
+                rpm = np.asarray(res["rpm"], dtype=float)
+                v_interp = np.interp(t_r, np.asarray(ocr["t"], dtype=float), np.asarray(ocr["v"], dtype=float), left=np.nan, right=np.nan)
+                wheel_rpm = (v_interp / 3.6) / max(2*np.pi*float(r_dyn), 1e-6) * 60.0
+                ratio_obs = rpm / np.maximum(wheel_rpm, 1e-6)
+                gear_arr = np.full_like(ratio_obs, np.nan, dtype=float)
+                total = np.asarray([float(axle) * g for g in gears], dtype=float)
+                for i, r in enumerate(ratio_obs):
+                    if np.isfinite(r):
+                        errs = np.abs(total - r) / np.maximum(total, 1e-6) * 100.0
+                        good = np.where(errs <= float(tol_pct))[0]
+                        if good.size:
+                            gear_arr[i] = float(good[0] + 1 if prefer_low else good[np.argmin(errs[good])] + 1)
+                fig_g.add_trace(go.Scatter(x=t_r, y=gear_arr, mode="lines", name="Gang geschätzt"))
+            fig_g.update_layout(title="Gang", xaxis_title="t [s]", yaxis_title="#", height=320, template="plotly_dark")
+            st.plotly_chart(fig_g, width="stretch")
+        except Exception as e:
+            st.warning(f"Plots konnten nicht erstellt werden: {e}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
 # ==============================
 # TAB ROI SETUP
 # ==============================
@@ -5133,84 +5616,6 @@ with tab_roi:
 # ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
 # TAB ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âº ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“ TRACK-ANALYSE
 # ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
-
-with tab_audio:
-    st.divider()
-    st.subheader("Audio Auswertung · Spektrogramm")
-    st.caption("Python-basierte Audioanalyse: Audio laden, Spektrogramm berechnen, dominante Frequenz verfolgen und optional als recordResult.audio_rpm in die MAT-Datei schreiben.")
-    c1, c2, c3 = st.columns(3)
-    f_min = c1.number_input("Min. Frequenz [Hz]", min_value=0.0, max_value=5000.0, value=20.0, step=5.0, key="aud_f_min")
-    f_max = c2.number_input("Max. Frequenz [Hz]", min_value=10.0, max_value=10000.0, value=1000.0, step=25.0, key="aud_f_max")
-    pulses = c3.number_input("Impulse pro Umdrehung", min_value=0.1, max_value=20.0, value=2.0, step=0.1, key="aud_pulses_per_rev")
-    c4, c5 = st.columns(2)
-    nperseg = int(c4.selectbox("FFT Fenster (nperseg)", [128, 256, 512, 1024, 2048, 4096], index=3, key="aud_nperseg"))
-    noverlap_pct = int(c5.slider("Overlap [%]", 0, 95, 75, 5, key="aud_overlap_pct"))
-    noverlap = int(nperseg * noverlap_pct / 100.0)
-    if st.button("Audioanalyse starten", type="primary", width="stretch", key="audio_run_btn"):
-        ok_a, audio_path_or_msg, audio_label = _download_current_audio_to_temp()
-        if not ok_a:
-            st.error(audio_path_or_msg)
-        else:
-            audio_path = audio_path_or_msg
-            try:
-                with st.spinner("Spektrogramm wird berechnet ..."):
-                    res = _run_audio_spectrogram_analysis(audio_path, f_min, f_max, nperseg, noverlap, pulses)
-                    res["source"] = audio_label
-                    st.session_state.audio_analysis_result = res
-                set_status("Audioanalyse abgeschlossen.", "ok")
-            except Exception as e:
-                st.session_state.audio_analysis_result = None
-                st.error(f"Audioanalyse fehlgeschlagen: {e}")
-            finally:
-                try:
-                    if str(audio_path).startswith(tempfile.gettempdir()):
-                        Path(audio_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-    res = st.session_state.get("audio_analysis_result")
-    if isinstance(res, dict):
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Ergebnis</div>', unsafe_allow_html=True)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Quelle", str(res.get("source", ""))[:32])
-        m2.metric("Samplerate", f"{int(res.get('sample_rate_hz', 0))} Hz")
-        m3.metric("Dauer", f"{float(res.get('duration_s', 0.0)):.1f} s")
-        rpm_arr = np.asarray(res.get("rpm", []), dtype=float)
-        m4.metric("RPM Median", f"{np.nanmedian(rpm_arr):.0f}" if rpm_arr.size else "-")
-        try:
-            import matplotlib.pyplot as plt
-            fig, ax = plt.subplots(figsize=(10, 4))
-            S = np.asarray(res.get("sxx", []), dtype=float)
-            tt = np.asarray(res.get("times_s", []), dtype=float)
-            ff = np.asarray(res.get("freq_hz", []), dtype=float)
-            if S.size and tt.size and ff.size:
-                db = 20.0 * np.log10(np.maximum(S, 1e-12))
-                ax.pcolormesh(tt, ff, db, shading="auto")
-                pk = np.asarray(res.get("peak_hz", []), dtype=float)
-                if pk.size == tt.size:
-                    ax.plot(tt, pk, linewidth=1.2)
-                ax.set_xlabel("Zeit [s]")
-                ax.set_ylabel("Frequenz [Hz]")
-                ax.set_title("Spektrogramm mit Peak-Frequenz")
-                st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
-        except Exception as e:
-            st.warning(f"Plot konnte nicht erstellt werden: {e}")
-        proc_df = pd.DataFrame({"t_s": np.asarray(res.get("times_s", []), dtype=float), "f_peak_hz": np.asarray(res.get("peak_hz", []), dtype=float), "rpm": np.asarray(res.get("rpm", []), dtype=float)})
-        st.dataframe(proc_df.head(1000), width="stretch", hide_index=True)
-        st.download_button("CSV herunterladen", data=proc_df.to_csv(index=False).encode("utf-8"), file_name="audio_rpm_processed.csv", mime="text/csv", width="stretch")
-        if st.button("Audioanalyse in aktuelle MAT speichern", width="stretch", key="audio_save_mat_btn"):
-            ok_s, msg_s = _save_audio_analysis_to_selected_mat(res)
-            if ok_s:
-                st.success(msg_s)
-                set_status(msg_s, "ok")
-            else:
-                st.error(msg_s)
-                set_status(msg_s, "warn")
-        st.markdown('</div>', unsafe_allow_html=True)
-    else:
-        st.info("Noch keine Audioanalyse durchgeführt. Voraussetzung: geladener Capture-Folder mit audio_proxy_1k.wav oder lokaler Audiodatei.")
-
 with tab_track:
     st.divider()
     st.subheader("2 · Track Analysis")
@@ -5218,9 +5623,9 @@ with tab_track:
     track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
     has_vid   = _has_media_source()
     fw=st.session_state.vid_width; fh=st.session_state.vid_height
-    has_8_track_points = _has_valid_8_points(st.session_state.ref_track_pts) and _has_valid_8_points(st.session_state.minimap_pts)
-    color_done = bool(st.session_state.get("track_color_detection_done", False))
-    can_cmp = bool(has_ref and track_roi and has_vid and has_8_track_points and color_done)
+    can_cmp = (has_ref and track_roi and has_vid and
+               _has_valid_8_points(st.session_state.ref_track_pts) and
+               _has_valid_8_points(st.session_state.minimap_pts))
 
     if not track_roi:
         st.info("[i] Keine track_minimap ROI -> Tab ROI Setup -> ROI anlegen.")
@@ -5428,7 +5833,6 @@ with tab_track:
                             s_lo=max(0,s-60),   s_hi=min(255,s+60),
                             v_lo=max(0,v-60),   v_hi=min(255,v+60),
                         )
-                        st.session_state.track_color_detection_done = True
                         set_status(f"Farbe gesetzt: HSV({h},{s},{v})","ok")
                         st.rerun()
 
@@ -5437,7 +5841,6 @@ with tab_track:
                 if rb1.button("Zurücksetzen", width="stretch", key="mm_pts_reset"):
                     st.session_state.minimap_pts = []
                     st.session_state.minimap_next_pt_idx = 0
-                    st.session_state.track_color_detection_done = False
                     st.session_state["_mm_last_click"] = None
                     st.session_state["_mm_last_color_click"] = None
                     st.rerun()
@@ -5445,18 +5848,11 @@ with tab_track:
                     if next_idx > 0:
                         st.session_state.minimap_pts = mm_pts[:next_idx-1]
                         st.session_state.minimap_next_pt_idx = next_idx-1
-                        st.session_state.track_color_detection_done = False
                         st.rerun()
                 if st.button("Vergleich 5 Zeiten", type="primary", width="stretch", key="cmp_5_times_btn", disabled=not can_cmp):
                     st.session_state["_run_compare_5_times"] = True
                 if not can_cmp:
-                    missing = []
-                    if not has_ref: missing.append("Referenztrack")
-                    if not track_roi: missing.append("track_minimap ROI")
-                    if not has_vid: missing.append("Video/Frame-Pack")
-                    if not has_8_track_points: missing.append("8 Punkte")
-                    if not color_done: missing.append("Farberkennung")
-                    st.caption("Benötigt: " + ", ".join(missing) + ".")
+                    st.caption("Benötigt: Referenztrack, track_minimap ROI, Video und je 8 Punkte.")
         else:
             st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
                         'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
