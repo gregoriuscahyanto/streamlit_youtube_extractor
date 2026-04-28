@@ -6,11 +6,13 @@ Tab 3: Track-Minimap Analyse - 8-Punkte + Farberkennung
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import cv2
 import numpy as np
 import json
 import tempfile
 import io
+import zipfile
 import time
 import os
 import subprocess
@@ -18,6 +20,9 @@ import shutil
 import sys
 import threading
 import traceback
+import socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 import concurrent.futures as cf
 import scipy.io as sio
 try:
@@ -389,6 +394,15 @@ def init_state():
         audio_analysis_result=None,
         audio_vehicle_title="",
         audio_last_mat_path="",
+        audio_debug_lines=[],
+        audio_debug_last_run="",
+        audio_bg_future=None,
+        audio_bg_started=0.0,
+        audio_bg_params={},
+        audio_bg_log=[],
+        audio_bg_source="",
+        audio_bg_progress={},
+        audio_bg_progress_ref=None,
         # Datei-Browser
         fb_path="", fb_items=[], fb_selected=None,
         # Aufnahme
@@ -2893,6 +2907,16 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
         audio_path = _mat_obj_get(meta, "audio") or _mat_obj_get(rr, "audio")
         out["recordresult_video_path"] = str(_mat_scalar(video_path) or "")
         out["recordresult_audio_path"] = str(_mat_scalar(audio_path) or "")
+        # Relevante Anzeige-Metadaten fuer den Audio-Tab mitnehmen.
+        # Je nach Erzeuger heisst der YouTube-/Video-Titel unterschiedlich.
+        if meta is not None:
+            for mk in ("video_title", "title", "vehicle_title", "name", "youtube_title"):
+                try:
+                    mv = _mat_scalar(_mat_obj_get(meta, mk))
+                    if mv is not None and str(mv).strip():
+                        out[mk] = str(mv).strip()
+                except Exception:
+                    pass
 
         params = _mat_obj_get(ocr, "params")
         start_s = _mat_to_float(_mat_obj_get(params, "start_s"))
@@ -3395,7 +3419,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
     """
     _start_mat_update(remote_keys)
     total = len(st.session_state.mat_update_keys or [])
-    progress = progress_slot.progress(0, text=f"0/{total} MAT-Dateien analysiert") if (total > 0 and progress_slot is not None) else None
+    progress = progress_slot.progress(0, text=f"0/0 aktuell analysiert · {total} offen") if (total > 0 and progress_slot is not None) else None
     try:
         cache = st.session_state.get("mat_summary_cache")
         if not isinstance(cache, dict):
@@ -3417,7 +3441,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
         if live_table is not None:
             _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
         if progress is not None and total > 0:
-            progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
+            progress.progress(min(1.0, done / total), text=f"{done}/{max(done + len(pending_idx), 1)} aktuell analysiert · {max(0, total-done)} offen")
 
         if pending_idx:
             max_workers = max(2, min(8, (os.cpu_count() or 4)))
@@ -3452,7 +3476,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                     if live_table is not None and (done == total or done % 3 == 0 or done <= 2):
                         _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
                     if progress is not None and total > 0:
-                        progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
+                        progress.progress(min(1.0, done / total), text=f"{done}/{max(done + sum(1 for f in fut_to_idx if not f.done()), done, 1)} aktuell analysiert · {max(0, total-done)} offen")
 
         st.session_state.mat_summary_cache = cache
         st.session_state.mat_update_running = False
@@ -3470,7 +3494,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                     column_config=MAT_OVERVIEW_COLCFG,
                 )
             if progress is not None and total > 0:
-                progress.progress(min(1.0, done / total), text=f"{done}/{total} MAT-Dateien analysiert")
+                progress.progress(min(1.0, done / total), text=f"{done}/{max(done,1)} aktuell analysiert · {max(0, total-done)} offen")
 
     if progress is not None:
         progress.empty()
@@ -3667,8 +3691,6 @@ def _load_mat_from_r2(remote_key):
             st.session_state.minimap_next_pt_idx = len(track_cfg["minimap_pts"])
         if track_cfg.get("moving_pt_color_range"):
             st.session_state.moving_pt_color_range = track_cfg["moving_pt_color_range"]
-        st.session_state.audio_last_mat_path = tmp.name
-        st.session_state.audio_vehicle_title = _extract_vehicle_title_from_mat(tmp.name)
         _track_name = _extract_track_name_from_recordresult_mat(tmp.name)
         if _track_name:
             st.session_state["loaded_track_name"] = _track_name
@@ -3677,410 +3699,6 @@ def _load_mat_from_r2(remote_key):
         return tmp.name
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
     return None
-
-
-def _extract_vehicle_title_from_mat(mat_path: str) -> str:
-    """Best-effort display name from recordResult.metadata so vehicle/setup is visible in Audio tab."""
-    if not mat_path:
-        return ""
-    keys = (
-        "title", "titel", "vehicle", "vehicle_name", "fahrzeug", "car", "car_name",
-        "name", "display_name", "project", "description", "video", "audio"
-    )
-    try:
-        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
-        rr = _mat_scalar(data.get("recordResult"))
-        meta = _mat_obj_get(rr, "metadata")
-        vals = []
-        for k in keys:
-            txt = _mat_to_text(_mat_obj_get(meta, k), "")
-            if txt:
-                vals.append(txt)
-        for txt in vals:
-            if txt and Path(txt).suffix.lower() not in VIDEO_EXTS + AUDIO_EXTS:
-                return txt
-        if vals:
-            return Path(vals[0]).stem
-    except NotImplementedError:
-        try:
-            import h5py
-            with h5py.File(mat_path, "r") as f:
-                meta = _h5_get_path_ci(f, ["recordResult", "metadata"])
-                vals = []
-                for k in keys:
-                    obj = _h5_get_path_ci(meta, [k]) if meta is not None else None
-                    txts = _h5_to_text_list(obj) if obj is not None else []
-                    if txts:
-                        vals.append(str(txts[0]).strip())
-                for txt in vals:
-                    if txt and Path(txt).suffix.lower() not in VIDEO_EXTS + AUDIO_EXTS:
-                        return txt
-                if vals:
-                    return Path(vals[0]).stem
-        except Exception:
-            pass
-    except Exception:
-        pass
-    try:
-        return Path(st.session_state.get("video_name") or st.session_state.get("capture_folder") or "").stem
-    except Exception:
-        return ""
-
-
-def _load_audio_for_current_capture() -> tuple[bool, str, int, np.ndarray, str]:
-    """Return ok, msg, sample_rate, mono_audio_float, source_label.
-
-    Cloud audio_proxy_1k.wav is preferred because it is already low-pass filtered
-    below 1000 Hz and downsampled. Local full-resolution audio is only a fallback.
-    """
-    folder = str(st.session_state.get("capture_folder") or "").strip()
-    candidates = []
-
-    if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None and folder:
-        pfx = st.session_state.r2_prefix.strip("/")
-        key = f"{pfx}/captures/{folder}/{AUDIO_PROXY_NAME}" if pfx else f"captures/{folder}/{AUDIO_PROXY_NAME}"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tmp.close()
-        ok, msg = st.session_state.r2_client.download_file(key, tmp.name)
-        if ok:
-            candidates.append(("cloud-proxy", tmp.name, True))
-        else:
-            try:
-                Path(tmp.name).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    if folder:
-        local_audio = _find_local_audio_file(folder)
-        if local_audio is not None:
-            candidates.append(("local-fallback", str(local_audio), False))
-
-    if not candidates:
-        return False, "Keine Audio-Datei gefunden (audio_proxy_1k.wav in Cloud oder lokale Audiodatei).", 0, np.array([], dtype=float), ""
-
-    last_err = ""
-    for label, path, cleanup in candidates:
-        try:
-            sr, data = wavfile.read(path)
-            y = np.asarray(data, dtype=np.float32)
-            if y.ndim > 1:
-                y = np.mean(y, axis=1)
-            if np.issubdtype(data.dtype, np.integer):
-                denom = float(np.iinfo(data.dtype).max) or 1.0
-                y = y / denom
-            y = np.nan_to_num(np.asarray(y, dtype=np.float32).reshape(-1).copy())
-            src = f"{label}: {AUDIO_PROXY_NAME if label == 'cloud-proxy' else Path(path).name}"
-            return True, "", int(sr), y, src
-        except Exception as e:
-            last_err = str(e)
-        finally:
-            if cleanup:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-    return False, f"Audio konnte nicht gelesen werden: {last_err}", 0, np.array([], dtype=float), ""
-def _moving_median_nan(x, k: int = 7) -> np.ndarray:
-    x = np.asarray(x, dtype=float).copy()
-    if k <= 1 or x.size < 3:
-        return x
-    k = int(k) | 1
-    pad = k // 2
-    out = x.copy()
-    for i in range(x.size):
-        lo, hi = max(0, i - pad), min(x.size, i + pad + 1)
-        vals = x[lo:hi]
-        vals = vals[np.isfinite(vals)]
-        if vals.size:
-            out[i] = float(np.median(vals))
-    return out
-
-
-def _interp_nan(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float).copy()
-    idx = np.arange(x.size)
-    good = np.isfinite(x)
-    if good.sum() == 0:
-        return x
-    if good.sum() == 1:
-        x[~good] = x[good][0]
-        return x
-    x[~good] = np.interp(idx[~good], idx[good], x[good])
-    return x
-
-
-def _smooth_energy_path(score: np.ndarray, max_jump_bins: int = 35) -> np.ndarray:
-    """Fast local ridge follower for score[freq_or_rpm_bin, time_bin].
-
-    This replaces the previous Viterbi/DP implementation. It is intentionally
-    linear in time so long Streamlit runs do not hang for minutes.
-    """
-    sc = np.asarray(score, dtype=np.float32)
-    if sc.ndim != 2 or sc.size == 0:
-        return np.array([], dtype=int)
-    nf, nt = sc.shape
-    sc = np.nan_to_num(sc, nan=float(np.nanmin(sc[np.isfinite(sc)])) if np.isfinite(sc).any() else 0.0)
-    max_jump_bins = int(max(1, min(max_jump_bins, max(1, nf - 1))))
-    path = np.zeros(nt, dtype=np.int32)
-    col_energy = np.nanmax(sc, axis=0)
-    t0 = int(np.nanargmax(col_energy)) if col_energy.size else 0
-    path[t0] = int(np.nanargmax(sc[:, t0]))
-    for t in range(t0 + 1, nt):
-        prev = int(path[t - 1])
-        lo, hi = max(0, prev - max_jump_bins), min(nf, prev + max_jump_bins + 1)
-        path[t] = lo + int(np.nanargmax(sc[lo:hi, t]))
-    for t in range(t0 - 1, -1, -1):
-        prev = int(path[t + 1])
-        lo, hi = max(0, prev - max_jump_bins), min(nf, prev + max_jump_bins + 1)
-        path[t] = lo + int(np.nanargmax(sc[lo:hi, t]))
-    return path
-def _extract_ocr_series_from_mat(mat_path: str) -> dict:
-    """Load OCR time/v/gear columns if present. Empty dict if unavailable."""
-    out = {}
-    if not mat_path:
-        return out
-    try:
-        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
-        rr = _mat_scalar(data.get("recordResult"))
-        ocr = _mat_obj_get(rr, "ocr")
-        tbl = _mat_obj_get(ocr, "cleaned")
-        if tbl is None:
-            tbl = _mat_obj_get(ocr, "table")
-        if tbl is None:
-            return out
-        t = _mat_numeric_vector(_mat_table_column(tbl, "time_s", "t_s", "time"))
-        v = _mat_numeric_vector(_mat_table_column(tbl, "v_Fzg_kmph", "v_kmph", "speed_kmph"))
-        gear = _mat_numeric_vector(_mat_table_column(tbl, "numgear_GET", "gear"))
-        n = max(t.size, v.size, gear.size)
-        if t.size and v.size:
-            m = min(t.size, v.size)
-            out["t"] = t[:m]
-            out["v"] = v[:m]
-        if t.size and gear.size:
-            m = min(t.size, gear.size)
-            out["gear_t"] = t[:m]
-            out["gear"] = gear[:m]
-    except Exception:
-        pass
-    return out
-
-
-def _run_robust_audio_rpm_analysis(
-    y: np.ndarray,
-    fs: int,
-    start_s: float,
-    end_s: float,
-    audio_offset_s: float,
-    nfft: int,
-    overlap_pct: float,
-    fmax: float,
-    cyl: int,
-    takt: int,
-    order: float,
-    rpm_min: float,
-    rpm_max: float,
-    method: str = "Auto robust",
-    debug_cb=None,
-    progress_cb=None,
-) -> dict:
-    """Robust frequency/RPM pipeline for noisy engine audio.
-
-    The analysis is always limited to video start/end. The audio time that corresponds
-    to video time t is t + audio_offset_s; displayed spectrogram time is shifted back
-    to video time so overlays align with OCR/video.
-    """
-    t_total0 = time.time()
-    def _dbg(message: str, progress: float | None = None):
-        elapsed = time.time() - t_total0
-        text = f"[{elapsed:6.1f}s] {message}"
-        if callable(debug_cb):
-            try:
-                debug_cb(text)
-            except Exception:
-                pass
-        if progress is not None and callable(progress_cb):
-            try:
-                progress_cb(float(max(0.0, min(1.0, progress))), message)
-            except Exception:
-                pass
-
-    _dbg("Audioanalyse initialisiert", 0.02)
-    y = np.asarray(y, dtype=np.float32).reshape(-1).copy()
-    if y.size == 0 or fs <= 0:
-        raise ValueError("Kein Audio geladen.")
-    _dbg(f"Audio im Speicher: {y.size:,} Samples @ {fs} Hz ({y.size / max(fs,1):.1f}s)", 0.04)
-    start_s = float(max(0.0, start_s))
-    end_s = float(max(start_s + 0.05, end_s))
-    a0 = max(0, int(round((start_s + float(audio_offset_s)) * fs)))
-    a1 = min(y.size, int(round((end_s + float(audio_offset_s)) * fs)))
-    if a1 <= a0 + max(32, int(0.1 * fs)):
-        raise ValueError("Audiosegment ist leer. Bitte Start/Ende oder Audio Offset pruefen.")
-    seg = y[a0:a1].astype(np.float32, copy=True)
-    seg = seg - np.float32(np.nanmedian(seg))
-    peak = float(np.nanmax(np.abs(seg)) or 1.0)
-    if peak > 0:
-        seg = (seg / np.float32(peak)).astype(np.float32, copy=False)
-    _dbg(f"Segment geschnitten: Video {start_s:.2f}-{end_s:.2f}s, Audio-Index {a0:,}:{a1:,}, {seg.size:,} Samples", 0.08)
-
-    # Speicherbremse: fuer lange Segmente wird NFFT/Overlap automatisch reduziert.
-    # Sonst entstehen leicht Arrays im Bereich mehrerer 100 MB, z.B. 8192 x >6000.
-    requested_nfft = int(nfft)
-    nfft = int(max(256, min(requested_nfft, max(256, seg.size))))
-    overlap_pct = float(max(0.0, min(95.0, overlap_pct)))
-    est_cells_limit = 1_800_000
-    while nfft > 512:
-        hop_est = max(1, int(round(nfft * (1.0 - overlap_pct / 100.0))))
-        nt_est = max(1, int(np.ceil(max(1, seg.size - nfft) / hop_est)) + 1)
-        nf_est = nfft // 2 + 1
-        if nf_est * nt_est <= est_cells_limit:
-            break
-        nfft = int(nfft // 2)
-    noverlap = int(max(0, min(nfft - 1, round(nfft * overlap_pct / 100.0))))
-    hop_dbg = max(1, nfft - noverlap)
-    est_frames_dbg = max(1, int(np.ceil(max(1, seg.size - nfft) / hop_dbg)) + 1)
-    _dbg(f"STFT vorbereitet: NFFT effektiv {nfft} (angefragt {requested_nfft}), Overlap {noverlap}/{nfft}, erwartete Frames ~{est_frames_dbg:,}", 0.13)
-
-    # mode='magnitude' vermeidet ein grosses komplexes STFT-Zwischenarray.
-    _dbg("Berechne Spektrogramm (scipy.signal.spectrogram) ...", 0.18)
-    freqs, tt, mag = signal.spectrogram(
-        seg, fs=fs, window='hann', nperseg=nfft, noverlap=noverlap, nfft=nfft,
-        detrend=False, scaling='spectrum', mode='magnitude'
-    )
-    mag = np.asarray(mag, dtype=np.float32)
-    _dbg(f"Spektrogramm fertig: Matrix {mag.shape[0]:,} x {mag.shape[1]:,} ({mag.size * mag.itemsize / 1024 / 1024:.1f} MiB)", 0.35)
-    t_video = tt.astype(np.float32, copy=False) + np.float32(a0 / float(fs) - float(audio_offset_s))
-    fmax = float(max(20.0, min(float(fmax), fs / 2.0)))
-    keep = freqs <= fmax
-    freqs = np.asarray(freqs[keep], dtype=np.float32).copy()
-    mag = mag[keep, :].copy()
-    db = (20.0 * np.log10(np.maximum(mag, np.float32(1e-12)))).astype(np.float32, copy=False)
-
-    cyl = max(1, int(cyl))
-    takt = max(1, int(takt))
-    order = max(0.1, float(order))
-    # firing-event factor: 4-stroke cyl/2, 2-stroke cyl. Generalized = 2*cyl/takt.
-    engine_factor = max(0.1, (2.0 * float(cyl) / float(takt)))
-    f_lo = max(5.0, float(rpm_min) / 60.0 * engine_factor * order)
-    f_hi = min(fmax, float(rpm_max) / 60.0 * engine_factor * order)
-    if f_hi <= f_lo:
-        f_lo, f_hi = max(5.0, min(freqs[-1], 30.0)), min(fmax, max(60.0, freqs[-1]))
-    pad = max(20.0, 0.20 * (f_hi - f_lo))
-    band_mask = (freqs >= max(0.0, f_lo - pad)) & (freqs <= min(fmax, f_hi + pad))
-    if not band_mask.any():
-        band_mask = freqs > 0
-    fb = freqs[band_mask].copy()
-    Sb = db[band_mask, :].copy()
-    Mb = mag[band_mask, :].copy()
-    if fb.size < 3 or Sb.shape[1] < 1:
-        raise ValueError("Zu wenig Spektrogramm-Daten im Suchband.")
-    _dbg(f"Suchband: {float(fb[0]):.1f}-{float(fb[-1]):.1f} Hz, Bandmatrix {Sb.shape[0]:,} x {Sb.shape[1]:,}", 0.42)
-
-    lines = {}
-    # Original peak in physically plausible band
-    _dbg("Methode Original Peak: Maximalenergie pro Zeitspalte ...", 0.45)
-    idx_peak = np.argmax(Sb, axis=0)
-    lines["Original Peak"] = fb[idx_peak]
-
-    # Ridge: fast local path through the band-energy image.
-    _dbg("Methode Ridge Tracking: schnelle lokale Spektrogramm-Linie ...", 0.50)
-    max_jump_hz = max(20.0, (f_hi - f_lo) * 0.16)
-    df = float(np.nanmedian(np.diff(fb))) if fb.size > 1 else 1.0
-    max_jump_bins = int(max(2, min(fb.size - 1, round(max_jump_hz / max(df, 1e-9)))))
-    path = _smooth_energy_path(Sb, max_jump_bins=max_jump_bins)
-    lines["Ridge Tracking"] = fb[path] if path.size else lines["Original Peak"].copy()
-    _dbg("Ridge Tracking fertig", 0.58)
-
-    # Order tracking: vectorized scoring of RPM candidates by multiple harmonics.
-    _dbg("Methode Order Tracking: schnelle harmonische Bewertung ...", 0.60)
-    rpm_grid = np.linspace(max(100.0, rpm_min), max(rpm_min + 100.0, rpm_max), 180, dtype=np.float32)
-    f_grid_base = rpm_grid / np.float32(60.0) * np.float32(engine_factor * order)
-    harmonics = [1, 2, 3]
-    score = np.zeros((rpm_grid.size, db.shape[1]), dtype=np.float32)
-    for hi, h in enumerate(harmonics):
-        fg = f_grid_base * np.float32(h)
-        valid = (fg >= freqs[0]) & (fg <= freqs[-1])
-        if not np.any(valid):
-            continue
-        _dbg(f"Order Tracking: Harmonik {h}/{harmonics[-1]} mit {int(np.sum(valid))} RPM-Kandidaten", 0.61 + 0.04 * hi)
-        idx = np.searchsorted(freqs, fg[valid]).clip(1, len(freqs) - 1)
-        left = freqs[idx - 1]
-        right = freqs[idx]
-        use_left = np.abs(fg[valid] - left) <= np.abs(right - fg[valid])
-        idx = np.where(use_left, idx - 1, idx)
-        score[valid, :] += db[idx, :] / np.float32(h)
-    if np.isfinite(score).any():
-        _dbg("Order Tracking: schnelle Pfadglättung ...", 0.75)
-        rpath = _smooth_energy_path(score, max_jump_bins=max(3, int(rpm_grid.size * 0.035)))
-        rpm_order = rpm_grid[rpath] if rpath.size else rpm_grid[np.argmax(score, axis=0)]
-        lines["Order Tracking"] = rpm_order / 60.0 * engine_factor * order
-    else:
-        lines["Order Tracking"] = lines["Ridge Tracking"].copy()
-    _dbg("Order Tracking fertig", 0.79)
-
-    # Cepstrum per STFT frame: periodicity in event-frequency range.
-    _dbg("Methode Cepstrum: Periodizität je Zeitfenster suchen ...", 0.80)
-    cep_freq = np.full(db.shape[1], np.nan, dtype=float)
-    hop = max(1, nfft - noverlap)
-    q_lo = 1.0 / max(f_hi + pad, 1e-6)
-    q_hi = 1.0 / max(f_lo - pad, 1e-6) if (f_lo - pad) > 1 else 1.0 / max(f_lo, 1e-6)
-    q_hi = min(q_hi, 0.25)
-    # Cepstrum ist teuer. Bei vielen Frames wird es auf jedem n-ten Frame berechnet
-    # und danach interpoliert. Dadurch bleibt die UI bedienbar.
-    cep_stride = int(max(1, np.ceil(db.shape[1] / 1800)))
-    hann_cache = np.hanning(nfft).astype(np.float32)
-    q = np.arange(nfft // 2 + 1) / float(fs)
-    qm = (q >= q_lo) & (q <= q_hi)
-    for count, ti in enumerate(range(0, db.shape[1], cep_stride)):
-        if count % 250 == 0:
-            _dbg(f"Cepstrum: Frame {ti:,}/{db.shape[1]:,} (Stride {cep_stride})", min(0.91, 0.80 + 0.10 * ti / max(1, db.shape[1])))
-        start = ti * hop
-        frame = seg[start:start + nfft]
-        if frame.size < nfft:
-            continue
-        frame = frame * hann_cache
-        spec = np.abs(np.fft.rfft(frame, n=nfft))
-        log_spec = np.log(spec + 1e-12)
-        cep = np.abs(np.fft.irfft(log_spec, n=nfft))[:q.size]
-        if qm.any():
-            qi = np.argmax(cep[qm])
-            qvals = q[qm]
-            if qvals[qi] > 0:
-                cep_freq[ti] = 1.0 / qvals[qi]
-    lines["Cepstrum"] = _moving_median_nan(_interp_nan(cep_freq), 9)
-    _dbg("Cepstrum fertig", 0.92)
-
-    # Auto robust: prefer order when it is close to ridge; otherwise blend with ridge.
-    _dbg("Auto robust: Methoden fusionieren und RPM glätten ...", 0.94)
-    ridge = np.asarray(lines["Ridge Tracking"], dtype=float)
-    order_line = np.asarray(lines["Order Tracking"], dtype=float)
-    cep = np.asarray(lines["Cepstrum"], dtype=float)
-    auto = ridge.copy()
-    for i in range(auto.size):
-        cands = [v for v in (ridge[i], order_line[i], cep[i]) if np.isfinite(v) and f_lo - pad <= v <= f_hi + pad]
-        if cands:
-            auto[i] = float(np.median(cands))
-    auto = _moving_median_nan(_interp_nan(auto), 11)
-    lines["Auto robust"] = auto
-
-    for k in list(lines.keys()):
-        lines[k] = _moving_median_nan(_interp_nan(np.asarray(lines[k], dtype=float)), 7)
-    selected = method if method in lines else "Auto robust"
-    f_sel = np.asarray(lines[selected], dtype=float)
-    rpm = f_sel * 60.0 / (engine_factor * order)
-    rpm[(rpm < rpm_min * 0.55) | (rpm > rpm_max * 1.45)] = np.nan
-    rpm = _moving_median_nan(_interp_nan(rpm), 9)
-    _dbg("Audioanalyse-Kern fertig", 0.98)
-
-    return dict(
-        fs=int(fs), t=t_video.copy(), freqs=freqs.copy(), db=db.copy(),
-        audio_t=np.arange(a0, a1) / float(fs) - float(audio_offset_s), audio_y=seg.copy(),
-        freq_lines=lines, selected_method=selected, selected_freq=f_sel.copy(), rpm=rpm.copy(),
-        params=dict(start_s=start_s, end_s=end_s, audio_offset_s=float(audio_offset_s), nfft=nfft,
-                    overlap_pct=float(overlap_pct), fmax=float(fmax), cyl=int(cyl), takt=int(takt),
-                    order=float(order), rpm_min=float(rpm_min), rpm_max=float(rpm_max),
-                    engine_factor=float(engine_factor), f_search_lo=float(f_lo), f_search_hi=float(f_hi)),
-    )
-
 
 def _apply_centerline_to_session(mat_path: str, mat_name: str) -> None:
     """Parse .mat → centerline → render image + auto-set fixed ref points."""
@@ -4139,6 +3757,723 @@ def _load_centerline_from_r2(remote_key: str, mat_name: str) -> None:
     else:
         set_status(f"Download fehlgeschlagen: {msg}", "warn")
 
+
+
+# ==============================
+# Audio / RPM helper functions
+# ==============================
+def _audio_load_current_capture() -> tuple[bool, str, int, np.ndarray, str]:
+    """Prefer cloud audio_proxy_1k.wav; local audio is only fallback."""
+    folder = str(st.session_state.get("capture_folder") or "").strip("/\\")
+    if not folder:
+        return False, "Kein capture_folder aktiv. Bitte zuerst MAT + Video laden.", 0, np.array([], dtype=np.float32), ""
+    # Cloud proxy first
+    if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+        pfx = st.session_state.r2_prefix.strip("/")
+        key = f"{pfx}/captures/{folder}/{AUDIO_PROXY_NAME}" if pfx else f"captures/{folder}/{AUDIO_PROXY_NAME}"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav"); tmp.close()
+        ok, msg = st.session_state.r2_client.download_file(key, tmp.name)
+        if ok:
+            try:
+                fs, data = wavfile.read(tmp.name)
+                y = data.astype(np.float32, copy=False)
+                if y.ndim > 1:
+                    y = np.mean(y, axis=1)
+                if np.issubdtype(data.dtype, np.integer):
+                    y = y / max(1.0, float(np.iinfo(data.dtype).max))
+                return True, "", int(fs), np.asarray(y, dtype=np.float32).reshape(-1).copy(), f"cloud:{AUDIO_PROXY_NAME}"
+            except Exception as e:
+                return False, f"Cloud-Audio konnte nicht gelesen werden: {e}", 0, np.array([], dtype=np.float32), ""
+            finally:
+                try: Path(tmp.name).unlink(missing_ok=True)
+                except Exception: pass
+    # Local fallback
+    fp = _find_local_audio_file(folder)
+    if fp is not None:
+        try:
+            fs, data = wavfile.read(str(fp))
+            y = data.astype(np.float32, copy=False)
+            if y.ndim > 1: y = np.mean(y, axis=1)
+            if np.issubdtype(data.dtype, np.integer): y = y / max(1.0, float(np.iinfo(data.dtype).max))
+            return True, "", int(fs), np.asarray(y, dtype=np.float32).reshape(-1).copy(), f"local:{fp.name}"
+        except Exception as e:
+            return False, f"Lokale Audiodatei konnte nicht gelesen werden: {e}", 0, np.array([], dtype=np.float32), ""
+    return False, "Kein Audio gefunden (weder Cloud audio_proxy_1k.wav noch lokal).", 0, np.array([], dtype=np.float32), ""
+
+
+def _audio_candidate_cylinders(cyl: int, mode: str) -> list[int]:
+    if str(mode).startswith("Fest"):
+        return [max(1, int(cyl))]
+    return [3, 4, 5, 6, 8, 10, 12]
+
+
+def _audio_candidate_harmonics(order: int, mode: str) -> list[int]:
+    if str(mode).startswith("Fest"):
+        return [max(1, int(order))]
+    return [1, 2, 3]
+
+
+def _audio_candidate_nfft_overlap(nfft: int, overlap_pct: float, mode: str, fs: int, seg_len: int) -> list[tuple[int, float]]:
+    """Return STFT grid. Auto mode now really tests low/high NFFT and low/high overlap."""
+    nfft = int(max(64, nfft))
+    overlap_pct = float(max(0.0, min(98.0, overlap_pct)))
+    seg_len = int(max(64, seg_len))
+    if str(mode).startswith("Fest"):
+        return [(min(nfft, seg_len), overlap_pct)]
+
+    # Auto Schnell: grobe, sinnvolle Abdeckung. Auto Breit: alter grosser Suchraum.
+    if "Schnell" in str(mode):
+        base = [256, 512, 1024, 2048, 4096, 8192]
+        quick_ovs = [0.0, 25.0, 50.0, 75.0]
+    else:
+        base = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+        quick_ovs = None
+    vals = sorted({int(v) for v in base + [nfft] if 64 <= int(v) <= seg_len})
+    if not vals:
+        vals = [min(512, seg_len)]
+
+    ovs = sorted(set((quick_ovs or [0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 87.5, 90.0]) + [overlap_pct]))
+    combos = []
+    max_cells = 2_800_000
+    for nf in vals:
+        for ov in ovs:
+            hop = max(1, int(round(nf * (1.0 - ov / 100.0))))
+            nt = max(1, int(np.ceil(max(1, seg_len - nf) / hop)) + 1)
+            bins = nf // 2 + 1
+            if nt * bins <= max_cells:
+                combos.append((int(nf), float(ov)))
+
+    if len(combos) > 40:
+        keep = []
+        for nf in vals:
+            for ov in ovs:
+                if (nf, ov) in combos and (ov in (0.0, 10.0, 50.0, 75.0, 90.0) or nf in (64, 256, 1024, 4096, 16384)):
+                    keep.append((nf, ov))
+        combos = keep[:40] or combos[:40]
+    return combos or [(min(nfft, seg_len), overlap_pct)]
+
+
+def _audio_line_score(line, freqs, score, flo, fhi):
+    line = np.asarray(line, dtype=float).copy()
+    if line.size == 0:
+        return -1e12
+    vals = np.array([np.interp(ff, freqs, score[:, i], left=np.nan, right=np.nan) if np.isfinite(ff) and i < score.shape[1] else np.nan for i, ff in enumerate(line)], dtype=float)
+    finite = np.isfinite(vals) & np.isfinite(line)
+    width = max(1.0, float(fhi - flo))
+    if not finite.any():
+        return -1e12
+    smooth_penalty = float(np.nanmedian(np.abs(np.diff(_audio_interp_nan(line)))) / width) if line.size > 1 else 0.0
+    edge_penalty = float(np.nanmean(((line < flo + 0.03 * width) | (line > fhi - 0.03 * width)).astype(float)))
+    return float(np.nanmedian(vals[finite]) + 2.5 * float(finite.mean()) - 5.0 * smooth_penalty - 3.0 * edge_penalty)
+
+
+def _audio_peak_line(fb, sb):
+    return np.asarray(fb[np.nanargmax(sb, axis=0)], dtype=float).copy()
+
+
+def _audio_greedy_ridge_line(fb, sb, flo, fhi, smooth_win=7, max_jump_frac=0.08):
+    nf, nt = sb.shape
+    if nt <= 0 or nf <= 0:
+        return np.array([], dtype=float)
+    path = np.zeros(nt, dtype=int)
+    strength = (np.nanmax(sb, axis=0) - np.nanmedian(sb, axis=0)).astype(float, copy=True)
+    anchor = int(np.nanargmax(strength)) if np.isfinite(strength).any() else 0
+    path[anchor] = int(np.nanargmax(sb[:, anchor]))
+    df = float(np.nanmedian(np.diff(fb))) if len(fb) > 1 else 1.0
+    maxjump = int(max(1, min(nf - 1, round(max(4.0, max_jump_frac * (fhi - flo)) / max(df, 1e-9)))))
+    for j in range(anchor + 1, nt):
+        p = path[j - 1]; lo = max(0, p - maxjump); hi = min(nf, p + maxjump + 1)
+        path[j] = lo + int(np.nanargmax(sb[lo:hi, j]))
+    for j in range(anchor - 1, -1, -1):
+        p = path[j + 1]; lo = max(0, p - maxjump); hi = min(nf, p + maxjump + 1)
+        path[j] = lo + int(np.nanargmax(sb[lo:hi, j]))
+    line = np.asarray(_audio_smooth(fb[path], smooth_win), dtype=float).copy()
+    line[(line < flo) | (line > fhi)] = np.nan
+    return np.asarray(_audio_smooth(line, smooth_win), dtype=float).copy()
+
+
+def _audio_viterbi_line(fb, sb, flo, fhi, smooth_win=5, jump_hz=25.0, penalty=1.2):
+    nf, nt = sb.shape
+    if nt <= 0 or nf <= 0:
+        return np.array([], dtype=float)
+    df = float(np.nanmedian(np.diff(fb))) if len(fb) > 1 else 1.0
+    w = int(max(1, min(nf - 1, round(float(jump_hz) / max(df, 1e-9)))))
+    z = np.asarray(sb, dtype=np.float32).copy()
+    z = z - np.nanmedian(z, axis=0, keepdims=True)
+    dp = np.full((nf, nt), -1e9, dtype=np.float32)
+    prev = np.zeros((nf, nt), dtype=np.int16 if nf < 32767 else np.int32)
+    dp[:, 0] = z[:, 0]
+    for t in range(1, nt):
+        old = dp[:, t - 1]
+        for i in range(nf):
+            lo = max(0, i - w); hi = min(nf, i + w + 1)
+            js = np.arange(lo, hi)
+            trans = old[lo:hi] - penalty * (np.abs(js - i) / max(1, w))
+            k = int(np.argmax(trans))
+            dp[i, t] = z[i, t] + trans[k]
+            prev[i, t] = lo + k
+    path = np.zeros(nt, dtype=int)
+    path[-1] = int(np.argmax(dp[:, -1]))
+    for t in range(nt - 1, 0, -1):
+        path[t - 1] = int(prev[path[t], t])
+    line = np.asarray(_audio_smooth(fb[path], smooth_win), dtype=float).copy()
+    line[(line < flo) | (line > fhi)] = np.nan
+    return line
+
+
+def _audio_autocorr_line(seg, fs, nfft_eff, noverlap, nt, flo, fhi, max_frames=700):
+    out = np.full(nt, np.nan, dtype=float)
+    lag_min = int(max(2, np.floor(fs / max(fhi, 1))))
+    lag_max = int(min(nfft_eff - 2, np.ceil(fs / max(flo, 1))))
+    if lag_max <= lag_min + 2:
+        return out
+    stride = max(1, int(np.ceil(nt / max_frames)))
+    hop = max(1, nfft_eff - noverlap)
+    win = np.hanning(nfft_eff).astype(np.float32)
+    for ti in range(0, nt, stride):
+        stt = int(ti * hop)
+        fr = np.asarray(seg[stt:stt + nfft_eff], dtype=np.float32).copy()
+        if fr.size < nfft_eff:
+            continue
+        fr = ((fr - np.mean(fr)) * win).astype(np.float32, copy=False)
+        ac = np.correlate(fr, fr, mode='full')[nfft_eff - 1:]
+        ac0 = float(ac[0]) if ac.size else 0.0
+        if ac0 <= 1e-9:
+            continue
+        part = np.asarray(ac[lag_min:lag_max + 1] / ac0, dtype=float).copy()
+        peaks, props = signal.find_peaks(part, prominence=0.02)
+        pk_i = int(peaks[np.argmax(props.get('prominences', np.ones_like(peaks)))]) if len(peaks) else int(np.argmax(part))
+        out[ti] = fs / float(lag_min + pk_i)
+    if np.isfinite(out).sum() >= 2:
+        x = np.arange(nt); m = np.isfinite(out)
+        out = np.interp(x, x[m], out[m]).astype(float, copy=True)
+    line = np.asarray(_audio_smooth(out, 9), dtype=float).copy()
+    line[(line < flo) | (line > fhi)] = np.nan
+    return line
+
+
+def _audio_cepstrum_line(seg, fs, nfft_eff, noverlap, nt, flo, fhi, max_frames=700):
+    out = np.full(nt, np.nan, dtype=float)
+    q_min = 1.0 / max(fhi, 1.0)
+    q_max = 1.0 / max(flo, 1.0)
+    qi0 = int(max(1, np.floor(q_min * fs)))
+    qi1 = int(min(nfft_eff // 2, np.ceil(q_max * fs)))
+    if qi1 <= qi0 + 2:
+        return out
+    stride = max(1, int(np.ceil(nt / max_frames)))
+    hop = max(1, nfft_eff - noverlap)
+    win = np.hanning(nfft_eff).astype(np.float32)
+    for ti in range(0, nt, stride):
+        stt = int(ti * hop)
+        fr = np.asarray(seg[stt:stt + nfft_eff], dtype=np.float32).copy()
+        if fr.size < nfft_eff:
+            continue
+        fr = ((fr - np.mean(fr)) * win).astype(np.float32, copy=False)
+        spec = np.abs(np.fft.rfft(fr, n=nfft_eff))
+        cep = np.abs(np.fft.irfft(np.log(np.maximum(spec, 1e-12)), n=nfft_eff))
+        part = cep[qi0:qi1 + 1]
+        if part.size:
+            out[ti] = fs / float(int(np.argmax(part)) + qi0)
+    if np.isfinite(out).sum() >= 2:
+        x = np.arange(nt); m = np.isfinite(out)
+        out = np.interp(x, x[m], out[m]).astype(float, copy=True)
+    line = np.asarray(_audio_smooth(out, 9), dtype=float).copy()
+    line[(line < flo) | (line > fhi)] = np.nan
+    return line
+
+
+def _audio_harmonic_comb_line(freqs, score, flo, fhi, harmonics=4):
+    freqs = np.asarray(freqs, dtype=float)
+    nt = score.shape[1]
+    cand = freqs[(freqs >= flo) & (freqs <= fhi)]
+    if cand.size < 3:
+        return np.full(nt, np.nan, dtype=float)
+    out = np.full(nt, np.nan, dtype=float)
+    for t in range(nt):
+        vals = []
+        for f0 in cand:
+            sc = 0.0; n = 0
+            for k in range(1, int(max(1, harmonics)) + 1):
+                fk = f0 * k
+                if fk > freqs[-1]:
+                    break
+                v = float(np.interp(fk, freqs, score[:, t], left=np.nan, right=np.nan))
+                if np.isfinite(v):
+                    sc += v / np.sqrt(k); n += 1
+            vals.append(sc / max(1, n))
+        out[t] = cand[int(np.nanargmax(vals))]
+    return np.asarray(_audio_smooth(out, 9), dtype=float).copy()
+
+
+def _audio_cwt_like_line(seg, fs, t_video, flo, fhi):
+    nt = len(t_video)
+    if nt <= 0:
+        return np.array([], dtype=float)
+    freqs_grid = np.linspace(flo, fhi, max(16, min(96, int((fhi - flo) / 4))))
+    env = np.zeros((len(freqs_grid), nt), dtype=np.float32)
+    full_t = np.arange(len(seg), dtype=float) / float(fs)
+    rel_t = np.asarray(t_video, dtype=float) - float(t_video[0])
+    for i, fc in enumerate(freqs_grid):
+        bw = max(8.0, fc * 0.08)
+        lo = max(1.0, fc - bw / 2) / (fs / 2)
+        hi = min(fs / 2 * 0.98, fc + bw / 2) / (fs / 2)
+        if hi <= lo:
+            continue
+        try:
+            b, a = signal.butter(2, [lo, hi], btype='band')
+            yb = signal.filtfilt(b, a, seg).astype(np.float32)
+            e = np.abs(signal.hilbert(yb)).astype(np.float32)
+            env[i, :] = np.interp(rel_t, full_t, e, left=np.nan, right=np.nan)
+        except Exception:
+            continue
+    idx = np.nanargmax(env, axis=0)
+    return np.asarray(_audio_smooth(freqs_grid[idx], 9), dtype=float).copy()
+
+def _audio_get_vehicle_title() -> str:
+    obj = st.session_state.get("mat_selected_summary")
+    parts = []
+    if isinstance(obj, dict):
+        dataset = str(obj.get("capture_folder") or obj.get("mat_file") or "").strip()
+        video_title = ""
+        for k in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
+            txt = str(obj.get(k, "") or "").strip()
+            if txt and txt not in parts:
+                video_title = txt
+                break
+        if dataset:
+            parts.append(dataset)
+        if video_title and video_title != dataset:
+            parts.append(video_title)
+        if parts:
+            return " · ".join(parts)
+    for k in ("audio_vehicle_title", "video_name", "capture_folder"):
+        txt = str(st.session_state.get(k, "") or "").strip()
+        if txt:
+            return txt
+    return ""
+
+
+def _audio_interp_nan(x):
+    x = np.asarray(x, dtype=float).copy()
+    if x.size == 0: return x
+    m = np.isfinite(x)
+    if not m.any(): return x
+    if m.sum() == 1:
+        x[:] = x[m][0]; return x
+    idx = np.arange(x.size)
+    x[~m] = np.interp(idx[~m], idx[m], x[m])
+    return x
+
+
+def _audio_smooth(x, win=7):
+    x = _audio_interp_nan(x)
+    try:
+        return pd.Series(x).rolling(int(max(3, win)) | 1, center=True, min_periods=1).median().to_numpy(dtype=float).copy()
+    except Exception:
+        return x
+
+
+def _audio_make_debug_zip(res: dict, shown_lines=None) -> bytes:
+    shown_lines = shown_lines or []
+    buf = io.BytesIO()
+    def npb(a):
+        b=io.BytesIO(); np.save(b, np.asarray(a)); return b.getvalue()
+    lines = res.get("freq_lines") or {}
+    t = np.asarray(res.get("t", []), dtype=np.float32)
+    freqs = np.asarray(res.get("freqs", []), dtype=np.float32)
+    db = np.asarray(res.get("db", []), dtype=np.float32)
+    meta = dict(params=res.get("params", {}), ui=res.get("ui", {}), source=res.get("source", ""), selected_method=res.get("selected_method", ""), candidate_table=res.get("candidate_table", []))
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("metadata.json", json.dumps(meta, ensure_ascii=False, indent=2, default=str))
+        try:
+            z.writestr("live_debug_log.txt", "\n".join([str(x) for x in (res.get("debug_lines") or st.session_state.get("audio_debug_lines", []) or [])]).encode("utf-8"))
+        except Exception:
+            pass
+        z.writestr("times_s.npy", npb(t)); z.writestr("frequencies_hz.npy", npb(freqs)); z.writestr("spectrogram_db.npy", npb(db)); z.writestr("rpm_selected.npy", npb(res.get("rpm", [])))
+        csv = {"t_s": t.astype(float)} if t.size else {}
+        for name, arr in lines.items():
+            safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(name)).strip("._") or "line"
+            aa = np.asarray(arr, dtype=np.float32)
+            z.writestr(f"lines/{safe}_Hz.npy", npb(aa))
+            if t.size and aa.size == t.size: csv[f"freq_{safe}_Hz"] = aa.astype(float)
+        if csv: z.writestr("lines_table.csv", pd.DataFrame(csv).to_csv(index=False).encode("utf-8"))
+        z.writestr("lines.json", json.dumps({str(k): np.asarray(v).tolist() for k, v in lines.items()}, ensure_ascii=False))
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            for wl in [False, True]:
+                fig, ax = plt.subplots(figsize=(13, 6), dpi=140)
+                if db.ndim == 2 and t.size and freqs.size:
+                    stp_t=max(1, int(np.ceil(db.shape[1]/1600))); stp_f=max(1, int(np.ceil(db.shape[0]/800)))
+                    ax.pcolormesh(t[::stp_t], freqs[::stp_f], db[::stp_f, ::stp_t], shading="auto")
+                if wl:
+                    for name in (shown_lines or list(lines.keys())):
+                        a=np.asarray(lines.get(name, []), dtype=float)
+                        if a.size == t.size: ax.plot(t, a, linewidth=1.1, label=str(name))
+                    if ax.get_legend_handles_labels()[0]: ax.legend(fontsize=7)
+                ax.set_xlabel("t [s]"); ax.set_ylabel("f [Hz]"); ax.grid(True, alpha=.25)
+                fig.tight_layout(); png=io.BytesIO(); fig.savefig(png, format="png"); plt.close(fig)
+                z.writestr("spectrogram_with_frequency_lines.png" if wl else "spectrogram_only.png", png.getvalue())
+        except Exception as e:
+            z.writestr("png_error.txt", str(e))
+    buf.seek(0); return buf.getvalue()
+
+
+@st.cache_resource(show_spinner=False)
+def _audio_executor():
+    return cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="audio_rpm")
+
+
+@st.cache_resource(show_spinner=False)
+def _audio_live_server():
+    """Small localhost JSON endpoint for live audio status without Streamlit reruns."""
+    state = {"jobs": {}}
+    lock = threading.RLock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args, **kwargs):
+            return
+
+        def _send_json(self, payload, code=200):
+            data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def do_GET(self):
+            try:
+                parsed = urlparse(self.path)
+                if parsed.path != "/audio":
+                    self._send_json({"ok": False, "error": "not found"}, 404)
+                    return
+                q = parse_qs(parsed.query or "")
+                job_id = (q.get("id") or [""])[0]
+                with lock:
+                    job = dict((state.get("jobs") or {}).get(job_id) or {})
+                    job["log"] = list(job.get("log") or [])[-80:]
+                    job["progress"] = dict(job.get("progress") or {})
+                self._send_json({"ok": True, "job": job})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, 500)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    host, port = sock.getsockname()
+    sock.close()
+    server = ThreadingHTTPServer(("127.0.0.1", int(port)), Handler)
+    thread = threading.Thread(target=server.serve_forever, name="audio_live_status_http", daemon=True)
+    thread.start()
+    return {"state": state, "lock": lock, "port": int(port), "server": server, "thread": thread}
+
+
+def _audio_live_update(job_id: str, *, log_line=None, progress=None, status=None):
+    if not job_id:
+        return
+    try:
+        live = _audio_live_server()
+        state = live["state"]
+        lock = live["lock"]
+        with lock:
+            jobs = state.setdefault("jobs", {})
+            job = jobs.setdefault(job_id, {"log": [], "progress": {}, "status": "running", "updated": time.time()})
+            if log_line is not None:
+                job.setdefault("log", []).append(str(log_line))
+                if len(job["log"]) > 300:
+                    del job["log"][:-300]
+            if progress is not None:
+                job["progress"] = dict(progress)
+            if status is not None:
+                job["status"] = str(status)
+            job["updated"] = time.time()
+    except Exception:
+        pass
+
+
+def _audio_live_widget(job_id: str, height: int = 330):
+    if not job_id:
+        return
+    try:
+        live = _audio_live_server()
+        port = int(live.get("port"))
+    except Exception:
+        return
+    endpoint = f"http://127.0.0.1:{port}/audio?id={job_id}"
+    html = f"""
+    <div id="audio-live-root" style="font-family: JetBrains Mono, monospace; background:#0a0c10; border:1px solid #1e2535; border-radius:8px; padding:10px 12px; color:#e8eaf0;">
+      <div id="audio-live-title" style="font-weight:800; font-size:12px; color:#4a90a4; margin-bottom:8px;">Audioanalyse läuft im Hintergrund</div>
+      <div style="height:12px; background:#1e2535; border-radius:999px; overflow:hidden; border:1px solid #243049;">
+        <div id="audio-live-bar" style="height:100%; width:0%; background:#3ddc84; border-radius:999px; transition:width .25s linear;"></div>
+      </div>
+      <div id="audio-live-text" style="font-size:11px; color:#b7c3d8; margin-top:6px;">Warte auf Status ...</div>
+      <pre id="audio-live-log" style="white-space:pre-wrap; margin:10px 0 0 0; max-height:220px; overflow:auto; background:#07090d; border:1px solid #1e2535; border-radius:6px; padding:8px; font-size:11px; line-height:1.35; color:#d8dee9;">Noch kein Audio-Debug vorhanden.</pre>
+    </div>
+    <script>
+    const endpoint = {json.dumps(endpoint)};
+    const bar = document.getElementById('audio-live-bar');
+    const text = document.getElementById('audio-live-text');
+    const log = document.getElementById('audio-live-log');
+    const title = document.getElementById('audio-live-title');
+    let stopped = false;
+    async function tick() {{
+      try {{
+        const r = await fetch(endpoint + '&_=' + Date.now(), {{cache:'no-store'}});
+        const data = await r.json();
+        const job = (data && data.job) || {{}};
+        const p = job.progress || {{}};
+        const done = Number(p.done || 0);
+        const total = Math.max(1, Number(p.total || 1));
+        const frac = Math.max(0, Math.min(1, Number(p.fraction || (done/total) || 0)));
+        const pct = Math.round(frac * 100);
+        const msg = String(p.text || '');
+        const status = String(job.status || 'running');
+        bar.style.width = pct + '%';
+        if (status === 'done') {{
+          title.textContent = 'Audioanalyse abgeschlossen';
+          text.textContent = `Fertig: ${{done}}/${{total}} Jobs (${{pct}}%)${{msg ? ' - ' + msg : ''}}`;
+          stopped = true;
+        }} else if (status === 'error') {{
+          title.textContent = 'Audioanalyse fehlgeschlagen';
+          text.textContent = msg || 'Fehler';
+          stopped = true;
+        }} else {{
+          title.textContent = 'Audioanalyse läuft im Hintergrund';
+          text.textContent = `Audioanalyse: ${{done}}/${{total}} Jobs (${{pct}}%)${{msg ? ' - ' + msg : ''}}`;
+        }}
+        const lines = Array.isArray(job.log) ? job.log.slice(-60) : [];
+        log.textContent = lines.length ? lines.join('\n') : 'Noch kein Audio-Debug vorhanden.';
+        log.scrollTop = log.scrollHeight;
+      }} catch(e) {{
+        text.textContent = 'Live-Status nicht erreichbar: ' + e;
+      }}
+      if (!stopped) window.setTimeout(tick, 1000);
+    }}
+    tick();
+    </script>
+    """
+    components.html(html, height=height)
+
+
+def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_progress=None, live_job_id=None):
+    log = []
+    t0 = time.perf_counter()
+
+    def _push_log(line: str):
+        log.append(line)
+        _audio_live_update(live_job_id, log_line=line, status="running")
+        if shared_log is not None:
+            try:
+                shared_log.append(line)
+                if len(shared_log) > 300:
+                    del shared_log[:-300]
+            except Exception:
+                pass
+
+    def _set_progress(done, total, text=""):
+        if shared_progress is not None:
+            try:
+                total = max(1, int(total))
+                done = max(0, min(int(done), total))
+                payload = {"done": done, "total": total, "fraction": float(done) / float(total), "text": str(text or ""), "updated": time.time(), "elapsed": time.perf_counter() - t0}
+                shared_progress.update(payload)
+                _audio_live_update(live_job_id, progress=payload, status="running")
+            except Exception:
+                pass
+
+    def dbg(m):
+        _push_log(f"[{time.perf_counter()-t0:7.2f}s] {m}")
+
+    def progress_cb(done, total, text=""):
+        _set_progress(done, total, text)
+
+    _set_progress(0, 1, "Audioanalyse startet ...")
+    res = _audio_extract_rpm_robust(
+        y, fs,
+        params["start_s"], params["end_s"], params["offset_s"],
+        params["nfft"], params["overlap_pct"], params["fmax"],
+        params["cyl"], params["takt"], params["order"],
+        params["rpm_min"], params["rpm_max"], params["method"],
+        params["cyl_mode"], params["harmonic_mode"], params["drive_type"],
+        stft_mode=params.get("stft_mode", "Fest auswÃ¤hlen"),
+        debug_cb=dbg,
+        method_params=params.get("method_params", {}),
+        progress_cb=progress_cb,
+    )
+    _set_progress(1, 1, "Audioanalyse fertig. Ergebnis wird uebernommen.")
+    _audio_live_update(live_job_id, status="done")
+    res["source"] = source
+    res["ui"] = dict(ui or {})
+    _push_log("Audioanalyse fertig. Ergebnis wird uebernommen.")
+    res["debug_lines"] = list(log[-300:])
+    return res
+
+
+def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode="Fest auswählen", debug_cb=None, method_params=None, progress_cb=None):
+    def dbg(msg):
+        if callable(debug_cb):
+            debug_cb(msg)
+
+    def prog(done, total, msg=""):
+        if callable(progress_cb):
+            try:
+                progress_cb(int(done), int(max(1, total)), str(msg or ""))
+            except Exception:
+                pass
+
+    mp = dict(method_params or {})
+    y = np.asarray(y, dtype=np.float32).reshape(-1).copy()
+    a0 = max(0, int(round((float(start_s) + float(offset_s)) * fs)))
+    a1 = min(len(y), int(round((float(end_s) + float(offset_s)) * fs)))
+    if a1 <= a0 + max(64, int(.1 * fs)):
+        raise ValueError("Audiosegment ist leer. Start/Ende/Offset pruefen.")
+
+    seg = np.asarray(y[a0:a1], dtype=np.float32).reshape(-1).copy()
+    seg = seg - np.float32(np.nanmedian(seg))
+    pk = float(np.nanmax(np.abs(seg)) or 1.0)
+    seg = (seg / pk).astype(np.float32, copy=True)
+    fmax = float(min(max(20.0, fmax), fs / 2))
+
+    is_ev = "elekt" in str(drive_type).lower() or "ev" in str(drive_type).lower()
+    cyls = [0] if is_ev else _audio_candidate_cylinders(cyl, cyl_mode)
+    harms = _audio_candidate_harmonics(order, harmonic_mode)
+    takt = max(1, int(takt)); order_base = max(.1, float(order))
+    rpm_min = float(max(100, rpm_min)); rpm_max = float(max(rpm_min + 100, rpm_max))
+
+    stft_candidates = _audio_candidate_nfft_overlap(nfft, overlap_pct, stft_mode, fs, len(seg))
+    dbg(f"Audiosegment: {len(seg):,} Samples @ {fs} Hz ({len(seg)/max(fs,1):.2f} s), Zeitfenster {start_s:.2f}-{end_s:.2f} s, Offset {offset_s:.2f} s")
+    dbg("STFT Kandidaten: " + ", ".join([f"NFFT {nf}/OV {ov:g}%" for nf, ov in stft_candidates]))
+    total_jobs = max(1, len(stft_candidates) * max(1, len(cyls)) * max(1, len(harms)))
+    done_jobs = 0
+    dbg(f"Kandidatenraum: {len(stft_candidates)} STFT-Kombi(s) × {len(cyls)} Zylinder/Antrieb × {len(harms)} Harmonische = {total_jobs} Jobs")
+    prog(0, total_jobs, "Audioanalyse vorbereitet")
+
+    all_candidates = []
+    all_method_names = ["Hybrid", "STFT Ridge", "STFT Viterbi", "Original Peak", "Autokorrelation/YIN", "Cepstrum", "Harmonic Comb/HPS", "CWT/Wavelet"]
+    comb_harmonics = int(mp.get("comb_harmonics", 4) or 4)
+    viterbi_jump_hz = float(mp.get("viterbi_jump_hz", 25.0) or 25.0)
+    viterbi_penalty = float(mp.get("viterbi_penalty", 1.2) or 1.2)
+
+    for combo_idx, (nfft_req, ov_req) in enumerate(stft_candidates, 1):
+        nfft_eff = int(max(64, min(int(nfft_req), len(seg))))
+        ov_eff = float(max(0, min(98, ov_req)))
+        noverlap = int(max(0, min(nfft_eff - 1, round(nfft_eff * ov_eff / 100))))
+        dbg(f"STFT {combo_idx}/{len(stft_candidates)}: NFFT {nfft_eff} (angefragt {nfft_req}), Overlap {ov_eff:g}%")
+        try:
+            _stft_t0 = time.perf_counter()
+            freqs, tt, mag = signal.spectrogram(seg, fs=fs, window='hann', nperseg=nfft_eff, noverlap=noverlap, nfft=nfft_eff, detrend=False, scaling='spectrum', mode='magnitude')
+            dbg(f"  STFT Matrix: {len(freqs)} Frequenzbins × {len(tt)} Zeitframes in {time.perf_counter()-_stft_t0:.2f}s")
+        except Exception as e:
+            dbg(f"STFT übersprungen ({nfft_eff}/{ov_eff:g}%): {e}")
+            continue
+        keep = np.asarray(freqs <= fmax, dtype=bool).copy()
+        freqs2 = np.asarray(freqs[keep], dtype=np.float32).copy()
+        mag2 = np.asarray(mag[keep, :], dtype=np.float32).copy()
+        if freqs2.size < 4 or mag2.size == 0:
+            continue
+        db = (20 * np.log10(np.maximum(mag2, 1e-12))).astype(np.float32, copy=True)
+        row = np.nanmedian(db, axis=1, keepdims=True).astype(np.float32, copy=False)
+        col = np.nanmedian(db - row, axis=0, keepdims=True).astype(np.float32, copy=False)
+        score = (db - row - col).astype(np.float32, copy=True)
+        t_video = tt.astype(np.float32) + np.float32(a0 / fs - float(offset_s))
+
+        for ci in cyls:
+            eng = 1.0 if is_ev else max(.1, 2 * float(ci) / float(takt))
+            for h in harms:
+                conv = eng * order_base * float(h)
+                flo = max(5.0, rpm_min / 60 * conv)
+                fhi = min(fmax, rpm_max / 60 * conv)
+                if fhi <= flo + 3:
+                    continue
+                pad = max(6.0, .08 * (fhi - flo))
+                bm = np.asarray((freqs2 >= max(0, flo - pad)) & (freqs2 <= min(fmax, fhi + pad)), dtype=bool).copy()
+                if int(bm.sum()) < 4:
+                    continue
+                fb = np.asarray(freqs2[bm], dtype=np.float32).copy()
+                sb = np.asarray(score[bm, :], dtype=np.float32).copy()
+
+                done_jobs += 1
+                job_txt = f"Job {done_jobs}/{total_jobs}: NFFT {nfft_eff}, OV {ov_eff:g}%, {'EV' if ci == 0 else 'C'+str(ci)}, H{h}, Band {flo:.1f}-{fhi:.1f} Hz"
+                dbg(job_txt)
+                prog(done_jobs - 1, total_jobs, job_txt)
+                _job_t0 = time.perf_counter()
+
+                method_lines = {}
+                fast_mode = bool(mp.get("fast_mode", True))
+                method_s = str(method)
+                # Schnelle Basismethoden: diese sind vektorisiert und reichen fuer die Vorauswahl meist aus.
+                method_lines["Original Peak"] = np.asarray(_audio_smooth(_audio_peak_line(fb, sb), 5), dtype=float).copy()
+                method_lines["STFT Ridge"] = _audio_greedy_ridge_line(fb, sb, flo, fhi, smooth_win=int(mp.get("ridge_smooth", 7) or 7), max_jump_frac=float(mp.get("ridge_jump_frac", 0.08) or 0.08))
+                method_lines["STFT Viterbi"] = _audio_viterbi_line(fb, sb, flo, fhi, smooth_win=int(mp.get("viterbi_smooth", 5) or 5), jump_hz=viterbi_jump_hz, penalty=viterbi_penalty)
+                # Teure Methoden nur berechnen, wenn sie explizit gewaehlt sind oder Genau-Modus aktiv ist.
+                if (not fast_mode) or method_s == "Autokorrelation/YIN":
+                    method_lines["Autokorrelation/YIN"] = _audio_autocorr_line(seg, fs, nfft_eff, noverlap, sb.shape[1], flo, fhi)
+                if (not fast_mode) or method_s == "Cepstrum":
+                    method_lines["Cepstrum"] = _audio_cepstrum_line(seg, fs, nfft_eff, noverlap, sb.shape[1], flo, fhi)
+                if (not fast_mode) or method_s == "Harmonic Comb/HPS":
+                    method_lines["Harmonic Comb/HPS"] = _audio_harmonic_comb_line(freqs2, score, flo, fhi, harmonics=comb_harmonics)
+                # CWT/Wavelet ist sehr langsam; im Schnellmodus nur bei expliziter Auswahl.
+                if method_s == "CWT/Wavelet" or ((not fast_mode) and bool(mp.get("always_run_cwt", False))):
+                    method_lines["CWT/Wavelet"] = _audio_cwt_like_line(seg, fs, t_video, flo, fhi)
+
+                scores = {name: _audio_line_score(line, freqs2, score, flo, fhi) for name, line in method_lines.items()}
+                valid = [(name, line) for name, line in method_lines.items() if np.isfinite(scores.get(name, np.nan)) and scores.get(name, -1e12) > -1e11]
+                if valid:
+                    # Hybrid = median of the best agreeing tracks, not just a renamed ridge.
+                    ranked = sorted(valid, key=lambda kv: scores.get(kv[0], -1e12), reverse=True)[:4]
+                    stack = np.vstack([np.asarray(v, dtype=float) for _, v in ranked])
+                    hybrid = np.nanmedian(stack, axis=0)
+                    method_lines["Hybrid"] = np.asarray(_audio_smooth(hybrid, int(mp.get("hybrid_smooth", 9) or 9)), dtype=float).copy()
+                    scores["Hybrid"] = _audio_line_score(method_lines["Hybrid"], freqs2, score, flo, fhi) + 0.4
+                else:
+                    method_lines["Hybrid"] = method_lines.get("STFT Ridge", np.full(sb.shape[1], np.nan))
+                    scores["Hybrid"] = scores.get("STFT Ridge", -1e12)
+
+                best_method_dbg = max(scores.items(), key=lambda kv: kv[1])[0] if scores else "-"
+                dbg(f"  fertig in {time.perf_counter()-_job_t0:.2f}s · bester Teilscore: {best_method_dbg} = {scores.get(best_method_dbg, float('nan')):.3f}")
+                prog(done_jobs, total_jobs, job_txt)
+
+                selected_for_rank = "Hybrid" if str(method) in ("Auto robust", "Hybrid") else str(method)
+                rank_score = scores.get(selected_for_rank, max(scores.values() if scores else [-1e12]))
+                for mname, line in method_lines.items():
+                    if line is None or len(line) != sb.shape[1]:
+                        continue
+                    all_candidates.append(dict(method=mname, cyl=ci, harmonic=h, conv=conv, engine_factor=eng, f_lo=flo, f_hi=fhi, line=np.asarray(line, dtype=float).copy(), score=float(scores.get(mname, -1e12)), rank_score=float(rank_score if mname == selected_for_rank else scores.get(mname, -1e12)), nfft=nfft_eff, overlap_pct=ov_eff, db=db, freqs=freqs2, t=t_video, all_lines=method_lines))
+
+    if not all_candidates:
+        raise ValueError("Keine plausiblen Kandidaten gefunden. RPM/fmax/Zylinder/Harmonische/NFFT prüfen.")
+
+    selected_method = "Hybrid" if str(method) in ("Auto robust", "Hybrid") else str(method)
+    filtered = [c for c in all_candidates if c.get("method") == selected_method]
+    pool = filtered or all_candidates
+    pool.sort(key=lambda c: c.get('score', -1e12), reverse=True)
+    best = pool[0]
+
+    freqs = best['freqs']; db = best['db']; t_video = best['t']
+    lines = {}
+    for name, line in (best.get('all_lines') or {}).items():
+        lines[name] = np.asarray(line, dtype=float).copy()
+    for i, c in enumerate(sorted(all_candidates, key=lambda x: x.get('score', -1e12), reverse=True)[:10], 1):
+        lines[f"Kandidat {i}: {c['method']} {'EV' if c['cyl']==0 else 'C'+str(c['cyl'])} H{c['harmonic']} N{c['nfft']} O{c['overlap_pct']:g}"] = c['line']
+
+    fsel = np.asarray(best['line'], dtype=float).copy()
+    rpm = np.asarray(_audio_smooth(fsel * 60 / max(best['conv'], 1e-9), 9), dtype=float).copy()
+    rpm[np.asarray((rpm < rpm_min * .5) | (rpm > rpm_max * 1.5), dtype=bool).copy()] = np.nan
+
+    table = [{"Rang": i + 1, "Methode": c['method'], "Zyl": "EV" if c['cyl'] == 0 else c['cyl'], "Harmonik": c['harmonic'], "NFFT": c['nfft'], "Overlap_%": c['overlap_pct'], "Score": round(c['score'], 3), "Band_Hz": f"{c['f_lo']:.1f}-{c['f_hi']:.1f}"} for i, c in enumerate(sorted(all_candidates, key=lambda x: x.get('score', -1e12), reverse=True)[:50])]
+    dbg(f"Auswahl: {best['method']} · {'EV' if best['cyl']==0 else 'C'+str(best['cyl'])} · H{best['harmonic']} · NFFT {best['nfft']} · OV {best['overlap_pct']:g}% · Score {best['score']:.3f}")
+    prog(total_jobs, total_jobs, "Audioanalyse abgeschlossen")
+    return dict(fs=int(fs), t=t_video, freqs=freqs, db=db, audio_t=np.arange(a0, a1) / float(fs) - float(offset_s), audio_y=seg, freq_lines=lines, selected_method=selected_method, selected_freq=fsel, rpm=rpm, candidate_table=table, debug_lines=[], params=dict(start_s=start_s, end_s=end_s, audio_offset_s=offset_s, nfft=best['nfft'], nfft_requested=nfft, overlap_pct=best['overlap_pct'], overlap_requested=overlap_pct, stft_mode=stft_mode, fmax=fmax, cyl=best['cyl'], takt=takt, order=order_base, harmonic=best['harmonic'], drive_type=drive_type, f_search_lo=best['f_lo'], f_search_hi=best['f_hi'], conversion_factor=best['conv'], method_params=mp))
 
 _try_auto_connect_once()
 _try_auto_connect_local_once()
@@ -4840,6 +5175,8 @@ with tab_mat:
                 set_status("MAT konnte nicht geladen werden.", "warn")
             elif not video_ok:
                 set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
+            if mat_loaded:
+                st.session_state.audio_last_mat_path = mat_loaded
         st.session_state.tab_default = "ROI Setup"
         st.session_state.mat_load_running = False
         st.rerun()
@@ -4849,222 +5186,229 @@ with tab_mat:
 
 
 
-
-def _plotly_heatmap_decimated(t, f, z, max_cells: int = 900_000):
-    """Return decimated t/f/z for interactive display without exhausting browser/RAM."""
-    t = np.asarray(t, dtype=np.float32)
-    f = np.asarray(f, dtype=np.float32)
-    z = np.asarray(z, dtype=np.float32)
-    if z.ndim != 2 or z.size == 0:
-        return t, f, z
-    nf, nt = z.shape
-    if nf * nt <= max_cells:
-        return t, f, z
-    f_step = max(1, int(np.ceil(nf / 650)))
-    t_step = max(1, int(np.ceil((nf // f_step) * nt / max_cells)))
-    return t[::t_step], f[::f_step], z[::f_step, ::t_step]
-
 # ==============================
 # TAB AUDIO AUSWERTUNG
 # ==============================
 with tab_audio:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Audio Auswertung / robuste RPM Pipeline</div>', unsafe_allow_html=True)
+    st.divider()
+    st.subheader("Audio Auswertung · robuste RPM-Extraktion")
+    title_txt = _audio_get_vehicle_title()
+    if title_txt:
+        st.info(f"Datensatz / Fahrzeug aus Metadata: {title_txt}")
+    st.caption("Mehrere echte RPM-Methoden: STFT/Ridge, Viterbi, Peak, Autokorrelation/YIN, Cepstrum, Harmonic Comb/HPS, CWT/Wavelet und Hybrid. Cloud audio_proxy_1k.wav wird bevorzugt; lokal ist nur Fallback.")
 
-    title = st.session_state.get("audio_vehicle_title") or _extract_vehicle_title_from_mat(st.session_state.get("audio_last_mat_path", ""))
-    if title:
-        st.info(f"Fahrzeug / Datensatz aus MAT-Metadata: {title}")
-    else:
-        st.caption("Kein Titel in recordResult.metadata gefunden. Nach MAT + Video laden wird hier der Fahrzeug-/Datensatzname angezeigt, falls vorhanden.")
+    with st.expander("Signal / STFT", expanded=True):
+        c0 = st.columns(4)
+        aud_stft_mode = c0[0].selectbox("NFFT/Overlap", ["Fest auswählen", "Auto Schnell", "Auto Breit"], key="aud_stft_mode_new")
+        stft_auto = str(aud_stft_mode).startswith("Auto")
+        aud_nfft = int(c0[1].number_input("NFFT", 64, 65536, 4096, step=64, key="aud_nfft_new", disabled=stft_auto))
+        aud_ov = float(c0[2].number_input("Overlap [%]", 0.0, 98.0, 75.0, step=1.0, key="aud_ov_new", disabled=stft_auto))
+        aud_fmax = float(c0[3].number_input("f max [Hz]", 20.0, 5000.0, 1000.0, step=25.0, key="aud_fmax_new"))
+        aud_method = st.selectbox("Drehzahl Methode", ["Hybrid", "STFT Ridge", "STFT Viterbi", "Original Peak", "Autokorrelation/YIN", "Cepstrum", "Harmonic Comb/HPS", "CWT/Wavelet"], key="aud_method_new")
+        if stft_auto:
+            st.caption("Auto Schnell testet eine reduzierte, sinnvolle STFT-Auswahl. Auto Breit testet den grossen Suchraum 64..16384 und viele Overlaps, ist aber deutlich langsamer.")
 
-    c_a, c_b, c_c, c_d = st.columns(4)
-    nfft = c_a.number_input("NFFT", min_value=256, max_value=65536, value=8192, step=256, key="aud_nfft")
-    overlap = c_b.slider("Overlap [%]", 0, 95, 75, 5, key="aud_overlap")
-    fmax = c_c.number_input("f max [Hz]", min_value=50.0, max_value=8000.0, value=1000.0, step=50.0, key="aud_fmax")
-    method = c_d.selectbox("Drehzahl Methode", ["Auto robust", "Original Peak", "Ridge Tracking", "Order Tracking", "Cepstrum"], index=0, key="aud_method")
+    with st.expander("Methoden-Parameter", expanded=False):
+        st.caption("Diese Parameter wirken nur auf die passenden Methoden; Hybrid nutzt sie beim Fusionieren der Teilmethoden.")
+        m0 = st.columns(4)
+        ridge_smooth = int(m0[0].number_input("Ridge Glättung", 3, 51, 7, step=2, key="aud_ridge_smooth"))
+        ridge_jump_frac = float(m0[1].number_input("Ridge max Sprung [% Band]", 1.0, 50.0, 8.0, step=1.0, key="aud_ridge_jump_pct")) / 100.0
+        viterbi_jump_hz = float(m0[2].number_input("Viterbi max Sprung [Hz/Frame]", 1.0, 300.0, 25.0, step=1.0, key="aud_viterbi_jump_hz"))
+        viterbi_penalty = float(m0[3].number_input("Viterbi Sprung-Strafe", 0.0, 10.0, 1.2, step=0.1, key="aud_viterbi_penalty"))
+        m1 = st.columns(4)
+        viterbi_smooth = int(m1[0].number_input("Viterbi Glättung", 3, 51, 5, step=2, key="aud_viterbi_smooth"))
+        comb_harmonics = int(m1[1].number_input("Comb/HPS Anzahl Harmonische", 1, 10, 4, step=1, key="aud_comb_harmonics"))
+        hybrid_smooth = int(m1[2].number_input("Hybrid Glättung", 3, 51, 9, step=2, key="aud_hybrid_smooth"))
+        always_run_cwt = bool(m1[3].checkbox("CWT auch in Kandidatenliste berechnen", value=False, key="aud_run_cwt_all"))
+        fast_mode = bool(st.checkbox("Schnellmodus: teure Methoden nur bei expliziter Auswahl berechnen", value=True, key="aud_fast_mode"))
+        method_params = dict(ridge_smooth=ridge_smooth, ridge_jump_frac=ridge_jump_frac, viterbi_jump_hz=viterbi_jump_hz, viterbi_penalty=viterbi_penalty, viterbi_smooth=viterbi_smooth, comb_harmonics=comb_harmonics, hybrid_smooth=hybrid_smooth, always_run_cwt=always_run_cwt, fast_mode=fast_mode)
 
-    e1, e2, e3, e4, e5 = st.columns(5)
-    cyl = e1.number_input("Zyl", min_value=1, max_value=16, value=8, step=1, key="aud_cyl")
-    takt = e2.selectbox("Takt", [2, 4], index=1, key="aud_takt")
-    order = e3.number_input("Ordnung", min_value=0.25, max_value=12.0, value=1.0, step=0.25, key="aud_order")
-    rpm_min = e4.number_input("RPM min", min_value=100.0, max_value=20000.0, value=1500.0, step=100.0, key="aud_rpm_min")
-    rpm_max = e5.number_input("RPM max", min_value=500.0, max_value=25000.0, value=8000.0, step=100.0, key="aud_rpm_max")
+    with st.expander("Motor / Kandidaten", expanded=True):
+        c0 = st.columns(3)
+        drive_type = c0[0].selectbox("Antrieb", ["Verbrenner/Hybrid", "Hybrid elektrisch dominant", "Elektro"], key="aud_drive_type")
+        cyl_mode = c0[1].selectbox("Zylinder", ["Auto variieren", "Fest auswählen"], key="aud_cyl_mode")
+        harm_mode = c0[2].selectbox("Harmonische/Ordnung", ["Auto variieren", "Fest auswählen"], key="aud_harm_mode")
+        cyl_disabled = str(cyl_mode).startswith("Auto") or ("elekt" in str(drive_type).lower())
+        harm_disabled = str(harm_mode).startswith("Auto")
+        c1 = st.columns(5)
+        aud_cyl = int(c1[0].number_input("Zyl fest", 1, 16, 4, step=1, key="aud_cyl_new", disabled=cyl_disabled))
+        aud_order = int(c1[1].number_input("Ordnung fest", 1, 12, 1, step=1, key="aud_order_new", disabled=harm_disabled))
+        aud_takt = int(c1[2].number_input("Takt", 2, 4, 4, step=2, key="aud_takt_new", disabled=("elekt" in str(drive_type).lower())))
+        aud_rpm_min = float(c1[3].number_input("RPM min", 100.0, 30000.0, 800.0, step=100.0, key="aud_rpm_min_new"))
+        aud_rpm_max = float(c1[4].number_input("RPM max", 500.0, 30000.0, 7500.0, step=100.0, key="aud_rpm_max_new"))
+        st.caption("Auto Zylinder testet 3/4/5/6/8/10/12. Auto Harmonische testet 1x/2x/3x. Bei Elektro wird die Frequenz direkt als Motor-/Order-Frequenz behandelt.")
 
-    g1, g2, g3, g4, g5 = st.columns(5)
-    r_dyn = g1.number_input("r dyn [m]", min_value=0.05, max_value=1.00, value=0.35, step=0.01, key="aud_rdyn")
-    use_ocr_v = g2.checkbox("OCR v verwenden", value=True, key="aud_use_ocr_v")
-    tol_pct = g3.number_input("Toleranz [%]", min_value=0.0, max_value=50.0, value=8.0, step=1.0, key="aud_tol_pct")
-    corr_len = g4.checkbox("Streckenlaenge korrigieren", value=False, key="aud_corr_len")
-    prefer_low = g5.checkbox("niedrigster Gang bevorzugt", value=False, key="aud_prefer_low")
-
-    h1, h2, h3, h4 = st.columns(4)
-    audio_offset = h1.slider("Audio Offset [s]", -10.0, 10.0, 0.0, 0.05, key="aud_offset")
-    a_min = h2.number_input("a min", value=-10.0, step=0.5, key="aud_a_min")
-    a_max = h3.number_input("a max", value=10.0, step=0.5, key="aud_a_max")
-    v_range = h4.slider("v min/max [km/h]", 0.0, 400.0, (30.0, 320.0), 5.0, key="aud_vrange")
-
-    with st.expander("Getriebe (Achsuebersetzung und Gang-i)", expanded=False):
-        axle = st.number_input("Achsuebersetzung", min_value=0.1, max_value=10.0, value=4.059, step=0.001, format="%.3f", key="aud_axle")
-        gear_txt = st.text_input("Gang-i, kommagetrennt", value="3.56, 2.53, 1.68, 1.02, 0.79, 0.76, 0.63", key="aud_gears")
+    with st.expander("Getriebe / Geschwindigkeit / Fahrzeug", expanded=False):
+        c = st.columns(4)
+        aud_offset = float(c[0].slider("Audio Offset [s]", -5.0, 5.0, 0.0, step=0.01, key="aud_offset_new"))
+        use_ocr_v = bool(c[1].checkbox("OCR v verwenden", value=True, key="aud_use_v_new"))
+        r_dyn = float(c[2].number_input("r dyn [m]", 0.05, 2.0, 0.35, step=0.01, key="aud_rdyn_new"))
+        tol_pct = float(c[3].number_input("Toleranz [%]", 0.0, 100.0, 6.0, step=0.5, key="aud_tol_new"))
+        c2 = st.columns(3)
+        axle_ratio = float(c2[0].number_input("Achsübersetzung i", 0.1, 20.0, 3.15, step=0.01, key="aud_axle_ratio"))
+        gear_text = c2[1].text_input("Gänge i (Komma-getrennt)", value="5.25, 3.36, 2.17, 1.72, 1.32, 1.00, 0.82, 0.64", key="aud_gears_text")
+        prefer_low = bool(c2[2].checkbox("niedrigster Gang bevorzugt", value=False, key="aud_prefer_low"))
         try:
-            gears = [float(x.strip()) for x in gear_txt.replace(";", ",").split(",") if x.strip()]
+            gear_ratios = [float(x.strip()) for x in str(gear_text).replace(";", ",").split(",") if x.strip()]
         except Exception:
-            gears = []
-        if gears:
-            st.caption("Gänge: " + ", ".join(f"{i+1}: {g:.3f}" for i, g in enumerate(gears)))
+            gear_ratios = []
+        st.caption("Getriebe wird nur genutzt, wenn nutzbare Geschwindigkeit/OCR-v vorhanden ist. Ohne v bleibt die RPM-Erkennung rein audio-basiert.")
+
+    _live_log_ref = st.session_state.get("audio_bg_log_ref")
+    if isinstance(_live_log_ref, list) and _live_log_ref:
+        st.session_state.audio_debug_lines = list(_live_log_ref[-200:])
+    _live_progress_ref = st.session_state.get("audio_bg_progress_ref")
+    if isinstance(_live_progress_ref, dict) and _live_progress_ref:
+        st.session_state.audio_bg_progress = dict(_live_progress_ref)
+
+    main_progress_box = st.empty()
+    main_prog_state = st.session_state.get("audio_bg_progress") or {}
+    if isinstance(main_prog_state, dict) and (main_prog_state or st.session_state.get("audio_bg_future") is not None):
+        done = int(main_prog_state.get("done", 0) or 0)
+        total = max(1, int(main_prog_state.get("total", 1) or 1))
+        frac = max(0.0, min(1.0, float(main_prog_state.get("fraction", done / total) or 0.0)))
+        txt = str(main_prog_state.get("text", "") or "")
+        label = f"Audioanalyse: {done}/{total} Jobs ({frac*100:.0f}%)"
+        if txt:
+            label += f" - {txt}"
+        main_progress_box.progress(frac, text=label)
+
+    show_live_debug = st.checkbox("Live-Debug während Audioanalyse anzeigen", value=True, key="aud_show_live_debug")
+
+    with st.expander("Live-Debug Audioanalyse", expanded=show_live_debug):
+        st.caption("Zeigt Quelle, Segment, STFT-Größe, Kandidatenfortschritt, Laufzeit pro Job und finale Auswahl. Die letzten Zeilen bleiben nach der Analyse sichtbar.")
+        dbg_progress_box = st.empty()
+        dbg_box = st.empty()
+        old_dbg = st.session_state.get("audio_debug_lines", []) or []
+        if old_dbg:
+            dbg_box.code("\n".join([str(x) for x in old_dbg[-40:]]), language="text")
         else:
-            st.warning("Keine gültigen Gangübersetzungen erkannt.")
+            dbg_box.code("Noch kein Audio-Debug vorhanden.", language="text")
+        prog_state = st.session_state.get("audio_bg_progress") or {}
+        if isinstance(prog_state, dict) and prog_state:
+            done = int(prog_state.get("done", 0) or 0)
+            total = max(1, int(prog_state.get("total", 1) or 1))
+            frac = max(0.0, min(1.0, float(prog_state.get("fraction", done / total) or 0.0)))
+            txt = str(prog_state.get("text", "") or "")
+            label = f"Audioanalyse: {done}/{total} Jobs ({frac*100:.0f}%)"
+            if txt:
+                label += f" - {txt}"
+            dbg_progress_box.progress(frac, text=label)
+        elif st.session_state.get("audio_bg_future") is not None:
+            dbg_progress_box.progress(0.0, text="Audioanalyse laeuft ...")
 
-    debug_live = st.checkbox("Live-Debug während Audioanalyse anzeigen", value=True, key="aud_live_debug")
-    run_audio = st.button("Audioanalyse starten", type="primary", width="stretch", key="aud_run")
-    if run_audio:
-        prog = st.progress(0.0, text="Audio wird geladen ...")
-        status_slot = st.empty()
-        debug_slot = st.empty()
-        debug_lines = []
-
-        def _audio_debug(line: str):
-            debug_lines.append(str(line))
-            st.session_state["audio_debug_lines"] = debug_lines[-120:]
-            if debug_live:
-                debug_slot.code("\n".join(debug_lines[-40:]), language="text")
-
-        def _audio_progress(frac: float, text: str):
-            prog.progress(float(max(0.0, min(1.0, frac))), text=str(text))
-
-        _audio_debug("[   0.0s] Button geklickt: Audioanalyse startet")
-        ok, msg, fs, y, source = _load_audio_for_current_capture()
-        if not ok:
-            _audio_debug(f"Audio konnte nicht geladen werden: {msg}")
-            st.error(msg)
-            set_status(msg, "warn")
-            prog.empty()
-        else:
+    # Hintergrundlauf: Der Future bleibt in st.session_state erhalten. Ein Tab-Wechsel
+    # triggert nur einen Streamlit-Rerun, bricht aber den Thread nicht mehr ab.
+    fut = st.session_state.get("audio_bg_future")
+    if fut is not None:
+        if fut.done():
             try:
-                t0_audio = time.time()
-                _audio_debug(f"Audio geladen: Quelle={source}, fs={fs}, Samples={len(y):,}, Dauer={len(y)/max(fs,1):.1f}s")
-                start_used = float(st.session_state.get("t_start", 0.0) or 0.0)
-                end_used = float(st.session_state.get("t_end", 0.0) or (len(y) / max(fs, 1)))
-                status_slot.info(f"Analysiere Audiosegment {start_used:.2f}-{end_used:.2f} s · Quelle: {source}")
-                _audio_progress(0.10, "Audio geladen. Spektrogramm/Frequenzlinien werden berechnet ...")
-                res = _run_robust_audio_rpm_analysis(
-                    y=y, fs=fs,
-                    start_s=start_used,
-                    end_s=end_used,
-                    audio_offset_s=float(audio_offset),
-                    nfft=int(nfft), overlap_pct=float(overlap), fmax=float(fmax),
-                    cyl=int(cyl), takt=int(takt), order=float(order),
-                    rpm_min=float(rpm_min), rpm_max=float(rpm_max), method=str(method),
-                    debug_cb=_audio_debug, progress_cb=_audio_progress,
-                )
-                _audio_progress(0.96, "OCR-/Gangdaten werden geladen ...")
-                _audio_debug("Lade optionale OCR-v/Gangdaten aus MAT ...")
-                res["source"] = source
-                res["ui"] = dict(r_dyn=float(r_dyn), use_ocr_v=bool(use_ocr_v), tol_pct=float(tol_pct),
-                                 corr_len=bool(corr_len), prefer_low=bool(prefer_low), axle=float(axle), gears=gears,
-                                 a_min=float(a_min), a_max=float(a_max), v_min=float(v_range[0]), v_max=float(v_range[1]))
-                # Optional OCR v/gear overlay only; audio RPM itself remains from audio.
-                mat_path = st.session_state.get("audio_last_mat_path") or ""
-                res["ocr"] = _extract_ocr_series_from_mat(mat_path)
-                st.session_state.audio_analysis_result = res
-                used_nfft = int(res.get("params", {}).get("nfft", nfft))
-                msg_done = f"Audioanalyse abgeschlossen ({time.time() - t0_audio:.1f}s, NFFT effektiv: {used_nfft})."
-                _audio_debug(msg_done)
-                status_slot.success(msg_done)
-                prog.progress(1.0, text="Audioanalyse fertig.")
-                set_status(msg_done, "ok")
-            except MemoryError:
-                st.session_state.audio_analysis_result = None
-                msg_e = "Audioanalyse fehlgeschlagen: zu wenig Arbeitsspeicher. Bitte NFFT kleiner wählen, Overlap reduzieren oder Start/Ende enger setzen."
-                _audio_debug(msg_e)
-                st.error(msg_e)
-                set_status(msg_e, "warn")
-                prog.empty()
+                res_bg = fut.result()
+                st.session_state.audio_analysis_result = res_bg
+                live_done = st.session_state.get("audio_bg_log_ref")
+                if isinstance(live_done, list) and live_done:
+                    st.session_state.audio_debug_lines = list(live_done[-200:])
+                else:
+                    st.session_state.audio_debug_lines = list(res_bg.get("debug_lines", []))[-200:]
+                st.session_state.audio_bg_log_ref = None
+                live_prog_done = st.session_state.get("audio_bg_progress_ref")
+                if isinstance(live_prog_done, dict) and live_prog_done:
+                    st.session_state.audio_bg_progress = dict(live_prog_done)
+                st.session_state.audio_bg_progress_ref = None
+                _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.get("audio_bg_progress") or {}, status="done")
+                set_status("Audioanalyse abgeschlossen.", "ok")
+                st.success("Audioanalyse abgeschlossen.")
             except Exception as e:
                 st.session_state.audio_analysis_result = None
-                msg_e = f"Audioanalyse fehlgeschlagen: {e}"
-                _audio_debug(msg_e)
-                st.error(msg_e)
-                set_status(msg_e, "warn")
-                prog.empty()
+                live_err = st.session_state.get("audio_bg_log_ref")
+                base_err = list(live_err[-190:]) if isinstance(live_err, list) else list(st.session_state.get("audio_debug_lines", []) or [])[-190:]
+                st.session_state.audio_debug_lines = [*base_err, f"FEHLER: {e}"]
+                st.session_state.audio_bg_log_ref = None
+                st.session_state.audio_bg_progress_ref = None
+                st.session_state.audio_bg_progress = {"done": 0, "total": 1, "fraction": 0.0, "text": f"Fehler: {e}"}
+                _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.audio_bg_progress, log_line=f"FEHLER: {e}", status="error")
+                st.error(f"Audioanalyse fehlgeschlagen: {e}")
+                set_status(f"Audioanalyse fehlgeschlagen: {e}", "warn")
+            finally:
+                st.session_state.audio_bg_future = None
+        else:
+            live_run = st.session_state.get("audio_bg_log_ref")
+            if isinstance(live_run, list) and live_run:
+                st.session_state.audio_debug_lines = list(live_run[-200:])
+            live_prog_run = st.session_state.get("audio_bg_progress_ref")
+            if isinstance(live_prog_run, dict) and live_prog_run:
+                st.session_state.audio_bg_progress = dict(live_prog_run)
+            elapsed = time.perf_counter() - float(st.session_state.get("audio_bg_started", time.perf_counter()) or time.perf_counter())
+            st.info(f"Audioanalyse laeuft im Hintergrund seit {elapsed:.1f}s. Status, Progressbar und Live-Debug aktualisieren sich unten ohne Seiten-Refresh.")
+            _audio_live_widget(str(st.session_state.get("audio_bg_live_id", "")))
 
-    old_debug = st.session_state.get("audio_debug_lines") or []
-    if old_debug and not run_audio:
-        with st.expander("Letzter Audioanalyse-Debug", expanded=False):
-            st.code("\n".join(str(x) for x in old_debug[-120:]), language="text")
+    running_bg = st.session_state.get("audio_bg_future") is not None
+    if st.button("Audioanalyse starten", type="primary", width="stretch", key="aud_run_new", disabled=running_bg):
+        ok,msg,fs,y,source=_audio_load_current_capture()
+        if not ok:
+            st.error(msg); set_status(msg,"warn")
+        else:
+            params_bg = dict(
+                start_s=float(st.session_state.get('t_start',0.0)),
+                end_s=float(st.session_state.get('t_end',len(y)/max(fs,1))),
+                offset_s=aud_offset,
+                nfft=aud_nfft,
+                overlap_pct=aud_ov,
+                fmax=aud_fmax,
+                cyl=aud_cyl,
+                takt=aud_takt,
+                order=aud_order,
+                rpm_min=aud_rpm_min,
+                rpm_max=aud_rpm_max,
+                method=aud_method,
+                cyl_mode=cyl_mode,
+                harmonic_mode=harm_mode,
+                drive_type=drive_type,
+                stft_mode=aud_stft_mode,
+                method_params=method_params,
+            )
+            ui_bg = dict(use_ocr_v=use_ocr_v,r_dyn=r_dyn,tol_pct=tol_pct,axle_ratio=axle_ratio,gears=gear_ratios,prefer_low=prefer_low,vehicle_title=title_txt)
+            live_job_id = f"audio-{int(time.time()*1000)}"
+            st.session_state.audio_bg_live_id = live_job_id
+            live_log = [f"[   0.00s] Quelle={source}, fs={fs}, Samples={len(y):,}", "[   0.00s] Hintergrundanalyse gestartet."]
+            live_progress = {"done": 0, "total": 1, "fraction": 0.0, "text": "Hintergrundanalyse gestartet."}
+            _audio_live_update(live_job_id, log_line=live_log[0], progress=live_progress, status="running")
+            _audio_live_update(live_job_id, log_line=live_log[1], progress=live_progress, status="running")
+            st.session_state.audio_bg_log_ref = live_log
+            st.session_state.audio_bg_progress_ref = live_progress
+            st.session_state.audio_debug_lines = live_log
+            st.session_state.audio_bg_progress = dict(live_progress)
+            st.session_state.audio_bg_params = params_bg
+            st.session_state.audio_bg_source = source
+            st.session_state.audio_bg_started = time.perf_counter()
+            st.session_state.audio_bg_future = _audio_executor().submit(_audio_background_worker, y, fs, source, params_bg, ui_bg, live_log, live_progress, live_job_id)
+            set_status("Audioanalyse im Hintergrund gestartet.", "info")
+            st.info("Audioanalyse wurde im Hintergrund gestartet. Tab-Wechsel bricht sie nicht mehr ab. Der Live-Status unten aktualisiert ohne Seiten-Refresh.")
+            _audio_live_widget(live_job_id)
 
-    res = st.session_state.get("audio_analysis_result")
-    if isinstance(res, dict) and res.get("t") is not None:
-        _p = res.get('params', {})
-        st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Suchband: {_p.get('f_search_lo',0):.1f}–{_p.get('f_search_hi',0):.1f} Hz · NFFT effektiv: {_p.get('nfft', '?')} · Start/Ende: {_p.get('start_s',0):.2f}–{_p.get('end_s',0):.2f} s")
+    res=st.session_state.get("audio_analysis_result")
+    if isinstance(res,dict) and res.get("t") is not None:
+        p=res.get('params',{})
+        zyl_txt = "EV" if p.get('cyl') == 0 else p.get('cyl')
+        st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} · Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz · NFFT: {p.get('nfft')} · Overlap: {p.get('overlap_pct')}%")
+        if res.get('candidate_table'):
+            with st.expander("Kandidatenbewertung", expanded=False):
+                st.dataframe(pd.DataFrame(res['candidate_table']), width="stretch", hide_index=True)
         try:
             import plotly.graph_objects as go
-            import plotly.express as px
-            # Audio
-            fig_audio = go.Figure()
-            at = np.asarray(res["audio_t"], dtype=float)
-            ay = np.asarray(res["audio_y"], dtype=float)
-            step = max(1, int(len(at) / 12000))
-            fig_audio.add_trace(go.Scattergl(x=at[::step], y=ay[::step], mode="lines", name="Audio"))
-            fig_audio.update_layout(title="Audio", xaxis_title="t [s]", yaxis_title="Amplitude", height=260, template="plotly_dark")
-            st.plotly_chart(fig_audio, width="stretch")
-
-            # Spectrogram with all frequency lines (decimated for interactive browser performance)
-            ht, hf, hz = _plotly_heatmap_decimated(res["t"], res["freqs"], res["db"])
-            fig_spec = go.Figure(data=go.Heatmap(
-                x=ht, y=hf, z=hz, colorscale="Viridis", colorbar=dict(title="dB")))
-            show_lines = st.multiselect(
-                "Frequenzlinien im Spektrogramm anzeigen",
-                list(res.get("freq_lines", {}).keys()),
-                default=[res.get("selected_method", "Auto robust")],
-                key="aud_show_lines",
-            )
-            for name in show_lines:
-                yy = np.asarray(res.get("freq_lines", {}).get(name, []), dtype=float)
-                if yy.size:
-                    fig_spec.add_trace(go.Scatter(x=np.asarray(res["t"], dtype=float), y=yy, mode="lines", name=name, line=dict(width=2)))
-            fig_spec.update_layout(title="Spektrogramm f [Hz] über t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
-            st.plotly_chart(fig_spec, width="stretch")
-
-            colp1, colp2 = st.columns(2)
-            fig_rpm = go.Figure()
-            fig_rpm.add_trace(go.Scatter(x=np.asarray(res["t"], dtype=float), y=np.asarray(res["rpm"], dtype=float), mode="lines", name="Audio RPM"))
-            fig_rpm.update_layout(title="RPM", xaxis_title="t [s]", yaxis_title="1/min", height=360, template="plotly_dark")
-            colp1.plotly_chart(fig_rpm, width="stretch")
-
-            fig_v = go.Figure()
-            ocr = res.get("ocr") or {}
-            if bool(use_ocr_v) and "t" in ocr and "v" in ocr:
-                fig_v.add_trace(go.Scatter(x=np.asarray(ocr["t"], dtype=float), y=np.asarray(ocr["v"], dtype=float), mode="lines", name="OCR v"))
-            fig_v.update_layout(title="v", xaxis_title="t [s]", yaxis_title="km/h", height=360, template="plotly_dark")
-            colp2.plotly_chart(fig_v, width="stretch")
-
-            fig_g = go.Figure()
-            ocr = res.get("ocr") or {}
-            if "gear_t" in ocr and "gear" in ocr:
-                fig_g.add_trace(go.Scatter(x=np.asarray(ocr["gear_t"], dtype=float), y=np.asarray(ocr["gear"], dtype=float), mode="lines", name="OCR Gang"))
-            elif gears and bool(use_ocr_v) and "t" in ocr and "v" in ocr:
-                # Estimate gear from OCR v + audio RPM using configured ratios.
-                t_r = np.asarray(res["t"], dtype=float)
-                rpm = np.asarray(res["rpm"], dtype=float)
-                v_interp = np.interp(t_r, np.asarray(ocr["t"], dtype=float), np.asarray(ocr["v"], dtype=float), left=np.nan, right=np.nan)
-                wheel_rpm = (v_interp / 3.6) / max(2*np.pi*float(r_dyn), 1e-6) * 60.0
-                ratio_obs = rpm / np.maximum(wheel_rpm, 1e-6)
-                gear_arr = np.full_like(ratio_obs, np.nan, dtype=float)
-                total = np.asarray([float(axle) * g for g in gears], dtype=float)
-                for i, r in enumerate(ratio_obs):
-                    if np.isfinite(r):
-                        errs = np.abs(total - r) / np.maximum(total, 1e-6) * 100.0
-                        good = np.where(errs <= float(tol_pct))[0]
-                        if good.size:
-                            gear_arr[i] = float(good[0] + 1 if prefer_low else good[np.argmin(errs[good])] + 1)
-                fig_g.add_trace(go.Scatter(x=t_r, y=gear_arr, mode="lines", name="Gang geschätzt"))
-            fig_g.update_layout(title="Gang", xaxis_title="t [s]", yaxis_title="#", height=320, template="plotly_dark")
-            st.plotly_chart(fig_g, width="stretch")
+            t=np.asarray(res['t'],dtype=float); f=np.asarray(res['freqs'],dtype=float); db=np.asarray(res['db'],dtype=float)
+            step_t=max(1,int(np.ceil(db.shape[1]/1800))) if db.ndim==2 else 1; step_f=max(1,int(np.ceil(db.shape[0]/900))) if db.ndim==2 else 1
+            fig=go.Figure(data=go.Heatmap(x=t[::step_t], y=f[::step_f], z=db[::step_f,::step_t], colorscale="Viridis", colorbar=dict(title="dB")))
+            show=st.multiselect("Frequenzlinien im Spektrogramm anzeigen", list((res.get('freq_lines') or {}).keys()), default=[res.get('selected_method','Auto robust')], key="aud_lines_new")
+            for nm in show:
+                a=np.asarray(res.get('freq_lines',{}).get(nm,[]),dtype=float)
+                if a.size==t.size: fig.add_trace(go.Scatter(x=t,y=a,mode="lines",name=nm,line=dict(width=2)))
+            fig.update_layout(title="Spektrogramm f [Hz] über t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
+            st.plotly_chart(fig, width="stretch")
+            fig2=go.Figure(); fig2.add_trace(go.Scatter(x=t,y=np.asarray(res['rpm'],dtype=float),mode="lines",name="RPM")); fig2.update_layout(title="RPM", xaxis_title="t [s]", yaxis_title="1/min", height=330, template="plotly_dark"); st.plotly_chart(fig2,width="stretch")
         except Exception as e:
             st.warning(f"Plots konnten nicht erstellt werden: {e}")
-
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.download_button("Debug ZIP herunterladen", data=_audio_make_debug_zip(res, shown_lines=st.session_state.get('aud_lines_new', [])), file_name=f"audio_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", width="stretch", key="aud_debug_zip_new")
 
 # ==============================
 # TAB ROI SETUP
