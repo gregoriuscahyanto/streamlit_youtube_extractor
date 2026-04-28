@@ -20,16 +20,28 @@ class TestAppRuntimeWithAppTest(unittest.TestCase):
             f"Exception im Initial-Run: {[e.value for e in at.exception]}",
         )
 
-        # Force execution inside each tab once. This catches many runtime crashes
-        # that won't appear in a pure startup smoke test.
-        expected_tabs = 5
-        self.assertEqual(len(at.tabs), expected_tabs, "Unerwartete Anzahl Tabs.")
-        for idx in range(expected_tabs):
-            at.tabs[idx].run(timeout=30)
+        # The app intentionally avoids st.tabs because Streamlit renders every
+        # tab body on each rerun. Force each active area once through the
+        # segmented navigation.
+        expected_tabs = 6
+        self.assertEqual(len(at.button_group), 1, "Hauptnavigation fehlt.")
+        self.assertEqual(
+            list(at.button_group[0].options),
+            [
+                "Cloud Connection & Root",
+                "Sync",
+                "MAT Selection",
+                "ROI Setup",
+                "Track Analysis",
+                "Audio Auswertung",
+            ],
+        )
+        for idx, label in enumerate(at.button_group[0].options):
+            at.button_group[0].set_value(label).run(timeout=30)
             self.assertEqual(
                 len(at.exception),
                 0,
-                f"Exception nach Tab-Run {idx}: {[e.value for e in at.exception]}",
+                f"Exception nach Bereich-Run {idx} ({label}): {[e.value for e in at.exception]}",
             )
 
 

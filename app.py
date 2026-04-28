@@ -168,24 +168,62 @@ if hasattr(threading, "excepthook"):
     threading.excepthook = _handle_thread_exception
 
 
-def _try_jump_to_tab(label: str):
-    """Best-effort tab switch for Streamlit versions without st.tabs(default=...)."""
-    if not label or streamlit_js_eval is None:
-        return
+def _render_main_navigation(labels: list[str]) -> str:
+    """Render only the selected app area.
+
+    Streamlit's native st.tabs renders every tab body on each rerun. ROI editing
+    is latency-sensitive, so the app uses a single active area and renders only
+    that module.
+    """
+    labels = list(labels or [])
+    if not labels:
+        return ""
+    state_key = "active_main_tab"
+    widget_key = "main_tab_selector"
+    requested = st.session_state.get("tab_default")
+    if isinstance(requested, str) and requested in labels:
+        st.session_state[state_key] = requested
+        st.session_state[widget_key] = requested
+    current = st.session_state.get(state_key)
+    if current not in labels:
+        current = labels[0]
+
+    selected = current
     try:
-        expr = (
-            "(function(){"
-            "const label = " + json.dumps(str(label)) + ";"
-            "const doc = window.parent?.document || document;"
-            "const tabs = Array.from(doc.querySelectorAll('[role=\"tab\"]'));"
-            "const tab = tabs.find(t => (t.innerText || t.textContent || '').trim() === label);"
-            "if (tab) { tab.click(); return true; }"
-            "return false;"
-            "})()"
-        )
-        streamlit_js_eval(js_expressions=expr, key=f"jump_to_tab_{str(label).replace(' ', '_')}", want_output=False)
+        segmented_kwargs = {
+            "selection_mode": "single",
+            "key": widget_key,
+            "label_visibility": "collapsed",
+        }
+        if widget_key not in st.session_state:
+            segmented_kwargs["default"] = current
+        selected = st.segmented_control(
+            "Bereich",
+            labels,
+            **segmented_kwargs,
+        ) or current
     except Exception:
-        pass
+        radio_key = "main_tab_selector_radio"
+        if isinstance(requested, str) and requested in labels:
+            st.session_state[radio_key] = requested
+        radio_kwargs = {
+            "horizontal": True,
+            "key": radio_key,
+            "label_visibility": "collapsed",
+        }
+        if radio_key not in st.session_state:
+            radio_kwargs["index"] = labels.index(current) if current in labels else 0
+        selected = st.radio(
+            "Bereich",
+            labels,
+            **radio_kwargs,
+        )
+    if selected not in labels:
+        selected = current if current in labels else labels[0]
+    st.session_state[state_key] = selected
+    if isinstance(requested, str) and requested in labels:
+        st.session_state.tab_default = None
+    return str(selected)
 
 st.set_page_config(
     page_title="OCR Extractor",
@@ -3893,6 +3931,17 @@ def _load_mat_from_r2(remote_key):
             st.session_state.ref_track_pts = cfg["ref_track_pts"]
         if cfg.get("minimap_pts"):
             st.session_state.minimap_pts = cfg["minimap_pts"]
+        try:
+            _audio_title_summary = _summarize_record_result_mat(tmp.name)
+            for _title_key in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
+                _title_txt = str(_audio_title_summary.get(_title_key, "") or "").strip()
+                if _title_txt:
+                    st.session_state["audio_vehicle_title"] = _title_txt
+                    if isinstance(st.session_state.get("mat_selected_summary"), dict):
+                        st.session_state.mat_selected_summary[_title_key] = _title_txt
+                    break
+        except Exception:
+            pass
         track_cfg = _extract_track_cal_from_recordresult_mat(tmp.name)
         if track_cfg.get("track_roi"):
             _upsert_track_minimap_roi_from_mat(track_cfg["track_roi"])
@@ -4259,31 +4308,43 @@ def _audio_cwt_like_line(seg, fs, t_video, flo, fhi):
 
 def _audio_get_vehicle_title() -> str:
     obj = st.session_state.get("mat_selected_summary")
-    parts = []
+    dataset = ""
+    video_title = ""
     if isinstance(obj, dict):
         dataset = str(obj.get("capture_folder") or obj.get("mat_file") or "").strip()
-        video_title = ""
         for k in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
             txt = str(obj.get(k, "") or "").strip()
-            if txt and txt not in parts:
+            if txt:
                 video_title = txt
                 break
-        if dataset:
-            parts.append(dataset)
-        if video_title and video_title != dataset:
-            parts.append(video_title)
-        if parts:
-            return " · ".join(parts)
+    if not video_title:
+        txt = str(st.session_state.get("audio_vehicle_title", "") or "").strip()
+        if txt:
+            video_title = txt
     mat_path = str(st.session_state.get("audio_last_mat_path") or "").strip()
-    if mat_path:
+    if not video_title and mat_path:
         try:
             local_summary = _summarize_record_result_mat(mat_path)
             for k in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
                 txt = str(local_summary.get(k, "") or "").strip()
                 if txt:
+                    st.session_state["audio_vehicle_title"] = txt
                     return txt
         except Exception:
             pass
+    if not video_title:
+        for k in ("video_name", "capture_folder"):
+            txt = str(st.session_state.get(k, "") or "").strip()
+            if txt:
+                video_title = txt
+                break
+    parts = []
+    if dataset:
+        parts.append(dataset)
+    if video_title and video_title != dataset:
+        parts.append(video_title)
+    if parts:
+        return " · ".join(parts)
     for k in ("audio_vehicle_title", "video_name", "capture_folder"):
         txt = str(st.session_state.get(k, "") or "").strip()
         if txt:
@@ -4795,6 +4856,36 @@ def _build_audio_rpm_struct_from_result(res: dict) -> dict:
     }
 
 
+def _loadmat_audio_save_robust(mat_path: str) -> tuple[dict | None, str]:
+    """Load a MAT file for audio_rpm insertion, retrying common scipy failures."""
+    try:
+        return sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False), ""
+    except NotImplementedError:
+        raise
+    except Exception as first_exc:
+        try:
+            return sio.loadmat(
+                mat_path,
+                squeeze_me=True,
+                struct_as_record=False,
+                verify_compressed_data_integrity=False,
+            ), f"Standard-Load fehlgeschlagen, Retry ohne Kompressionsintegritätsprüfung genutzt: {first_exc}"
+        except NotImplementedError:
+            raise
+        except Exception as second_exc:
+            return None, f"{first_exc}; Retry fehlgeschlagen: {second_exc}"
+
+
+def _audio_title_from_summary(summary: dict) -> str:
+    if not isinstance(summary, dict):
+        return ""
+    for key in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
+        txt = str(summary.get(key, "") or "").strip()
+        if txt:
+            return txt
+    return ""
+
+
 def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
     if not isinstance(res, dict) or res.get("t") is None:
         return False, "Keine Audioanalyse-Ergebnisse zum Speichern vorhanden."
@@ -4813,8 +4904,11 @@ def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
             shutil.copyfile(local_mat_path, tmp_in.name)
         else:
             return False, "Keine Cloud-Verbindung und keine lokale MAT-Datei verfügbar."
+        load_note = ""
         try:
-            mat_data = sio.loadmat(tmp_in.name, squeeze_me=True, struct_as_record=False)
+            mat_data, load_note = _loadmat_audio_save_robust(tmp_in.name)
+            if mat_data is None:
+                raise ValueError(load_note or "MAT konnte nicht gelesen werden.")
             rr = _mat_struct_to_plain(mat_data.get("recordResult", {}))
             if not isinstance(rr, dict):
                 rr = {"data": rr}
@@ -4825,8 +4919,21 @@ def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
             if not isinstance(rr, dict):
                 rr = {}
             extra = {}
+            load_note = "v7.3/HDF5-Fallback genutzt"
         except Exception as e:
-            return False, f"MAT konnte nicht gelesen werden: {e}"
+            base = _build_save_mat_struct(build_result_json())
+            rr = _mat_struct_to_plain(base.get("recordResult", {}))
+            if not isinstance(rr, dict):
+                rr = {}
+            extra = {}
+            load_note = f"MAT-Lesefallback genutzt: {e}"
+        title_txt = _audio_title_from_summary(st.session_state.get("mat_selected_summary") or {})
+        if not title_txt:
+            title_txt = str(st.session_state.get("audio_vehicle_title", "") or "").strip()
+        if title_txt:
+            meta = rr.get("metadata", {}) if isinstance(rr.get("metadata", {}), dict) else {}
+            meta.setdefault("title", title_txt)
+            rr["metadata"] = meta
         rr["audio_rpm"] = _build_audio_rpm_struct_from_result(res)
         out_data = dict(extra)
         out_data["recordResult"] = rr
@@ -4839,9 +4946,11 @@ def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
                 st.session_state.mat_summary_cache.pop(selected_key, None)
             except Exception:
                 pass
-            return True, f"Audioanalyse in MAT gespeichert: {selected_key}"
+            note = f" ({load_note})" if load_note else ""
+            return True, f"Audioanalyse in MAT gespeichert: {selected_key}{note}"
         shutil.copyfile(tmp_out.name, local_mat_path)
-        return True, f"Audioanalyse lokal gespeichert: {local_mat_path}"
+        note = f" ({load_note})" if load_note else ""
+        return True, f"Audioanalyse lokal gespeichert: {local_mat_path}{note}"
     finally:
         for fp in (tmp_in.name, tmp_out.name):
             try:
@@ -4869,51 +4978,27 @@ st.markdown(
     f'<span class="status-badge status-{stype}">{st.session_state.status_msg}</span>' + _pfx_badge,
     unsafe_allow_html=True)
 
-# Main tabs
-_tab_labels = ["Cloud Connection & Root", "Sync", "MAT Selection", "ROI Setup", "Audio Auswertung"]
-_tab_default = st.session_state.get("tab_default")
-_tab_kwargs = {}
-if isinstance(_tab_default, str) and _tab_default in _tab_labels:
-    _tab_kwargs["default"] = _tab_default
-try:
-    tab_setup, tab_sync, tab_mat, tab_roi, tab_audio = st.tabs(_tab_labels, **_tab_kwargs)
-    tab_track = tab_roi
-except TypeError:
-    tab_setup, tab_sync, tab_mat, tab_roi, tab_audio = st.tabs(_tab_labels)
-    tab_track = tab_roi
-finally:
-    pass
+# Main areas. Only one renderer is executed per Streamlit rerun; this keeps ROI
+# editing responsive even when Track/Audio/MAT pages contain expensive widgets.
+_tab_labels = [
+    "Cloud Connection & Root",
+    "Sync",
+    "MAT Selection",
+    "ROI Setup",
+    "Track Analysis",
+    "Audio Auswertung",
+]
+_active_tab = _render_main_navigation(_tab_labels)
 
-if isinstance(_tab_default, str) and _tab_default in _tab_labels:
-    _try_jump_to_tab(_tab_default)
-    # One-shot tab jump target.
-    st.session_state.tab_default = None
-
-# ----------------------------------------
-# TAB: Setup
-# ----------------------------------------
-with tab_setup:
+if _active_tab == "Cloud Connection & Root":
     setup_tab.render(globals())
-# Sync Tab
-with tab_sync:
+elif _active_tab == "Sync":
     sync_tab.render(globals())
-# ----------------------------------------
-# TAB: MAT selection
-# ----------------------------------------
-with tab_mat:
+elif _active_tab == "MAT Selection":
     mat_selection_tab.render(globals())
-# ==============================
-# TAB AUDIO AUSWERTUNG
-# ==============================
-with tab_audio:
-    audio_tab.render(globals())
-# ==============================
-# TAB ROI SETUP
-# ==============================
-with tab_roi:
+elif _active_tab == "ROI Setup":
     roi_setup_tab.render(globals())
-# ----------------------------------------
-# TAB: Track analysis
-# ----------------------------------------
-with tab_track:
+elif _active_tab == "Track Analysis":
     track_analysis_tab.render(globals())
+elif _active_tab == "Audio Auswertung":
+    audio_tab.render(globals())

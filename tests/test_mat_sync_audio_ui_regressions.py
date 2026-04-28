@@ -58,6 +58,8 @@ def _load_audio_save_namespace():
         "_cellstr_column",
         "_struct_array_from_dicts",
         "_build_audio_rpm_struct_from_result",
+        "_loadmat_audio_save_robust",
+        "_audio_title_from_summary",
         "_save_audio_result_to_selected_mat",
     }
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in needed]
@@ -73,6 +75,21 @@ def _load_audio_save_namespace():
         "_build_save_mat_struct": lambda _result: {"recordResult": {}},
         "build_result_json": lambda: {},
     }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(repo / "app.py"), "exec"), namespace)
+    return namespace
+
+
+def _load_audio_title_namespace():
+    namespace = _load_mat_summary_namespace()
+    repo = Path(__file__).resolve().parents[1]
+    source = (repo / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_audio_get_vehicle_title"
+    ]
+    namespace["st"] = SimpleNamespace(session_state={})
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(repo / "app.py"), "exec"), namespace)
     return namespace
 
@@ -218,6 +235,9 @@ def test_tabs_are_split_into_renderer_modules():
 
     app_source = (repo / "app.py").read_text(encoding="utf-8")
     assert "from app_tabs import" in app_source
+    assert "_render_main_navigation(_tab_labels)" in app_source
+    assert "st.tabs(" not in app_source
+    assert '"Track Analysis"' in app_source
     for name in ("setup_tab", "sync_tab", "mat_selection_tab", "audio_tab", "roi_setup_tab", "track_analysis_tab"):
         assert f"{name}.render(globals())" in app_source
 
@@ -263,3 +283,66 @@ def test_audio_result_can_be_saved_to_local_mat_copy():
     audio_rpm = getattr(rr, "audio_rpm")
     assert getattr(audio_rpm, "processed") is not None
     assert getattr(audio_rpm, "params") is not None
+
+
+def test_audio_title_uses_metadata_title_from_loaded_mat_when_summary_has_only_dataset():
+    ns = _load_audio_title_namespace()
+    repo = Path(__file__).resolve().parents[1]
+    mat_path = repo / "results_20251116_212257.mat"
+    assert mat_path.exists(), "Beispiel-MAT results_20251116_212257.mat fehlt."
+    ns["st"].session_state.update(
+        {
+            "mat_selected_summary": {"capture_folder": "results_20251116_212257"},
+            "audio_last_mat_path": str(mat_path),
+            "audio_vehicle_title": "",
+            "video_name": "",
+            "capture_folder": "",
+        }
+    )
+
+    title = ns["_audio_get_vehicle_title"]()
+
+    assert "Ford Mustang" in title
+
+
+def test_audio_save_falls_back_when_mat_reader_reports_buffer_error():
+    ns = _load_audio_save_namespace()
+    repo = Path(__file__).resolve().parents[1]
+    tmp_dir = repo / "logs" / "mat_sync_audio_ui_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    dst = tmp_dir / "audio_save_corrupt_target.mat"
+    dst.write_bytes(b"not a valid mat file")
+
+    ns["st"].session_state.update(
+        {
+            "mat_selected_key": "",
+            "mat_pending_selected_key": "",
+            "audio_last_mat_path": str(dst),
+            "r2_connected": False,
+            "r2_client": None,
+            "audio_debug_lines": ["debug ok"],
+            "mat_selected_summary": {"title": "Fallback Video Title"},
+            "audio_vehicle_title": "",
+        }
+    )
+    res = {
+        "t": np.array([0.0, 0.5, 1.0], dtype=float),
+        "rpm": np.array([1000.0, 1200.0, 1400.0], dtype=float),
+        "selected_freq": np.array([40.0, 48.0, 56.0], dtype=float),
+        "selected_method": "UnitTest",
+        "source": "local-video:test.mp4",
+        "params": {"conversion_factor": 2.0, "nfft": 512},
+        "ui": {"vehicle_title": "Unit Test"},
+        "freq_lines": {"UnitTest": np.array([40.0, 48.0, 56.0], dtype=float)},
+        "candidate_table": [{"Methode": "UnitTest", "Score": 1.0}],
+        "debug_lines": ["saved"],
+    }
+
+    ok, message = ns["_save_audio_result_to_selected_mat"](res)
+
+    assert ok, message
+    assert "Lesefallback" in message
+    data = sio.loadmat(str(dst), squeeze_me=True, struct_as_record=False)
+    rr = data["recordResult"]
+    assert getattr(rr, "audio_rpm") is not None
+    assert getattr(getattr(rr, "metadata"), "title") == "Fallback Video Title"
