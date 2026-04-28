@@ -84,6 +84,7 @@ from track_analysis import (
     extract_minimap_crop,
     project_point_with_homography,
 )
+from app_tabs import audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, track_analysis_tab
 
 if DeltaGenerator is not None and not getattr(st.button, "_ocr_form_fallback", False):
     _ORIG_DELTA_BUTTON = DeltaGenerator.button
@@ -337,6 +338,7 @@ MAT_OVERVIEW_COLCFG = {
     "mat_datei": st.column_config.TextColumn("mat_datei", width="medium"),
     "remote_key": st.column_config.TextColumn("remote_key", width="large"),
     "audio_video_vorhanden": st.column_config.TextColumn("Audio+Video vorhanden", width="small"),
+    "kein_roi_vorhanden": st.column_config.TextColumn("Kein ROI", width="small"),
     "roi_ausgewaehlt": st.column_config.TextColumn("ROI", width="small"),
     "track_ausgewaehlt": st.column_config.TextColumn("Track", width="small"),
     "anfang_ende_ausgewaehlt": st.column_config.TextColumn("Start/Ende", width="small"),
@@ -697,7 +699,7 @@ def _cloud_reduced_completeness(folder: str, src_video: Path | None) -> tuple[bo
     if src_video is not None:
         expected_count = _expected_reduced_frame_count_for_video(src_video)
     if expected_count <= 0:
-        return False, int(cloud_count), int(expected_count), "Nein (Erwartete Frames unbekannt)"
+        return False, int(cloud_count), int(expected_count), "Nein (Originalvideo nicht lesbar; erwartete Frame-Anzahl konnte nicht berechnet werden)"
 
     pfx = st.session_state.r2_prefix.strip("/")
     cap_dir = f"{pfx}/captures/{folder}" if pfx else f"captures/{folder}"
@@ -1638,12 +1640,55 @@ def _merge_recordresult_template(mat_struct: dict, template_fields: dict) -> dic
     return out
 
 
-def _build_save_mat_struct(result):
+def _stamp_no_roi_available(mat_struct: dict, reason: str = "kein roi vorhanden") -> dict:
+    """Mark a capture as intentionally not OCR/ROI-processable."""
+    out = dict(mat_struct or {})
+    rr = _mat_struct_to_plain(out.get("recordResult", {}))
+    if not isinstance(rr, dict):
+        rr = {"data": rr}
+    meta = rr.get("metadata", {}) if isinstance(rr.get("metadata", {}), dict) else {}
+    meta["no_roi_available"] = True
+    meta["roi_status"] = "kein_roi_vorhanden"
+    meta["roi_note"] = str(reason or "kein roi vorhanden")
+    meta["roi_stamped_at"] = datetime.now().isoformat(timespec="seconds")
+    rr["metadata"] = meta
+
+    ocr = rr.get("ocr", {}) if isinstance(rr.get("ocr", {}), dict) else {}
+    params = ocr.get("params", {}) if isinstance(ocr.get("params", {}), dict) else {}
+    params["start_s"] = float(st.session_state.get("t_start", 0.0) or 0.0)
+    params["end_s"] = float(st.session_state.get("t_end", 0.0) or 0.0)
+    ocr["params"] = params
+    ocr["no_roi_available"] = True
+    ocr["roi_status"] = "kein_roi_vorhanden"
+    ocr["roi_note"] = str(reason or "kein roi vorhanden")
+    ocr["created"] = datetime.now().isoformat(timespec="seconds")
+    # Keep empty table-like fields where possible, but the explicit stamp is the source of truth.
+    try:
+        ocr["roi_table"] = _build_roi_table_for_matlab([])
+        ocr["roi_table_raw"] = _build_roi_table_for_matlab([])
+    except Exception:
+        ocr["roi_table"] = []
+        ocr["roi_table_raw"] = []
+    ocr["roi_catalog"] = {
+        "roiNames": _matlab_cellstr(ROI_NAMES),
+        "fmtOptions": _matlab_cellstr(FMT_OPTIONS),
+    }
+    rr["ocr"] = ocr
+    rr.pop("audio_rpm", None)
+    rr.pop("validation", None)
+    out["recordResult"] = rr
+    return out
+
+
+def _build_save_mat_struct(result, no_roi: bool = False):
     mat_struct = build_mat_struct(result)
     template_path = _download_template_mat_for_save()
     try:
         template_fields = _load_recordresult_template_fields(template_path) if template_path else {}
-        return _merge_recordresult_template(mat_struct, template_fields)
+        merged = _merge_recordresult_template(mat_struct, template_fields)
+        if no_roi:
+            merged = _stamp_no_roi_available(merged)
+        return merged
     finally:
         try:
             if template_path and str(template_path).startswith(tempfile.gettempdir()):
@@ -1670,11 +1715,40 @@ def _upload_bytes_compat(client, key: str, data: bytes, content_type: str) -> tu
         return False, str(e)
 
 
-def _save_result_json_and_mat() -> tuple[bool, str, dict]:
+def _server_results_dir() -> Path:
+    """Directory on the machine running Streamlit, not on a remote browser client."""
+    try:
+        if st.session_state.get("local_connected") and st.session_state.get("local_base_path"):
+            base = Path(str(st.session_state.local_base_path)).expanduser()
+            return (base / "results").resolve()
+    except Exception:
+        pass
+    return (Path.cwd() / "results").resolve()
+
+
+def _save_result_json_and_mat(no_roi: bool = False) -> tuple[bool, str, dict]:
     cf = st.session_state.capture_folder or Path(str(st.session_state.video_name or "output")).stem or "output"
     safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(cf)).strip("._") or "output"
-    result = build_result_json()
-    mat_struct_for_save = _build_save_mat_struct(result)
+    if no_roi:
+        result = build_result_payload(
+            t_start=st.session_state.t_start,
+            t_end=st.session_state.t_end,
+            rois=[],
+            video={
+                "width": st.session_state.vid_width,
+                "height": st.session_state.vid_height,
+                "fps": st.session_state.vid_fps,
+                "duration": st.session_state.vid_duration,
+            },
+            track={
+                "ref_pts": None,
+                "minimap_pts": None,
+                "moving_pt_color_range": {},
+            },
+        )
+    else:
+        result = build_result_json()
+    mat_struct_for_save = _build_save_mat_struct(result, no_roi=no_roi)
     json_payload = _mat_export_to_jsonable(mat_struct_for_save)
     json_bytes = json.dumps(json_payload, indent=2, ensure_ascii=False, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
     mat_name = f"results_{safe_cf}.mat"
@@ -1683,17 +1757,20 @@ def _save_result_json_and_mat() -> tuple[bool, str, dict]:
     mat_bytes = mat_buf.getvalue()
     json_name = f"results_{safe_cf}.json"
     saved_targets = []
+    saved_mat_key = ""
+    local_saved_dir = ""
     try:
-        out_dir = Path.cwd() / "results"
+        out_dir = _server_results_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / json_name).write_bytes(json_bytes)
         (out_dir / mat_name).write_bytes(mat_bytes)
-        saved_targets.append(str(out_dir))
+        local_saved_dir = str(out_dir)
+        saved_targets.append(f"Server lokal: {local_saved_dir}")
     except Exception as e:
-        saved_targets.append(f"lokal fehlgeschlagen: {e}")
-    saved_mat_key = ""
+        saved_targets.append(f"Server lokal fehlgeschlagen: {e}")
     if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
-        # 1) zentrale MAT/JSON-Ablage fuer MAT selection
+        # ROI-Setup speichert nur zentral in der Cloud unter <prefix>/results.
+        # Keine lokalen Kopien und keine Duplikate im Capture-Ordner.
         res_dir = _results_dir_key().strip("/")
         json_key = f"{res_dir}/{json_name}" if res_dir else json_name
         mat_key = f"{res_dir}/{mat_name}" if res_dir else mat_name
@@ -1706,25 +1783,14 @@ def _save_result_json_and_mat() -> tuple[bool, str, dict]:
                 st.session_state.mat_summary_cache.pop(mat_key, None)
             except Exception:
                 pass
+            _invalidate_and_update_mat_selection_for_capture(str(cf), saved_mat_key, no_roi=no_roi)
         else:
             saved_targets.append(f"R2 results fehlgeschlagen: JSON={msg_json or ok_json}, MAT={msg_mat or ok_mat}")
-
-        # 2) passende Capture-Cloud-Ablage neben audio_proxy/frames_1fps
-        cap_dir = _capture_results_dir_key(str(cf)).strip("/")
-        if cap_dir and cap_dir != res_dir:
-            cap_json_key = f"{cap_dir}/{json_name}"
-            cap_mat_key = f"{cap_dir}/{mat_name}"
-            ok_cj, msg_cj = _upload_bytes_compat(st.session_state.r2_client, cap_json_key, json_bytes, "application/json")
-            ok_cm, msg_cm = _upload_bytes_compat(st.session_state.r2_client, cap_mat_key, mat_bytes, "application/octet-stream")
-            if ok_cj and ok_cm:
-                saved_targets.append(f"R2: {cap_dir}")
-            else:
-                saved_targets.append(f"R2 capture fehlgeschlagen: JSON={msg_cj or ok_cj}, MAT={msg_cm or ok_cm}")
-
-        if saved_mat_key:
-            _invalidate_and_update_mat_selection_for_capture(str(cf), saved_mat_key)
-    payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=saved_targets, mat_key=saved_mat_key)
-    return True, f"Gespeichert: {json_name} + {mat_name}", payload
+    else:
+        saved_targets.append("R2 nicht verbunden: nicht gespeichert")
+    payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=saved_targets, mat_key=saved_mat_key, local_dir=local_saved_dir)
+    msg_prefix = "Kein ROI vorhanden abgestempelt" if no_roi else "Gespeichert"
+    return True, f"{msg_prefix}: {json_name} + {mat_name}", payload
 
 
 def load_json_config(data):
@@ -2821,6 +2887,37 @@ def _mat_to_float(x, default=np.nan) -> float:
         return default
 
 
+def _mat_truthy(x) -> bool:
+    """Robust truth parser for MATLAB values (logical, numeric, char, cell)."""
+    if x is None:
+        return False
+    try:
+        x = _mat_scalar(x)
+        if isinstance(x, (bool, np.bool_)):
+            return bool(x)
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            return bool(float(x) != 0.0 and np.isfinite(float(x)))
+        if isinstance(x, (bytes, bytearray)):
+            x = x.decode("utf-8", errors="ignore")
+        if isinstance(x, str):
+            s = x.strip().strip("'\"").lower()
+            return s in {"1", "true", "yes", "ja", "y", "ok", "kein_roi_vorhanden", "kein roi vorhanden", "no_roi_available"}
+        if isinstance(x, np.ndarray):
+            if x.size == 0:
+                return False
+            if x.dtype.kind in ("b", "i", "u", "f"):
+                vals = np.asarray(x, dtype=float).ravel()
+                vals = vals[np.isfinite(vals)]
+                return bool(vals.size and np.any(vals != 0.0))
+            return any(_mat_truthy(v) for v in x.ravel().tolist())
+        txt = _mat_to_text(x, "")
+        if txt:
+            return _mat_truthy(txt)
+    except Exception:
+        pass
+    return False
+
+
 def _mat_table_height(tbl) -> int:
     tbl = _mat_scalar(tbl)
     if tbl is None:
@@ -2909,22 +3006,15 @@ def _summarize_record_result_hdf5(mat_path: str) -> dict:
                 if hasattr(obj, "shape"):
                     shapes[lname] = tuple(int(v) for v in obj.shape)
             f.visititems(visitor)
-
-            # v7.3 MAT files store recordResult.metadata as HDF5 groups/datasets.
-            # Read title explicitly so the Audio tab can show the original video
-            # title above the analysis controls.
             meta = _h5_get_path_ci(f, ["recordResult", "metadata"])
             if meta is not None:
-                for mk in ("title", "video_title", "youtube_title", "vehicle_title", "name"):
+                for mk in ("video_title", "title", "vehicle_title", "name", "youtube_title"):
                     obj = _h5_get_path_ci(meta, [mk])
                     if obj is None:
                         continue
                     vals = _h5_to_text_list(obj)
-                    txt = str(vals[0]).strip() if vals else _mat_to_text(_h5_decode_value(obj), "").strip()
-                    if txt:
-                        out[mk] = txt
-                        if mk == "title":
-                            out["metadata_title"] = txt
+                    if vals and str(vals[0]).strip():
+                        out[mk] = str(vals[0]).strip()
                         break
         joined = "\n".join(paths)
         def has(*needles):
@@ -2935,8 +3025,10 @@ def _summarize_record_result_hdf5(mat_path: str) -> dict:
                     if not sh or int(np.prod(sh)) > 0:
                         return True
             return False
-        out["roi_selected"] = has("recordresult/ocr/roi_table", "roi_table")
-        out["track_selected"] = nonempty_path("recordresult/ocr/trkcalslim/roi")
+        no_roi_paths = [p for p in paths if ("no_roi_available" in p or "roi_status" in p)]
+        out["no_roi_available"] = bool(no_roi_paths)
+        out["roi_selected"] = bool((not out.get("no_roi_available")) and nonempty_path("recordresult/ocr/roi_table", "roi_table"))
+        out["track_selected"] = bool((not out.get("no_roi_available")) and nonempty_path("recordresult/ocr/trkcalslim/roi"))
         out["start_end_selected"] = has("recordresult/ocr/params/start_s") and has("recordresult/ocr/params/end_s")
         out["ocr_done"] = nonempty_path("recordresult/ocr/table", "recordresult/ocr/cleaned")
         out["ocr_complete"] = bool(out.get("ocr_done") and out.get("start_end_selected"))
@@ -2959,20 +3051,30 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
         audio_rpm = _mat_obj_get(rr, "audio_rpm")
         validation = _mat_obj_get(rr, "validation")
 
-        video_path = _mat_obj_get(meta, "video") or _mat_obj_get(rr, "video")
-        audio_path = _mat_obj_get(meta, "audio") or _mat_obj_get(rr, "audio")
-        out["recordresult_video_path"] = str(_mat_scalar(video_path) or "")
-        out["recordresult_audio_path"] = str(_mat_scalar(audio_path) or "")
+        video_path = _mat_obj_get(meta, "video") if meta is not None else None
+        if video_path is None:
+            video_path = _mat_obj_get(rr, "video")
+        audio_path = _mat_obj_get(meta, "audio") if meta is not None else None
+        if audio_path is None:
+            audio_path = _mat_obj_get(rr, "audio")
+        out["recordresult_video_path"] = _mat_to_text(video_path, "")
+        out["recordresult_audio_path"] = _mat_to_text(audio_path, "")
         # Relevante Anzeige-Metadaten fuer den Audio-Tab mitnehmen.
         # Je nach Erzeuger heisst der YouTube-/Video-Titel unterschiedlich.
         if meta is not None:
-            for mk in ("title", "video_title", "vehicle_title", "name", "youtube_title"):
+            for mk in ("video_title", "title", "vehicle_title", "name", "youtube_title"):
                 try:
-                    mv = _mat_scalar(_mat_obj_get(meta, mk))
-                    if mv is not None and str(mv).strip():
+                    mv = _mat_to_text(_mat_obj_get(meta, mk), "")
+                    if mv:
                         out[mk] = str(mv).strip()
+                        break
                 except Exception:
                     pass
+        no_roi_meta = _mat_obj_get(meta, "no_roi_available") if meta is not None else None
+        no_roi_ocr = _mat_obj_get(ocr, "no_roi_available") if ocr is not None else None
+        roi_status_meta = _mat_to_text(_mat_obj_get(meta, "roi_status") if meta is not None else None, "")
+        roi_status_ocr = _mat_to_text(_mat_obj_get(ocr, "roi_status") if ocr is not None else None, "")
+        out["no_roi_available"] = bool(_mat_truthy(no_roi_meta) or _mat_truthy(no_roi_ocr) or "kein_roi" in roi_status_meta.lower() or "kein roi" in roi_status_meta.lower() or "no_roi" in roi_status_meta.lower() or "kein_roi" in roi_status_ocr.lower() or "kein roi" in roi_status_ocr.lower() or "no_roi" in roi_status_ocr.lower())
 
         params = _mat_obj_get(ocr, "params")
         start_s = _mat_to_float(_mat_obj_get(params, "start_s"))
@@ -2988,13 +3090,13 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
                 roi_rows = len(_extract_rois_from_recordresult_hdf5(mat_path))
             except Exception:
                 roi_rows = 0
-        out["roi_selected"] = bool(roi_rows > 0)
+        out["roi_selected"] = bool((not out.get("no_roi_available")) and roi_rows > 0)
         out["roi_count"] = int(roi_rows)
 
         # OCRExtractor.m stores reusable track calibration in recordResult.ocr.trkCalSlim.
         # Fresh ROI-setup MATs may only contain track_minimap in roi_table.
         trk_slim = _mat_obj_get(ocr, "trkCalSlim")
-        out["track_selected"] = bool(_mat_has_nonempty_roi_field(trk_slim) or _mat_roi_table_has_track(roi_table))
+        out["track_selected"] = bool((not out.get("no_roi_available")) and (_mat_has_nonempty_roi_field(trk_slim) or _mat_roi_table_has_track(roi_table)))
 
         raw_table = _mat_obj_get(ocr, "table")
         cleaned = _mat_obj_get(ocr, "cleaned")
@@ -3057,9 +3159,15 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
     for k, v in record_summary.items():
         if v is not None:
             summary[k] = v
-    summary["roi_selected"] = bool(summary.get("roi_selected") or _mat_has_any(["rois", "roi", "roi_table", "roitable"]))
+    summary["no_roi_available"] = bool(summary.get("no_roi_available") or _mat_has_any(["no_roi_available"]))
+    if summary.get("no_roi_available"):
+        summary["roi_selected"] = False
+    elif "roi_selected" in record_summary:
+        summary["roi_selected"] = bool(record_summary.get("roi_selected"))
+    else:
+        summary["roi_selected"] = bool(summary.get("roi_selected") or _mat_has_any(["rois", "roi", "roi_table", "roitable"]))
     # Track status follows OCRExtractor.m: only recordResult.ocr.trkCalSlim.roi counts.
-    summary["track_selected"] = bool(summary.get("track_selected"))
+    summary["track_selected"] = bool((not summary.get("no_roi_available")) and summary.get("track_selected"))
     summary["start_end_selected"] = bool(summary.get("start_end_selected") or _mat_has_any(["t_start", "t_end", "start_time", "end_time", "startend", "time_range"]))
     summary["ocr_done"] = bool(summary.get("ocr_done") or _mat_has_any(["ocr_results", "ocr_values", "results_table"]))
     summary["ocr_complete"] = bool(summary.get("ocr_complete") or (summary.get("ocr_done") and not _mat_has_any(["ocr_missing", "ocr_errors", "missing_values"])))
@@ -3143,6 +3251,7 @@ def _compute_folder_only_summary(folder: str, client, prefix: str) -> dict:
         "capture_folder": folder,
         "video_file_exists": False,
         "audio_file_exists": False,
+        "no_roi_available": False,
         "roi_selected": False,
         "track_selected": False,
         "start_end_selected": False,
@@ -3238,6 +3347,7 @@ def _summary_to_overview_row(summary: dict, display_folder: str = "") -> dict:
         "audio_video_vorhanden": _jn(
             bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists"))
         ),
+        "kein_roi_vorhanden": _jn(summary.get("no_roi_available")),
         "roi_ausgewaehlt": _jn(summary.get("roi_selected")),
         "track_ausgewaehlt": _jn(summary.get("track_selected")),
         "anfang_ende_ausgewaehlt": _jn(summary.get("start_end_selected")),
@@ -3261,6 +3371,7 @@ def _placeholder_overview_row(target) -> dict:
         "mat_datei": title,
         "remote_key": mat_key,
         "audio_video_vorhanden": "...",
+        "kein_roi_vorhanden": "...",
         "roi_ausgewaehlt": "...",
         "track_ausgewaehlt": "...",
         "anfang_ende_ausgewaehlt": "...",
@@ -3358,6 +3469,7 @@ def _status_cell_style(value):
 def _style_overview_dataframe(df: pd.DataFrame):
     status_cols = [
         "audio_video_vorhanden",
+        "kein_roi_vorhanden",
         "roi_ausgewaehlt",
         "track_ausgewaehlt",
         "anfang_ende_ausgewaehlt",
@@ -3401,6 +3513,7 @@ def _normalize_overview_lamps(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     status_cols = [
         "audio_video_vorhanden",
+        "kein_roi_vorhanden",
         "roi_ausgewaehlt",
         "track_ausgewaehlt",
         "anfang_ende_ausgewaehlt",
@@ -3425,6 +3538,7 @@ def _render_mat_selection_analysis(df: pd.DataFrame, title_suffix: str = "") -> 
         return
     status_items = [
         ("Audio+Video", "audio_video_vorhanden"),
+        ("Kein ROI", "kein_roi_vorhanden"),
         ("ROI", "roi_ausgewaehlt"),
         ("Track", "track_ausgewaehlt"),
         ("Start/Ende", "anfang_ende_ausgewaehlt"),
@@ -3593,7 +3707,43 @@ def _capture_results_dir_key(capture_folder: str) -> str:
     return f"{pfx}/captures/{folder}" if pfx else f"captures/{folder}"
 
 
-def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_key: str = "") -> None:
+def _build_current_roi_save_summary(capture_folder: str, mat_key: str, no_roi: bool = False) -> dict:
+    """Build an immediate MAT-selection summary from the current UI state.
+
+    This avoids waiting for R2 overwrite consistency or a second MAT download right
+    after saving. The uploaded MAT is still the source of truth on the next full
+    refresh, but the row shown to the user is updated immediately.
+    """
+    rois = list(st.session_state.get("rois") or [])
+    has_roi = bool(rois) and not bool(no_roi)
+    has_track = False
+    if has_roi:
+        for r in rois:
+            if str(r.get("name", "")).strip() == "track_minimap":
+                try:
+                    has_track = float(r.get("w", 0) or 0) > 0 and float(r.get("h", 0) or 0) > 0
+                except Exception:
+                    has_track = True
+                break
+    t_start = float(st.session_state.get("t_start", 0.0) or 0.0)
+    t_end = float(st.session_state.get("t_end", 0.0) or 0.0)
+    current_summary = dict(st.session_state.get("mat_selected_summary") or {})
+    return {
+        **current_summary,
+        "mat_file": Path(mat_key).name if mat_key else f"results_{capture_folder}.mat",
+        "remote_key": mat_key,
+        "capture_folder": capture_folder,
+        "no_roi_available": bool(no_roi),
+        "roi_selected": bool(has_roi),
+        "roi_count": int(len(rois) if has_roi else 0),
+        "track_selected": bool(has_track),
+        "start_end_selected": bool(t_end > t_start),
+        "t_start": t_start,
+        "t_end": t_end,
+    }
+
+
+def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_key: str = "", no_roi: bool = False) -> None:
     """Refresh cached MAT-selection status for the saved capture without rescanning everything."""
     folder = str(capture_folder or "").strip("/\\")
     key = str(mat_key or "").strip("/")
@@ -3601,7 +3751,11 @@ def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_ke
         if key and isinstance(st.session_state.get("mat_summary_cache"), dict):
             st.session_state.mat_summary_cache.pop(key, None)
         if key and st.session_state.get("r2_client") is not None:
-            summary = _get_mat_summary_from_r2(key)
+            summary = _build_current_roi_save_summary(folder, key, no_roi=no_roi)
+            cache = st.session_state.get("mat_summary_cache")
+            if isinstance(cache, dict):
+                cache[key] = dict(summary)
+                st.session_state.mat_summary_cache = cache
             row = _summary_to_overview_row(summary, display_folder=folder)
             rows = list(st.session_state.get("mat_overview_rows") or [])
             replaced = False
@@ -3615,6 +3769,7 @@ def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_ke
             st.session_state.mat_overview_rows = rows
             st.session_state.mat_selected_key = key
             st.session_state.mat_pending_selected_key = key
+            st.session_state.mat_user_selected_key = key
             st.session_state.mat_selected_summary = summary
 
             targets = list(st.session_state.get("mat_targets") or [])
@@ -3629,8 +3784,6 @@ def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_ke
             st.session_state.mat_targets = targets
     except Exception as e:
         set_status(f"MAT Selection konnte nicht aktualisiert werden: {e}", "warn")
-
-
 def _find_next_roi_setup_target() -> dict | None:
     """Return next capture with reduced audio+video in cloud but without ROI parameters."""
     rows = list(st.session_state.get("mat_overview_rows") or [])
@@ -3649,8 +3802,9 @@ def _find_next_roi_setup_target() -> dict | None:
         if not folder or folder == current:
             continue
         media_ok = _overview_status_is_green(row.get("audio_video_vorhanden"))
+        no_roi_stamped = _overview_status_is_green(row.get("kein_roi_vorhanden"))
         roi_missing = not _overview_status_is_green(row.get("roi_ausgewaehlt"))
-        if media_ok and roi_missing:
+        if media_ok and roi_missing and not no_roi_stamped:
             candidates.append({"idx": idx, "folder": folder, "remote_key": str(row.get("remote_key", "") or "")})
     if candidates:
         return candidates[0]
@@ -3662,7 +3816,7 @@ def _find_next_roi_setup_target() -> dict | None:
         key = str(t.get("mat_key", "") or "")
         try:
             summary = _get_mat_summary_from_r2(key) if key else _compute_folder_only_summary(folder, st.session_state.r2_client, st.session_state.r2_prefix.strip("/"))
-            if bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists")) and not bool(summary.get("roi_selected")):
+            if bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists")) and not bool(summary.get("roi_selected")) and not bool(summary.get("no_roi_available")):
                 return {"idx": -1, "folder": folder, "remote_key": key}
         except Exception:
             continue
@@ -4109,7 +4263,7 @@ def _audio_get_vehicle_title() -> str:
     if isinstance(obj, dict):
         dataset = str(obj.get("capture_folder") or obj.get("mat_file") or "").strip()
         video_title = ""
-        for k in ("metadata_title", "title", "video_title", "youtube_title", "vehicle_title", "name"):
+        for k in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
             txt = str(obj.get(k, "") or "").strip()
             if txt and txt not in parts:
                 video_title = txt
@@ -4120,6 +4274,16 @@ def _audio_get_vehicle_title() -> str:
             parts.append(video_title)
         if parts:
             return " · ".join(parts)
+    mat_path = str(st.session_state.get("audio_last_mat_path") or "").strip()
+    if mat_path:
+        try:
+            local_summary = _summarize_record_result_mat(mat_path)
+            for k in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
+                txt = str(local_summary.get(k, "") or "").strip()
+                if txt:
+                    return txt
+        except Exception:
+            pass
     for k in ("audio_vehicle_title", "video_name", "capture_folder"):
         txt = str(st.session_state.get(k, "") or "").strip()
         if txt:
@@ -4339,217 +4503,6 @@ def _audio_live_widget(job_id: str, height: int = 330):
     components.html(html, height=height)
 
 
-
-def _audio_live_snapshot(job_id: str = "") -> tuple[dict, list[str], str]:
-    """Read live audio status from Python/shared state for fragment updates."""
-    job_id = str(job_id or st.session_state.get("audio_bg_live_id", "") or "")
-    progress = dict(st.session_state.get("audio_bg_progress") or {})
-    lines = [str(x) for x in (st.session_state.get("audio_debug_lines") or [])]
-    status = "idle"
-    fut = st.session_state.get("audio_bg_future")
-    if fut is not None:
-        status = "done" if fut.done() else "running"
-
-    live_ref = st.session_state.get("audio_bg_log_ref")
-    if isinstance(live_ref, list) and live_ref:
-        lines = [str(x) for x in live_ref[-300:]]
-        st.session_state.audio_debug_lines = list(lines[-200:])
-    prog_ref = st.session_state.get("audio_bg_progress_ref")
-    if isinstance(prog_ref, dict) and prog_ref:
-        progress = dict(prog_ref)
-        st.session_state.audio_bg_progress = dict(progress)
-
-    if job_id:
-        try:
-            live = _audio_live_server()
-            with live["lock"]:
-                job = dict((live["state"].get("jobs") or {}).get(job_id) or {})
-            if job:
-                jlines = [str(x) for x in (job.get("log") or [])]
-                if jlines:
-                    lines = jlines[-300:]
-                    st.session_state.audio_debug_lines = list(lines[-200:])
-                jprog = job.get("progress") or {}
-                if isinstance(jprog, dict) and jprog:
-                    progress = dict(jprog)
-                    st.session_state.audio_bg_progress = dict(progress)
-                status = str(job.get("status") or status)
-        except Exception:
-            pass
-
-    if fut is not None and not fut.done() and not progress:
-        progress = {"done": 0, "total": 1, "fraction": 0.0, "text": "Hintergrundjob gestartet ..."}
-    return progress, lines, status
-
-
-def _audio_collect_finished_future(show_messages: bool = False) -> bool:
-    """Move a finished background result into session_state without st.rerun()."""
-    fut = st.session_state.get("audio_bg_future")
-    if fut is None or not fut.done():
-        return False
-    try:
-        res_bg = fut.result()
-        st.session_state.audio_analysis_result = res_bg
-        live_done = st.session_state.get("audio_bg_log_ref")
-        if isinstance(live_done, list) and live_done:
-            st.session_state.audio_debug_lines = list(live_done[-200:])
-        else:
-            st.session_state.audio_debug_lines = list(res_bg.get("debug_lines", []))[-200:]
-        live_prog_done = st.session_state.get("audio_bg_progress_ref")
-        if isinstance(live_prog_done, dict) and live_prog_done:
-            st.session_state.audio_bg_progress = dict(live_prog_done)
-        st.session_state.audio_bg_log_ref = None
-        st.session_state.audio_bg_progress_ref = None
-        _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.get("audio_bg_progress") or {}, status="done")
-        set_status("Audioanalyse abgeschlossen.", "ok")
-        if show_messages:
-            st.success("Audioanalyse abgeschlossen.")
-    except Exception as e:
-        st.session_state.audio_analysis_result = None
-        live_err = st.session_state.get("audio_bg_log_ref")
-        base_err = list(live_err[-190:]) if isinstance(live_err, list) else list(st.session_state.get("audio_debug_lines", []) or [])[-190:]
-        st.session_state.audio_debug_lines = [*base_err, f"FEHLER: {e}"]
-        st.session_state.audio_bg_log_ref = None
-        st.session_state.audio_bg_progress_ref = None
-        st.session_state.audio_bg_progress = {"done": 0, "total": 1, "fraction": 0.0, "text": f"Fehler: {e}"}
-        _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.audio_bg_progress, log_line=f"FEHLER: {e}", status="error")
-        set_status(f"Audioanalyse fehlgeschlagen: {e}", "warn")
-        if show_messages:
-            st.error(f"Audioanalyse fehlgeschlagen: {e}")
-    finally:
-        st.session_state.audio_bg_future = None
-        try:
-            ex_done = st.session_state.get("audio_bg_executor")
-            if ex_done is not None:
-                ex_done.shutdown(wait=False, cancel_futures=True)
-            st.session_state.audio_bg_executor = None
-        except Exception:
-            pass
-    return True
-
-
-def _render_audio_start_feedback(message: str = "Audioanalyse wird gestartet ..."):
-    """Small non-blocking visual feedback after pressing the audio button."""
-    safe = str(message or "Audioanalyse wird gestartet ...").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    st.markdown(
-        f"""
-        <style>
-        .audio-start-feedback {{
-            position: fixed;
-            right: 22px;
-            bottom: 22px;
-            z-index: 9998;
-            pointer-events: none;
-            background: rgba(13, 30, 46, 0.96);
-            border: 1px solid #4a90a4;
-            color: #e8f7ff;
-            border-radius: 10px;
-            padding: 10px 14px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 12px;
-            font-weight: 800;
-            box-shadow: 0 10px 28px rgba(0,0,0,.35);
-        }}
-        .audio-start-feedback::before {{
-            content: '';
-            display: inline-block;
-            width: 9px;
-            height: 9px;
-            margin-right: 9px;
-            border-radius: 999px;
-            background: #4a90a4;
-            box-shadow: 0 0 10px rgba(74,144,164,.75);
-            animation: audioPulse 1s infinite ease-in-out;
-        }}
-        @keyframes audioPulse {{
-            0%, 100% {{ opacity: .35; transform: scale(.85); }}
-            50% {{ opacity: 1; transform: scale(1.15); }}
-        }}
-        </style>
-        <div class="audio-start-feedback">{safe}</div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _render_audio_live_native(job_id: str = ""):
-    progress, lines, status = _audio_live_snapshot(job_id)
-    done = int(progress.get("done", 0) or 0)
-    total = max(1, int(progress.get("total", 1) or 1))
-    frac = max(0.0, min(1.0, float(progress.get("fraction", done / total) or 0.0)))
-    txt = str(progress.get("text", "") or "")
-    if status == "done":
-        label = f"Fertig: {done}/{total} Jobs ({frac*100:.0f}%)"
-    elif status == "error":
-        label = f"Fehler: {txt}" if txt else "Fehler"
-    elif st.session_state.get("audio_bg_future") is not None:
-        label = f"Audioanalyse: {done}/{total} Jobs ({frac*100:.0f}%)"
-    else:
-        label = "Keine Audioanalyse aktiv"
-    if txt and status != "error" and not label.endswith(txt):
-        label += f" - {txt}"
-    st.progress(frac, text=label)
-
-    shown = [str(x) for x in (lines[-160:] if lines else ["Noch kein Audio-Debug vorhanden."])]
-    log_rows = []
-    for ln in shown:
-        safe = ln.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        log_rows.append(f'<div class="audio-live-log-line">{safe}</div>')
-    st.markdown(f"""
-        <style>
-        .audio-live-log-box {{
-            height: 260px; min-height: 260px; max-height: 260px;
-            overflow-y: auto; overflow-x: auto;
-            background: #191c24; border: 1px solid #243049; border-radius: 6px;
-            padding: 8px 10px; margin-top: 8px;
-        }}
-        .audio-live-log-line {{
-            white-space: pre; color: #f4f7ff;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 10px; line-height: 1.28; min-height: 13px;
-        }}
-        </style>
-        <div class="audio-live-log-box">{''.join(log_rows)}</div>
-        """, unsafe_allow_html=True)
-    if status == "running":
-        elapsed = time.perf_counter() - float(st.session_state.get("audio_bg_started", time.perf_counter()) or time.perf_counter())
-        st.caption(f"Live seit {elapsed:.1f}s · aktualisiert nur diesen Bereich, ohne kompletten App-Rerun.")
-
-
-def _render_audio_result_plots(res: dict, key_suffix: str = ""):
-    if not (isinstance(res, dict) and res.get("t") is not None):
-        return
-    p = res.get('params', {})
-    zyl_txt = "EV" if p.get('cyl') == 0 else p.get('cyl')
-    st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} · Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz · NFFT: {p.get('nfft')} · Overlap: {p.get('overlap_pct')}%")
-    if res.get('candidate_table'):
-        with st.expander("Kandidatenbewertung", expanded=False):
-            st.dataframe(pd.DataFrame(res['candidate_table']), width="stretch", hide_index=True)
-    try:
-        import plotly.graph_objects as go
-        t = np.asarray(res['t'], dtype=float)
-        f = np.asarray(res['freqs'], dtype=float)
-        db = np.asarray(res['db'], dtype=float)
-        step_t = max(1, int(np.ceil(db.shape[1] / 1800))) if db.ndim == 2 else 1
-        step_f = max(1, int(np.ceil(db.shape[0] / 900))) if db.ndim == 2 else 1
-        fig = go.Figure(data=go.Heatmap(x=t[::step_t], y=f[::step_f], z=db[::step_f, ::step_t], colorscale="Viridis", colorbar=dict(title="dB")))
-        line_keys = list((res.get('freq_lines') or {}).keys())
-        default_line = [res.get('selected_method', 'Auto robust')] if res.get('selected_method', 'Auto robust') in line_keys else (line_keys[:1] if line_keys else [])
-        show = st.multiselect("Frequenzlinien im Spektrogramm anzeigen", line_keys, default=default_line, key=f"aud_lines_new{key_suffix}")
-        for nm in show:
-            a = np.asarray(res.get('freq_lines', {}).get(nm, []), dtype=float)
-            if a.size == t.size:
-                fig.add_trace(go.Scatter(x=t, y=a, mode="lines", name=nm, line=dict(width=2)))
-        fig.update_layout(title="Spektrogramm f [Hz] über t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
-        st.plotly_chart(fig, width="stretch")
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=t, y=np.asarray(res['rpm'], dtype=float), mode="lines", name="RPM"))
-        fig2.update_layout(title="RPM", xaxis_title="t [s]", yaxis_title="1/min", height=330, template="plotly_dark")
-        st.plotly_chart(fig2, width="stretch")
-    except Exception as e:
-        st.warning(f"Plots konnten nicht erstellt werden: {e}")
-    st.download_button("Debug ZIP herunterladen", data=_audio_make_debug_zip(res, shown_lines=st.session_state.get(f'aud_lines_new{key_suffix}', [])), file_name=f"audio_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", width="stretch", key=f"aud_debug_zip_new{key_suffix}")
-
 def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_progress=None, live_job_id=None):
     log = []
     t0 = time.perf_counter()
@@ -4760,6 +4713,142 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
     prog(total_jobs, total_jobs, "Audioanalyse abgeschlossen")
     return dict(fs=int(fs), t=t_video, freqs=freqs, db=db, audio_t=np.arange(a0, a1) / float(fs) - float(offset_s), audio_y=seg, freq_lines=lines, selected_method=selected_method, selected_freq=fsel, rpm=rpm, candidate_table=table, debug_lines=[], params=dict(start_s=start_s, end_s=end_s, audio_offset_s=offset_s, nfft=best['nfft'], nfft_requested=nfft, overlap_pct=best['overlap_pct'], overlap_requested=overlap_pct, stft_mode=stft_mode, fmax=fmax, cyl=best['cyl'], takt=takt, order=order_base, harmonic=best['harmonic'], drive_type=drive_type, f_search_lo=best['f_lo'], f_search_hi=best['f_hi'], conversion_factor=best['conv'], method_params=mp))
 
+
+def _matlab_field_name(name: str, fallback: str = "field") -> str:
+    txt = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name or "")).strip("_")
+    if not txt:
+        txt = fallback
+    if txt[0].isdigit():
+        txt = "x_" + txt
+    return txt[:63]
+
+
+def _cellstr_column(values) -> np.ndarray:
+    return np.array([str(v) for v in (values or [])], dtype=object).reshape((-1, 1))
+
+
+def _struct_array_from_dicts(rows: list[dict]) -> np.ndarray:
+    rows = list(rows or [])
+    if not rows:
+        return np.empty((0, 1), dtype=object)
+    field_names = []
+    for r in rows:
+        for k in (r or {}).keys():
+            fn = _matlab_field_name(k)
+            if fn not in field_names:
+                field_names.append(fn)
+    arr = np.empty((len(rows), 1), dtype=[(fn, object) for fn in field_names])
+    for i, r in enumerate(rows):
+        vals = []
+        for fn in field_names:
+            src_key = next((k for k in (r or {}).keys() if _matlab_field_name(k) == fn), fn)
+            v = (r or {}).get(src_key, "")
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                vals.append(np.array([[float(v)]], dtype=float))
+            else:
+                vals.append(str(v))
+        arr[i, 0] = tuple(vals)
+    return arr
+
+
+def _build_audio_rpm_struct_from_result(res: dict) -> dict:
+    res = dict(res or {})
+    p = dict(res.get("params") or {})
+    ui = dict(res.get("ui") or {})
+    t = np.asarray(res.get("t", []), dtype=float).reshape(-1)
+    rpm = np.asarray(res.get("rpm", []), dtype=float).reshape(-1)
+    fsel = np.asarray(res.get("selected_freq", []), dtype=float).reshape(-1)
+    n = int(min(len(t), len(rpm), len(fsel))) if len(fsel) else int(min(len(t), len(rpm)))
+    t = t[:n]
+    rpm = rpm[:n]
+    fsel = fsel[:n] if len(fsel) else np.full(n, np.nan)
+    freq_lines = {}
+    for name, arr in (res.get("freq_lines") or {}).items():
+        a = np.asarray(arr, dtype=float).reshape(-1)
+        if a.size == n:
+            freq_lines[_matlab_field_name(name, "line")] = a.reshape((-1, 1))
+    params = {}
+    base_params = dict(p)
+    base_params.update({"source": res.get("source", ""), "selected_method": res.get("selected_method", "")})
+    for k, v in base_params.items():
+        fn = _matlab_field_name(k)
+        if isinstance(v, (dict, list, tuple)):
+            params[fn] = json.dumps(v, ensure_ascii=False, default=str)
+        elif isinstance(v, (int, float, np.integer, np.floating)):
+            params[fn] = np.array([[float(v)]], dtype=float)
+        else:
+            params[fn] = str(v)
+    if ui:
+        params["ui"] = { _matlab_field_name(k): (json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list, tuple)) else v) for k, v in ui.items() }
+    return {
+        "params": params,
+        "processed": {
+            "t_s": t.reshape((-1, 1)),
+            "rpm": rpm.reshape((-1, 1)),
+            "freq_hz": fsel.reshape((-1, 1)),
+            "method": str(res.get("selected_method", "")),
+        },
+        "freq_lines": freq_lines,
+        "candidate_table": _struct_array_from_dicts(list(res.get("candidate_table") or [])),
+        "debug_lines": _cellstr_column(res.get("debug_lines") or st.session_state.get("audio_debug_lines") or []),
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
+    if not isinstance(res, dict) or res.get("t") is None:
+        return False, "Keine Audioanalyse-Ergebnisse zum Speichern vorhanden."
+    selected_key = str(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
+    local_mat_path = str(st.session_state.get("audio_last_mat_path") or "").strip()
+    if not selected_key and not local_mat_path:
+        return False, "Keine MAT-Datei ausgewählt. Bitte zuerst MAT + Video laden."
+    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp_in.close()
+    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp_out.close()
+    try:
+        if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+            ok, msg = st.session_state.r2_client.download_file(selected_key, tmp_in.name)
+            if not ok:
+                return False, f"MAT-Download fehlgeschlagen: {msg}"
+        elif local_mat_path:
+            shutil.copyfile(local_mat_path, tmp_in.name)
+        else:
+            return False, "Keine Cloud-Verbindung und keine lokale MAT-Datei verfügbar."
+        try:
+            mat_data = sio.loadmat(tmp_in.name, squeeze_me=True, struct_as_record=False)
+            rr = _mat_struct_to_plain(mat_data.get("recordResult", {}))
+            if not isinstance(rr, dict):
+                rr = {"data": rr}
+            extra = {k: v for k, v in mat_data.items() if not str(k).startswith("__") and k != "recordResult"}
+        except NotImplementedError:
+            base = _build_save_mat_struct(build_result_json())
+            rr = _mat_struct_to_plain(base.get("recordResult", {}))
+            if not isinstance(rr, dict):
+                rr = {}
+            extra = {}
+        except Exception as e:
+            return False, f"MAT konnte nicht gelesen werden: {e}"
+        rr["audio_rpm"] = _build_audio_rpm_struct_from_result(res)
+        out_data = dict(extra)
+        out_data["recordResult"] = rr
+        sio.savemat(tmp_out.name, out_data, do_compression=True)
+        if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+            ok_up, msg_up = st.session_state.r2_client.upload_file(tmp_out.name, selected_key)
+            if not ok_up:
+                return False, f"MAT-Upload fehlgeschlagen: {msg_up}"
+            try:
+                st.session_state.mat_summary_cache.pop(selected_key, None)
+            except Exception:
+                pass
+            return True, f"Audioanalyse in MAT gespeichert: {selected_key}"
+        shutil.copyfile(tmp_out.name, local_mat_path)
+        return True, f"Audioanalyse lokal gespeichert: {local_mat_path}"
+    finally:
+        for fp in (tmp_in.name, tmp_out.name):
+            try:
+                Path(fp).unlink(missing_ok=True)
+            except Exception:
+                pass
+
 _try_auto_connect_once()
 _try_auto_connect_local_once()
 
@@ -4804,1837 +4893,27 @@ if isinstance(_tab_default, str) and _tab_default in _tab_labels:
 # TAB: Setup
 # ----------------------------------------
 with tab_setup:
-    with st.expander("Debug-Logs", expanded=False):
-        st.caption(f"Crash-Log Datei: {LOG_FILE}")
-        if LOG_FILE.exists():
-            try:
-                log_text = LOG_FILE.read_text(encoding="utf-8", errors="ignore")
-            except Exception as e:
-                log_text = f"Log konnte nicht gelesen werden: {e}"
-            st.code(log_text[-12000:] if log_text else "(leer)", language="text")
-            c_log1, c_log2 = st.columns(2)
-            c_log1.download_button(
-                "Log herunterladen",
-                data=log_text.encode("utf-8", errors="ignore"),
-                file_name="app_crash.log",
-                mime="text/plain",
-                width="stretch",
-            )
-            if c_log2.button("Log leeren", width="stretch"):
-                try:
-                    LOG_FILE.write_text("", encoding="utf-8")
-                    set_status("Crash-Log geleert.", "info")
-                    st.rerun()
-                except Exception as e:
-                    set_status(f"Log konnte nicht geleert werden: {e}", "warn")
-        else:
-            st.info("Noch kein Crash-Log vorhanden.")
-
-    cloud_ok = bool(st.session_state.r2_connected)
-    local_ok = bool(st.session_state.local_connected)
-
-    col_cloud, col_local = st.columns(2, gap="large")
-
-    with col_cloud:
-        st.markdown('<div class="section-card" style="background:#0b1524;border-color:#234465;">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Cloud DB | Cloudflare R2</div>', unsafe_allow_html=True)
-        # Card 1: Status
-        st.markdown(
-            f"""
-            <div style="background:#0b1524;border:1px solid #2b4f77;border-radius:10px;padding:.8rem 1rem;margin-bottom:.7rem;">
-              <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;">Cloud DB Status</div>
-              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
-                <span class="conn-dot {'ok' if cloud_ok else 'off'}" style="width:13px;height:13px;"></span>
-                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if cloud_ok else '#ff5c5c'};">
-                  {'Verbunden' if cloud_ok else 'Nicht verbunden'}
-                </span>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        # Card 2: Credentials + connect
-        with st.container(border=True, key="cloud_access_card"):
-            st.markdown(
-                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Cloud Zugang</div>",
-                unsafe_allow_html=True,
-            )
-            r2_account = st.text_input(
-                "Account ID",
-                key="r2_account_id",
-                help="Cloudflare Dashboard -> R2 -> Account ID",
-            )
-            r2_key = st.text_input(
-                "Access Key ID",
-                key="r2_access_key_id",
-                help="R2 -> Manage API Tokens -> Create API Token",
-            )
-            r2_secret = st.text_input(
-                "Secret Access Key",
-                key="r2_secret_access_key",
-                type="password",
-            )
-            r2_bucket = st.text_input(
-                "Bucket Name",
-                key="r2_bucket",
-                placeholder="mein-bucket",
-            )
-
-            try:
-                r2_connect_clicked = st.button("Cloud DB verbinden", type="primary", width="stretch", key="r2_connect_btn")
-            except Exception as e:
-                if "can't be used in an `st.form()`" not in str(e):
-                    raise
-                r2_connect_clicked = st.form_submit_button("Cloud DB verbinden", type="primary", width="stretch")
-
-            if r2_connect_clicked:
-                if r2_account and r2_key and r2_secret and r2_bucket:
-                    with st.spinner("Verbinde Cloud DB ..."):
-                        _ok, _msg, _client = connect_r2_client(r2_account, r2_key, r2_secret, r2_bucket)
-                    if _ok:
-                        st.session_state.r2_connected = True
-                        st.session_state.r2_client = _client
-                        st.session_state.r2_prefix_options = list_root_prefixes(_client)
-                        st.session_state.r2_prefix = ""
-                        st.session_state.mat_scan_prefix = None
-                        set_status("Cloud DB verbunden.", "ok")
-                    else:
-                        st.session_state.r2_connected = False
-                        set_status(f"Cloud DB Verbindung fehlgeschlagen: {_msg}", "warn")
-                    st.rerun()
-                else:
-                    set_status("Bitte alle Cloud-DB Felder ausfuellen.", "warn")
-                    st.rerun()
-
-        # Card 3: Root + refresh
-        with st.container(border=True, key="cloud_root_card"):
-            st.markdown(
-                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Cloud Root</div>",
-                unsafe_allow_html=True,
-            )
-            if st.session_state.r2_connected:
-                opts = st.session_state.r2_prefix_options or [""]
-                cur = st.session_state.r2_prefix
-                idx = opts.index(cur) if cur in opts else 0
-                chosen = st.selectbox(
-                    "Cloud Prefix",
-                    opts,
-                    index=idx,
-                    format_func=lambda x: x or "(Bucket-Root)",
-                    label_visibility="collapsed",
-                    key="root_dd",
-                )
-                if chosen != st.session_state.r2_prefix:
-                    st.session_state.r2_prefix = chosen
-                    st.session_state.mat_scan_prefix = None
-                    set_status(f"Cloud Root: {chosen or '(root)'}", "ok")
-                if st.button("Cloud Liste aktualisieren", width="stretch", key="refresh_root"):
-                    st.session_state.r2_prefix_options = get_root_prefixes()
-                    st.rerun()
-            else:
-                st.caption("Erst Cloud DB verbinden.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col_local:
-        st.markdown('<div class="section-card" style="background:#132114;border-color:#305b34;">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Lokale DB</div>', unsafe_allow_html=True)
-        # Card 1: Status
-        st.markdown(
-            f"""
-            <div style="background:#132114;border:1px solid #376a3d;border-radius:10px;padding:.8rem 1rem;margin-bottom:.7rem;">
-              <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#9fbe9f;text-transform:uppercase;letter-spacing:.08em;">Lokale DB Status</div>
-              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
-                <span class="conn-dot {'ok' if local_ok else 'off'}" style="width:13px;height:13px;"></span>
-                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if local_ok else '#ff5c5c'};">
-                  {'Verbunden' if local_ok else 'Nicht verbunden'}
-                </span>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        # Card 2: Notice + picker + path
-        with st.container(border=True, key="local_access_card"):
-            st.markdown(
-                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#9fbe9f;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Lokaler Zugriff</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                """
-                <div style="background:#17301a;border:1px solid #2b5a31;border-radius:8px;padding:.55rem .7rem;
-                     font-family:'JetBrains Mono',monospace;font-size:.68rem;color:#b8ddb9;line-height:1.5;margin-bottom:.6rem;">
-                Hinweis: Nur auf localhost nutzbar. Der gewaehlte Ordner muss einen Unterordner <b>captures</b> enthalten.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            if st.button("Ordner waehlen (lokal)", width="stretch", key="local_pick_btn"):
-                try:
-                    ok_pick, picked = _pick_local_folder_dialog(st.session_state.local_base_path_input)
-                    if ok_pick and picked:
-                        st.session_state.local_base_path_input = picked
-                        lp = Path(picked).expanduser().resolve()
-                        captures_dir = lp / "captures"
-                        if captures_dir.exists() and captures_dir.is_dir():
-                            local_client = LocalStorageAdapter(str(lp))
-                            ok_local, msg_local = local_client.test_connection()
-                            if ok_local:
-                                st.session_state.local_connected = True
-                                st.session_state.local_client = local_client
-                                st.session_state.local_base_path = str(lp)
-                                st.session_state.local_root = ""
-                                set_status(f"Lokale DB verbunden: {lp}", "ok")
-                            else:
-                                st.session_state.local_connected = False
-                                st.session_state.local_client = None
-                                set_status(f"Lokale DB Verbindung fehlgeschlagen: {msg_local}", "warn")
-                        else:
-                            st.session_state.local_connected = False
-                            st.session_state.local_client = None
-                            set_status("Lokale DB nicht verbunden: Unterordner 'captures' fehlt.", "warn")
-                        st.rerun()
-                    elif picked:
-                        set_status(f"Ordnerdialog nicht verfuegbar: {picked}", "warn")
-                except Exception as e:
-                    set_status(f"Lokale DB Verbindung fehlgeschlagen: {e}", "warn")
-            st.markdown(
-                f'<div class="breadcrumb">Lokaler Basispfad: {st.session_state.local_base_path if st.session_state.local_connected else "(noch nicht gesetzt)"}</div>',
-                unsafe_allow_html=True,
-            )
-
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-
+    setup_tab.render(globals())
 # Sync Tab
 with tab_sync:
-    st.markdown('<div class="section-title">Sync Uebersicht (Lokal vs. Cloud)</div>', unsafe_allow_html=True)
-
-    can_sync_compare = bool(st.session_state.r2_connected and st.session_state.local_connected)
-    overall_progress_slot = st.empty()
-    stage_slot = st.empty()
-    table_slot = st.empty()
-    sync_refresh_clicked = False
-    sync_start_clicked = False
-    sync_stop_clicked = False
-    selected_queue_folders = list(st.session_state.sync_selected_folders or [])
-    edited = None
-
-    def _render_sync_table(df_table: pd.DataFrame):
-        table_slot.dataframe(
-            df_table[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
-            width="stretch",
-            hide_index=True,
-            height=340,
-            column_config={
-                "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
-                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
-                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
-                "status": st.column_config.TextColumn("Status", width="medium"),
-            },
-        )
-
-    if not can_sync_compare:
-        st.caption("Cloud DB und lokale DB muessen beide verbunden sein.")
-    else:
-        st.caption("Vergleich: lokale Full-FPS Videos vs. Cloud Frame-Packs (1 fps). Sync extrahiert lokal und laedt Frames hoch.")
-
-    if st.session_state.sync_running:
-        c_sync_refresh, c_sync_start, c_sync_stop = st.columns([1, 1, 1])
-        sync_refresh_clicked = c_sync_refresh.button(
-            "Sync Uebersicht aktualisieren",
-            width="stretch",
-            disabled=True,
-            key="sync_refresh_btn_running",
-        )
-        c_sync_start.button(
-            "Auswahl uebernehmen + Sync starten",
-            type="primary",
-            width="stretch",
-            disabled=True,
-            key="sync_start_btn_running",
-        )
-        sync_stop_clicked = c_sync_stop.button(
-            "Stop",
-            type="secondary",
-            width="stretch",
-            key="sync_stop_btn_running",
-        )
-
-        df_live = st.session_state.get("sync_editor_value")
-        if not isinstance(df_live, pd.DataFrame) or df_live.empty:
-            df_live = pd.DataFrame(st.session_state.sync_overview_rows or [])
-            if not df_live.empty:
-                cols = ["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
-                for c in cols:
-                    if c not in df_live.columns:
-                        df_live[c] = False if c == "auswaehlen" else ""
-                df_live = df_live[cols]
-        if isinstance(df_live, pd.DataFrame) and not df_live.empty:
-            _render_sync_table(df_live)
-        else:
-            _render_sync_table(
-                pd.DataFrame(columns=["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]),
-            )
-    else:
-        cached_editor_df = st.session_state.get("sync_single_table")
-        if not isinstance(cached_editor_df, pd.DataFrame):
-            cached_editor_df = st.session_state.get("sync_editor_value")
-        if not isinstance(cached_editor_df, pd.DataFrame) or cached_editor_df.empty:
-            if st.session_state.sync_overview_rows:
-                df_sync_editor = pd.DataFrame(st.session_state.sync_overview_rows)[
-                    ["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]
-                ].copy()
-                if "auswaehlen" not in df_sync_editor.columns:
-                    df_sync_editor["auswaehlen"] = False
-            else:
-                df_sync_editor = pd.DataFrame(columns=["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"])
-            st.session_state.sync_editor_value = df_sync_editor.copy()
-        else:
-            df_sync_editor = cached_editor_df.copy()
-
-        c_sync_refresh, c_sync_start, c_sync_stop = st.columns([1, 1, 1])
-        sync_refresh_clicked = c_sync_refresh.button(
-            "Sync Uebersicht aktualisieren",
-            width="stretch",
-            disabled=not can_sync_compare,
-            key="sync_refresh_btn",
-        )
-        sync_start_clicked = c_sync_start.button(
-            "Auswahl uebernehmen + Sync starten",
-            width="stretch",
-            type="primary",
-            disabled=not can_sync_compare,
-            key="sync_start_btn",
-        )
-        sync_stop_clicked = c_sync_stop.button(
-            "Stop",
-            width="stretch",
-            disabled=True,
-            key="sync_stop_btn",
-        )
-
-        edited = st.data_editor(
-            df_sync_editor[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
-            width="stretch",
-            hide_index=True,
-            height=340,
-            disabled=False,
-            column_config={
-                "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
-                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
-                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
-                "status": st.column_config.TextColumn("Status", width="medium"),
-            },
-            key="sync_single_table",
-        )
-        if isinstance(edited, pd.DataFrame):
-            st.session_state.sync_editor_value = edited.copy()
-
-    if sync_refresh_clicked:
-        try:
-            _refresh_sync_overview_live(table_slot=table_slot, progress_slot=overall_progress_slot)
-            st.rerun()
-        except Exception as e:
-            set_status(f"Sync-Uebersicht Fehler: {e}", "warn")
-
-    if sync_stop_clicked:
-        st.session_state.sync_stop_requested = True
-        set_status("Stop angefordert: Sync stoppt nach aktueller Datei.", "warn")
-
-    if sync_start_clicked:
-        selected_from_editor = []
-        edited_df = edited if isinstance(edited, pd.DataFrame) else st.session_state.get("sync_single_table")
-        if not isinstance(edited_df, pd.DataFrame):
-            edited_df = st.session_state.get("sync_editor_value")
-        if isinstance(edited_df, pd.DataFrame) and (not edited_df.empty):
-            selected_from_editor = [
-                str(row["capture_folder"])
-                for _, row in edited_df.iterrows()
-                if bool(row.get("auswaehlen"))
-            ]
-        st.session_state.sync_selected_folders = selected_from_editor
-
-        if (not selected_from_editor) and (not st.session_state.sync_queue_rows):
-            set_status("Sync-Queue ist leer.", "warn")
-        else:
-            target_folders = selected_from_editor if selected_from_editor else [
-                str(r.get("capture_folder", ""))
-                for r in (st.session_state.sync_queue_rows or [])
-            ]
-            for f in target_folders:
-                _set_sync_row_status(f, "Queue")
-
-            _start_sync_run(target_folders)
-            if st.session_state.sync_running:
-                set_status(f"Sync gestartet ({st.session_state.sync_run_total} Datei(en)).", "info")
-                st.rerun()
-            else:
-                set_status("Keine gueltigen Queue-Dateien fuer Sync ausgewaehlt.", "warn")
-
-    if st.session_state.sync_running:
-        idx = int(st.session_state.sync_run_idx)
-        total = int(st.session_state.sync_run_total)
-        run_queue = st.session_state.sync_run_queue or []
-        status_map = dict(st.session_state.sync_status_map or {})
-
-        completed = max(0, idx)
-        elapsed = max(0.0, time.time() - float(st.session_state.sync_run_started_ts or time.time()))
-        eta = ((elapsed / completed) * (total - completed)) if completed > 0 else 0.0
-        overall_progress_slot.progress(
-            min(1.0, completed / max(1, total)),
-            text=f"Gesamt: {completed}/{total} ({int((completed/max(1,total))*100)}%) | ETA { _format_eta_seconds(eta) }",
-        )
-
-        if st.session_state.sync_stop_requested:
-            _finish_sync_run("Sync gestoppt.", "warn")
-            st.rerun()
-
-        if idx >= total:
-            ok_count = sum(1 for v in status_map.values() if str(v).startswith("OK"))
-            err_count = sum(1 for v in status_map.values() if str(v).startswith("Fehler"))
-            st.session_state.sync_status_map = status_map
-            overview_rows, queue_rows = _build_sync_overview_rows()
-            st.session_state.sync_overview_rows = overview_rows
-            st.session_state.sync_queue_rows = queue_rows
-            st.session_state.sync_editor_value = None
-            stage_slot.success(f"Sync abgeschlossen: {ok_count} erfolgreich, {err_count} Fehler.")
-            _finish_sync_run(
-                f"Sync abgeschlossen ({ok_count} OK / {err_count} Fehler).",
-                "warn" if err_count > 0 else "ok",
-            )
-            st.rerun()
-
-        qrow = run_queue[idx]
-        folder = str(qrow.get("capture_folder", "")).strip()
-        if not folder:
-            st.session_state.sync_run_idx = idx + 1
-            st.rerun()
-
-        status_map[folder] = "Konvertierung gestartet"
-        st.session_state.sync_status_map = status_map
-        _set_sync_row_status(folder, "0%")
-        src_video = _find_local_fullfps_video(folder)
-        if src_video is None:
-            status_map[folder] = "Fehler: keine lokale Full-FPS Datei"
-            st.session_state.sync_status_map = status_map
-            _set_sync_row_status(folder, "Fehler")
-            st.session_state.sync_run_idx = idx + 1
-            st.rerun()
-
-        stage_slot.empty()
-
-        def _cb(pct: float, txt: str):
-            pct = max(0.0, min(1.0, float(pct)))
-            _set_sync_row_status(folder, f"{int(pct * 100)}%")
-            df_live_cb = st.session_state.get("sync_editor_value")
-            if isinstance(df_live_cb, pd.DataFrame) and not df_live_cb.empty:
-                _render_sync_table(df_live_cb)
-            overall_pct = (idx + (pct * 0.8)) / max(1, total)
-            done = int(overall_pct * 100)
-            elapsed_l = max(0.0, time.time() - float(st.session_state.sync_run_started_ts or time.time()))
-            completed_l = idx + max(0.01, pct)
-            eta_l = (elapsed_l / completed_l) * max(0.0, total - completed_l)
-            overall_progress_slot.progress(overall_pct, text=f"Gesamt: {idx}/{total} ({done}%) | ETA { _format_eta_seconds(eta_l) }")
-
-        ok_pack, msg_pack, n_frames, audio_note = _upload_framepack_1fps(src_video, folder, progress_cb=_cb)
-        if not ok_pack:
-            status_map[folder] = f"Fehler Frame-Pack: {msg_pack}"
-            st.session_state.sync_status_map = status_map
-            _set_sync_row_status(folder, "Fehler")
-            st.session_state.sync_run_idx = idx + 1
-            st.rerun()
-        status_map[folder] = f"OK ({n_frames} Frames{audio_note})"
-        _set_sync_row_status(folder, "OK")
-
-        st.session_state.sync_status_map = status_map
-        st.session_state.sync_run_idx = idx + 1
-        st.rerun()
-
-    st.markdown("---")
-    st.caption("Hinweis: Stop wirkt zwischen Dateien (nicht mitten in einer laufenden Konvertierung).")
-
-
+    sync_tab.render(globals())
 # ----------------------------------------
 # TAB: MAT selection
 # ----------------------------------------
 with tab_mat:
-    st.markdown('<div class="section-card mat-selection-no-scroll">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">MAT-Auswahl und Analyse</div>', unsafe_allow_html=True)
-
-    connected = st.session_state.r2_connected and st.session_state.r2_client is not None
-    if connected and st.session_state.mat_scan_prefix != st.session_state.r2_prefix:
-        _refresh_mat_files()
-        st.session_state.mat_auto_updated_prefix = None
-
-    mat_targets = st.session_state.mat_targets if connected else []
-    running = bool(st.session_state.mat_update_running)
-    load_running = bool(st.session_state.mat_load_running)
-
-    c1, c2 = st.columns(2)
-    update_clicked = c1.button(
-        "Update",
-        width="stretch",
-        key="mat_update_tab",
-        disabled=(not connected) or running or load_running,
-    )
-    # Button soll nach Update/Filter nicht durch einen veralteten Selection-State
-    # blockiert werden. Ob wirklich eine sichtbare MAT-Zeile gewaehlt ist, wird
-    # beim Klick gegen die aktuell sichtbare Tabelle validiert.
-    can_load = (
-        connected
-        and bool(st.session_state.mat_overview_rows)
-        and not running
-        and not load_running
-    )
-    load_clicked = c2.button(
-        "MAT + Video laden",
-        type="primary",
-        width="stretch",
-        key="mat_load_all_tab",
-        disabled=not can_load,
-    )
-
-    progress_slot = st.empty()
-    table_slot = st.empty()
-
-    if update_clicked:
-        if running:
-            st.session_state.mat_update_running = False
-            st.session_state.mat_run_state = "idle"
-            set_status("Analyse abgebrochen.", "warn")
-        else:
-            _refresh_mat_files()
-            mat_targets = st.session_state.mat_targets
-            st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
-            if mat_targets:
-                st.session_state.mat_update_running = True
-                st.session_state.mat_run_state = "running"
-                set_status(f"Analyse gestartet ({len(mat_targets)} Eintraege).", "info")
-                _update_all_mat_overview_rows(mat_targets, live_table=table_slot, progress_slot=progress_slot)
-                st.session_state.mat_update_running = False
-                st.session_state.mat_run_state = "idle"
-                set_status(f"Analyse fuer {len(mat_targets)} Eintraege abgeschlossen.", "ok")
-            else:
-                st.session_state.mat_run_state = "idle"
-                set_status("Keine MAT-Dateien gefunden.", "warn")
-
-    if connected and mat_targets and st.session_state.mat_auto_updated_prefix != st.session_state.r2_prefix and not running:
-        st.session_state.mat_auto_updated_prefix = st.session_state.r2_prefix
-        st.session_state.mat_update_running = True
-        st.session_state.mat_run_state = "running"
-        _update_all_mat_overview_rows(mat_targets, live_table=table_slot, progress_slot=progress_slot)
-        st.session_state.mat_update_running = False
-        st.session_state.mat_run_state = "idle"
-        set_status(f"Analyse fuer {len(mat_targets)} Eintraege abgeschlossen.", "ok")
-
-    if not connected:
-        st.caption("Erst in Tab 'Verbindung & Root' verbinden und Projektroot waehlen.")
-
-    current_selected_key = str(st.session_state.get("mat_pending_selected_key", "") or "")
-
-    if st.session_state.mat_overview_rows:
-        df_overview = pd.DataFrame(st.session_state.mat_overview_rows)
-        df_overview = _normalize_overview_lamps(df_overview)
-        filter_missing_roi = st.checkbox(
-            "Nur Fälle anzeigen: ROI fehlt und Audio+Video vorhanden",
-            value=False,
-            key="mat_filter_missing_roi_with_media",
-        )
-        display_df = df_overview
-        if filter_missing_roi:
-            display_df = df_overview[
-                (~df_overview["roi_ausgewaehlt"].map(_overview_status_true))
-                & (df_overview["audio_video_vorhanden"].map(_overview_status_true))
-            ].copy()
-            st.caption(f"Filter aktiv: {len(display_df)} von {len(df_overview)} Fällen angezeigt.")
-        is_running_now = bool(st.session_state.mat_update_running)
-        styled_df = display_df
-        allow_select = not is_running_now and not load_running
-        if display_df.empty:
-            table_slot.empty()
-            st.info("Keine Fälle passend zum aktuellen Filter.")
-        elif allow_select:
-            sel_event = table_slot.dataframe(
-                styled_df,
-                width="stretch",
-                hide_index=True,
-                height=MAT_TABLE_HEIGHT,
-                column_config=MAT_OVERVIEW_COLCFG,
-                key="mat_single_table",
-                on_select="rerun",
-                selection_mode="single-row",
-            )
-            selected_rows = []
-            if hasattr(sel_event, "selection"):
-                selected_rows = list(getattr(sel_event.selection, "rows", []) or [])
-            elif isinstance(sel_event, dict):
-                selected_rows = list((((sel_event.get("selection") or {}).get("rows")) or []))
-            if selected_rows:
-                idx0 = int(selected_rows[0])
-                if 0 <= idx0 < len(styled_df):
-                    current_selected_key = str(styled_df.iloc[idx0].get("remote_key", "") or "")
-                    st.session_state.mat_pending_selected_key = current_selected_key
-                    st.session_state.mat_user_selected_key = current_selected_key
-        else:
-            with table_slot.container():
-                st.markdown('<div class="mat-selection-disabled">MAT-Auswahl wird aktualisiert ...</div>', unsafe_allow_html=True)
-                try:
-                    disabled_view = styled_df.style.set_properties(**{
-                        "background-color": "#20232b",
-                        "color": "#7d8491",
-                    })
-                except Exception:
-                    disabled_view = styled_df
-                st.dataframe(
-                    disabled_view,
-                    width="stretch",
-                    hide_index=True,
-                    height=MAT_TABLE_HEIGHT,
-                    column_config=MAT_OVERVIEW_COLCFG,
-                )
-        _render_mat_selection_analysis(
-            display_df,
-            title_suffix=" (gefilterte Ansicht)" if filter_missing_roi else "",
-        )
-    else:
-        table_slot.empty()
-        st.caption("Noch keine MAT analysiert.")
-
-    if load_clicked and can_load:
-        selected_key = str(st.session_state.get("mat_user_selected_key", "") or "")
-        visible_keys = set()
-        try:
-            visible_keys = {str(v or "") for v in display_df.get("remote_key", pd.Series(dtype=str)).tolist()}
-        except Exception:
-            visible_keys = set()
-        if selected_key and selected_key in visible_keys:
-            st.session_state.mat_selected_key = selected_key
-            st.session_state.mat_pending_selected_key = selected_key
-            st.session_state.mat_selected_summary = None
-            st.session_state.mat_load_requested = True
-        else:
-            st.session_state.mat_selected_key = ""
-            st.session_state.mat_selected_summary = None
-            st.session_state.mat_user_selected_key = ""
-            set_status("Bitte zuerst genau eine MAT-Zeile in der aktuell sichtbaren Tabelle anwaehlen.", "warn")
-
-    if st.session_state.mat_load_requested and (not running) and connected:
-        selected = st.session_state.mat_selected_key
-        st.session_state.mat_load_requested = False
-        if not selected:
-            set_status("Bitte zuerst eine Zeile mit MAT-Datei waehlen.", "warn")
-            st.rerun()
-        st.session_state.mat_load_running = True
-        st.rerun()
-
-    if st.session_state.mat_load_running and (not running) and connected:
-        selected = st.session_state.mat_selected_key
-        st.markdown(
-            """
-            <style>
-            .mat-load-overlay {
-              position: fixed;
-              inset: 0;
-              background: rgba(15, 22, 36, 0.42);
-              z-index: 9998;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-            }
-            .mat-load-overlay-box {
-              background: rgba(7, 14, 26, 0.90);
-              color: #d7e8ff;
-              border: 1px solid rgba(74, 144, 164, 0.45);
-              border-radius: 12px;
-              padding: 14px 18px;
-              font-weight: 700;
-            }
-            </style>
-            <div class="mat-load-overlay"><div class="mat-load-overlay-box">MAT + Video wird geladen ...</div></div>
-            """,
-            unsafe_allow_html=True,
-        )
-        with st.spinner("Lade MAT + Video ..."):
-            _analyze_mat_from_r2(selected)
-            summary = st.session_state.mat_selected_summary or {}
-            capture_folder = summary.get("capture_folder") or _mat_capture_guess_from_key(selected)
-            video_ok = _try_load_video_for_capture_folder(capture_folder)
-            if video_ok:
-                st.session_state.capture_folder = capture_folder
-            mat_loaded = _load_mat_from_r2(selected)
-            if mat_loaded is None:
-                set_status("MAT konnte nicht geladen werden.", "warn")
-            elif not video_ok:
-                set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
-            if mat_loaded:
-                st.session_state.audio_last_mat_path = mat_loaded
-        st.session_state.tab_default = "ROI Setup"
-        st.session_state.mat_load_running = False
-        st.rerun()
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-
-
+    mat_selection_tab.render(globals())
 # ==============================
 # TAB AUDIO AUSWERTUNG
 # ==============================
 with tab_audio:
-    st.divider()
-    st.subheader("Audio Auswertung · robuste RPM-Extraktion")
-    title_txt = _audio_get_vehicle_title()
-    if title_txt:
-        st.info(f"Datensatz / Fahrzeug aus Metadata: {title_txt}")
-    st.caption("Mehrere echte RPM-Methoden direkt aus der Video-/Audiospur: STFT/Ridge, Viterbi, Peak, Autokorrelation/YIN, Cepstrum, Harmonic Comb/HPS, CWT/Wavelet und Hybrid. Cloud audio_proxy_1k.wav wird bevorzugt; lokale Videos werden bei Bedarf per ffmpeg gelesen.")
-
-    with st.expander("Signal / STFT", expanded=True):
-        c0 = st.columns(4)
-        aud_stft_mode = c0[0].selectbox("NFFT/Overlap", ["Fest auswählen", "Auto Schnell", "Auto Breit"], key="aud_stft_mode_new")
-        stft_auto = str(aud_stft_mode).startswith("Auto")
-        aud_nfft = int(c0[1].number_input("NFFT", 64, 65536, 4096, step=64, key="aud_nfft_new", disabled=stft_auto))
-        aud_ov = float(c0[2].number_input("Overlap [%]", 0.0, 98.0, 75.0, step=1.0, key="aud_ov_new", disabled=stft_auto))
-        aud_fmax = float(c0[3].number_input("f max [Hz]", 20.0, 5000.0, 1000.0, step=25.0, key="aud_fmax_new"))
-        aud_method = st.selectbox("Drehzahl Methode", ["Hybrid", "STFT Ridge", "STFT Viterbi", "Original Peak", "Autokorrelation/YIN", "Cepstrum", "Harmonic Comb/HPS", "CWT/Wavelet"], key="aud_method_new")
-        if stft_auto:
-            st.caption("Auto Schnell testet eine reduzierte, sinnvolle STFT-Auswahl. Auto Breit testet den grossen Suchraum 64..16384 und viele Overlaps, ist aber deutlich langsamer.")
-
-    with st.expander("Methoden-Parameter", expanded=False):
-        st.caption("Diese Parameter wirken nur auf die passenden Methoden; Hybrid nutzt sie beim Fusionieren der Teilmethoden.")
-        m0 = st.columns(4)
-        ridge_smooth = int(m0[0].number_input("Ridge Glättung", 3, 51, 7, step=2, key="aud_ridge_smooth"))
-        ridge_jump_frac = float(m0[1].number_input("Ridge max Sprung [% Band]", 1.0, 50.0, 8.0, step=1.0, key="aud_ridge_jump_pct")) / 100.0
-        viterbi_jump_hz = float(m0[2].number_input("Viterbi max Sprung [Hz/Frame]", 1.0, 300.0, 25.0, step=1.0, key="aud_viterbi_jump_hz"))
-        viterbi_penalty = float(m0[3].number_input("Viterbi Sprung-Strafe", 0.0, 10.0, 1.2, step=0.1, key="aud_viterbi_penalty"))
-        m1 = st.columns(4)
-        viterbi_smooth = int(m1[0].number_input("Viterbi Glättung", 3, 51, 5, step=2, key="aud_viterbi_smooth"))
-        comb_harmonics = int(m1[1].number_input("Comb/HPS Anzahl Harmonische", 1, 10, 4, step=1, key="aud_comb_harmonics"))
-        hybrid_smooth = int(m1[2].number_input("Hybrid Glättung", 3, 51, 9, step=2, key="aud_hybrid_smooth"))
-        always_run_cwt = bool(m1[3].checkbox("CWT auch in Kandidatenliste berechnen", value=False, key="aud_run_cwt_all"))
-        fast_mode = bool(st.checkbox("Schnellmodus: teure Methoden nur bei expliziter Auswahl berechnen", value=True, key="aud_fast_mode"))
-        method_params = dict(ridge_smooth=ridge_smooth, ridge_jump_frac=ridge_jump_frac, viterbi_jump_hz=viterbi_jump_hz, viterbi_penalty=viterbi_penalty, viterbi_smooth=viterbi_smooth, comb_harmonics=comb_harmonics, hybrid_smooth=hybrid_smooth, always_run_cwt=always_run_cwt, fast_mode=fast_mode)
-
-    with st.expander("Motor / Kandidaten", expanded=True):
-        c0 = st.columns(3)
-        drive_type = c0[0].selectbox("Antrieb", ["Verbrenner/Hybrid", "Hybrid elektrisch dominant", "Elektro"], key="aud_drive_type")
-        cyl_mode = c0[1].selectbox("Zylinder", ["Auto variieren", "Fest auswählen"], key="aud_cyl_mode")
-        harm_mode = c0[2].selectbox("Harmonische/Ordnung", ["Auto variieren", "Fest auswählen"], key="aud_harm_mode")
-        cyl_disabled = str(cyl_mode).startswith("Auto") or ("elekt" in str(drive_type).lower())
-        harm_disabled = str(harm_mode).startswith("Auto")
-        c1 = st.columns(5)
-        aud_cyl = int(c1[0].number_input("Zyl fest", 1, 16, 4, step=1, key="aud_cyl_new", disabled=cyl_disabled))
-        aud_order = int(c1[1].number_input("Ordnung fest", 1, 12, 1, step=1, key="aud_order_new", disabled=harm_disabled))
-        aud_takt = int(c1[2].number_input("Takt", 2, 4, 4, step=2, key="aud_takt_new", disabled=("elekt" in str(drive_type).lower())))
-        aud_rpm_min = float(c1[3].number_input("RPM min", 100.0, 30000.0, 800.0, step=100.0, key="aud_rpm_min_new"))
-        aud_rpm_max = float(c1[4].number_input("RPM max", 500.0, 30000.0, 7500.0, step=100.0, key="aud_rpm_max_new"))
-        st.caption("Auto Zylinder testet 3/4/5/6/8/10/12. Auto Harmonische testet 1x/2x/3x. Bei Elektro wird die Frequenz direkt als Motor-/Order-Frequenz behandelt.")
-
-    with st.expander("Getriebe / Geschwindigkeit / Fahrzeug", expanded=False):
-        c = st.columns(4)
-        aud_offset = float(c[0].slider("Audio Offset [s]", -5.0, 5.0, 0.0, step=0.01, key="aud_offset_new"))
-        use_ocr_v = bool(c[1].checkbox("OCR v verwenden", value=True, key="aud_use_v_new"))
-        r_dyn = float(c[2].number_input("r dyn [m]", 0.05, 2.0, 0.35, step=0.01, key="aud_rdyn_new"))
-        tol_pct = float(c[3].number_input("Toleranz [%]", 0.0, 100.0, 6.0, step=0.5, key="aud_tol_new"))
-        c2 = st.columns(3)
-        axle_ratio = float(c2[0].number_input("Achsübersetzung i", 0.1, 20.0, 3.15, step=0.01, key="aud_axle_ratio"))
-        gear_text = c2[1].text_input("Gänge i (Komma-getrennt)", value="5.25, 3.36, 2.17, 1.72, 1.32, 1.00, 0.82, 0.64", key="aud_gears_text")
-        prefer_low = bool(c2[2].checkbox("niedrigster Gang bevorzugt", value=False, key="aud_prefer_low"))
-        try:
-            gear_ratios = [float(x.strip()) for x in str(gear_text).replace(";", ",").split(",") if x.strip()]
-        except Exception:
-            gear_ratios = []
-        st.caption("Getriebe wird nur genutzt, wenn nutzbare Geschwindigkeit/OCR-v vorhanden ist. Ohne v bleibt die RPM-Erkennung rein audio-basiert.")
-
-    _live_log_ref = st.session_state.get("audio_bg_log_ref")
-    if isinstance(_live_log_ref, list) and _live_log_ref:
-        st.session_state.audio_debug_lines = list(_live_log_ref[-200:])
-    _live_progress_ref = st.session_state.get("audio_bg_progress_ref")
-    if isinstance(_live_progress_ref, dict) and _live_progress_ref:
-        st.session_state.audio_bg_progress = dict(_live_progress_ref)
-
-    show_live_debug = st.checkbox("Live-Debug während Audioanalyse anzeigen", value=True, key="aud_show_live_debug")
-
-    with st.expander("Live-Debug Audioanalyse", expanded=show_live_debug):
-        st.caption("Zeigt Quelle, Segment, STFT-Größe, Kandidatenfortschritt, Laufzeit pro Job und finale Auswahl. Dieser Bereich aktualisiert sich live ohne kompletten App-Rerun.")
-
-        def _audio_live_and_result_panel():
-            _audio_collect_finished_future(show_messages=False)
-            _render_audio_live_native(str(st.session_state.get("audio_bg_live_id", "") or ""))
-            res_live = st.session_state.get("audio_analysis_result")
-            if isinstance(res_live, dict) and res_live.get("t") is not None and st.session_state.get("audio_bg_future") is None:
-                st.markdown("---")
-                st.subheader("Audioanalyse Ergebnis")
-                _render_audio_result_plots(res_live, key_suffix="_live")
-
-        if hasattr(st, "fragment"):
-            @st.fragment(run_every=1.0)
-            def _audio_live_fragment():
-                _audio_live_and_result_panel()
-            _audio_live_fragment()
-        else:
-            _audio_collect_finished_future(show_messages=True)
-            _render_audio_live_native(str(st.session_state.get("audio_bg_live_id", "") or ""))
-
-    # Auch ausserhalb des Fragments pruefen, falls durch eine Nutzerinteraktion
-    # bereits ein abgeschlossener Future vorliegt. Kein st.rerun(): Ergebnis wird
-    # direkt in session_state uebernommen.
-    _audio_collect_finished_future(show_messages=True)
-
-    running_bg = st.session_state.get("audio_bg_future") is not None
-    start_feedback_slot = st.empty()
-    if running_bg:
-        start_feedback_slot.info("Audioanalyse läuft bereits. Live-Debug steht oben im Expander.")
-    if st.button("Audioanalyse starten", type="primary", width="stretch", key="aud_run_new", disabled=running_bg):
-        start_feedback_slot.info("Audioanalyse wird gestartet ... Audioquelle wird geladen.")
-        _render_audio_start_feedback("Audioanalyse wird gestartet ...")
-        try:
-            st.toast("Audioanalyse wird gestartet ...", icon="⏳")
-        except Exception:
-            pass
-        with st.spinner("Audioquelle laden und Hintergrundjob starten ..."):
-            ok,msg,fs,y,source=_audio_load_current_capture()
-        if not ok:
-            start_feedback_slot.error(msg)
-            st.error(msg); set_status(msg,"warn")
-        else:
-            params_bg = dict(
-                start_s=float(st.session_state.get('t_start',0.0)),
-                end_s=float(st.session_state.get('t_end',len(y)/max(fs,1))),
-                offset_s=aud_offset,
-                nfft=aud_nfft,
-                overlap_pct=aud_ov,
-                fmax=aud_fmax,
-                cyl=aud_cyl,
-                takt=aud_takt,
-                order=aud_order,
-                rpm_min=aud_rpm_min,
-                rpm_max=aud_rpm_max,
-                method=aud_method,
-                cyl_mode=cyl_mode,
-                harmonic_mode=harm_mode,
-                drive_type=drive_type,
-                stft_mode=aud_stft_mode,
-                method_params=method_params,
-            )
-            ui_bg = dict(use_ocr_v=use_ocr_v,r_dyn=r_dyn,tol_pct=tol_pct,axle_ratio=axle_ratio,gears=gear_ratios,prefer_low=prefer_low,vehicle_title=title_txt)
-            live_job_id = f"audio-{int(time.time()*1000)}"
-            st.session_state.audio_bg_live_id = live_job_id
-            live_log = [f"[   0.00s] Quelle={source}, fs={fs}, Samples={len(y):,}", "[   0.00s] Hintergrundanalyse gestartet."]
-            live_progress = {"done": 0, "total": 1, "fraction": 0.0, "text": "Hintergrundanalyse gestartet."}
-            _audio_live_update(live_job_id, log_line=live_log[0], progress=live_progress, status="running")
-            _audio_live_update(live_job_id, log_line=live_log[1], progress=live_progress, status="running")
-            st.session_state.audio_bg_log_ref = live_log
-            st.session_state.audio_bg_progress_ref = live_progress
-            st.session_state.audio_debug_lines = live_log
-            st.session_state.audio_bg_progress = dict(live_progress)
-            st.session_state.audio_bg_params = params_bg
-            st.session_state.audio_bg_source = source
-            st.session_state.audio_bg_started = time.perf_counter()
-            st.session_state.audio_analysis_result = None
-            # Wichtig: keinen gecachten Single-Worker-Executor wiederverwenden.
-            # Wenn ein alter Audio-Job im ThreadPool haengt, wuerde ein neuer Job nur
-            # in der Queue stehen und nie starten -> Live-Log bleibt bei 0/1 Jobs.
-            try:
-                old_ex = st.session_state.get("audio_bg_executor")
-                old_fut = st.session_state.get("audio_bg_future")
-                if old_ex is not None and (old_fut is None or old_fut.done()):
-                    old_ex.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-            ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"audio_rpm_{int(time.time())}")
-            st.session_state.audio_bg_executor = ex
-            live_log.append(f"[   0.00s] Parameter: Methode={aud_method}, STFT={aud_stft_mode}, Zyl={cyl_mode}/{aud_cyl}, Harm={harm_mode}/{aud_order}, NFFT={aud_nfft}, OV={aud_ov:g}%, fmax={aud_fmax:g} Hz")
-            live_progress.update({"text": "Worker wird gestartet ...", "updated": time.time()})
-            _audio_live_update(live_job_id, log_line=live_log[-1], progress=live_progress, status="running")
-            st.session_state.audio_bg_future = ex.submit(_audio_background_worker, y, fs, source, params_bg, ui_bg, live_log, live_progress, live_job_id)
-            set_status("Audioanalyse im Hintergrund gestartet.", "info")
-            start_feedback_slot.success("Audioanalyse gestartet. Live-Debug läuft oben im Expander weiter.")
-            _render_audio_start_feedback("Audioanalyse gestartet - Live-Debug oben aktiv")
-            st.info("Audioanalyse wurde im Hintergrund gestartet. Live-Status und Ergebnis erscheinen oben im Expander ohne kompletten App-Rerun.")
-
-    # Fallback/Normalanzeige nach manueller Interaktion oder auf Streamlit-Versionen
-    # ohne Fragment. Wenn das Ergebnis bereits im Live-Fragment angezeigt wird, bleibt
-    # diese Stelle leer, solange kein neuer kompletter Run passiert.
-    res=st.session_state.get("audio_analysis_result")
-    if isinstance(res,dict) and res.get("t") is not None and not hasattr(st, "fragment"):
-        _render_audio_result_plots(res, key_suffix="")
-
+    audio_tab.render(globals())
 # ==============================
 # TAB ROI SETUP
 # ==============================
 with tab_roi:
-    _scroll_to_top_once()
-    if not _has_media_source():
-        st.markdown("""
-        <div style="text-align:center;padding:3rem 2rem;color:#4a5060;">
-          <div style="font-size:2.5rem;margin-bottom:.8rem">VIDEO</div>
-          <div style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:600">
-            Kein Video geladen</div>
-          <div style="font-family:'JetBrains Mono',monospace;font-size:.72rem;
-               margin-top:.4rem;color:#2e3545">
-            -> Tab CLOUD oeffnen -> Video laden oder von R2 laden</div>
-        </div>""", unsafe_allow_html=True)
-    else:
-        st.markdown(
-            """
-            <style>
-            .roi-compact .section-card { margin-bottom: .4rem !important; padding: .5rem .7rem !important; }
-            [data-testid="stTabContent"] { overflow: visible !important; }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown('<div class="roi-compact">', unsafe_allow_html=True)
-        st.subheader("1 · ROI Setup")
-
-        dur = st.session_state.vid_duration
-        fps = st.session_state.vid_fps
-        fw = st.session_state.vid_width
-        fh = st.session_state.vid_height
-        step_s = round(1 / max(fps, 1.0), 4)
-
-        prev_start = float(st.session_state.get("_roi_prev_start", st.session_state.t_start))
-        prev_end = float(st.session_state.get("_roi_prev_end", st.session_state.t_end))
-        prev_tcur = float(st.session_state.get("_roi_prev_tcur", st.session_state.t_current))
-
-        col_v, col_r = st.columns([1, 1], gap="medium")
-        with col_v:
-            st.markdown('<div class="section-card">', unsafe_allow_html=True)
-            st.markdown('<div id="roi-left-width-probe"></div>', unsafe_allow_html=True)
-            _sc1, _sc2 = st.columns(2)
-            _min_gap = 1.0 / max(fps, 1.0)
-            _start_max = max(0.0, float(st.session_state.t_end) - _min_gap)
-            t_start = _sc1.slider(
-                "Start [s]",
-                0.0,
-                float(_start_max),
-                float(min(max(st.session_state.t_start, 0.0), _start_max)),
-                step=step_s,
-                format="%d s",
-                key="sl_start",
-            )
-            _end_min = min(float(dur), float(t_start) + _min_gap)
-            t_end_raw = _sc2.slider(
-                "Ende [s]",
-                float(_end_min),
-                float(dur),
-                float(min(max(st.session_state.t_end, _end_min), float(dur))),
-                step=step_s,
-                format="%d s",
-                key="sl_end",
-            )
-            t_start, t_end = normalize_time_range(
-                start_s=float(t_start),
-                end_s=float(t_end_raw),
-                duration_s=float(dur),
-                fps=float(fps),
-            )
-            st.session_state.t_start = float(t_start)
-            st.session_state.t_end = float(min(t_end, dur))
-
-            start_changed = abs(t_start - prev_start) > 1e-9
-            end_changed = abs(st.session_state.t_end - prev_end) > 1e-9
-            if start_changed and not end_changed:
-                st.session_state.t_current = float(st.session_state.t_start)
-            elif end_changed and not start_changed:
-                st.session_state.t_current = float(st.session_state.t_end)
-            elif start_changed and end_changed:
-                st.session_state.t_current = float(st.session_state.t_start)
-            st.session_state._roi_prev_start = float(st.session_state.t_start)
-            st.session_state._roi_prev_end = float(st.session_state.t_end)
-
-            t_cur = st.slider(
-                "Position [s]",
-                float(st.session_state.t_start),
-                float(st.session_state.t_end),
-                float(min(max(st.session_state.t_current, st.session_state.t_start), st.session_state.t_end)),
-                step=step_s,
-                format="%d s",
-                key="sl_cur",
-            )
-            st.session_state.t_current = float(t_cur)
-            frame_idx = int(round(float(t_cur) * max(float(fps), 1.0)))
-            prev_frame_idx = st.session_state.get("roi_prev_frame_idx")
-            t_changed = (prev_frame_idx is None) or (int(prev_frame_idx) != frame_idx)
-            st.session_state._roi_prev_tcur = float(t_cur)
-            st.session_state.roi_prev_frame_idx = frame_idx
-            if t_changed and isinstance(st.session_state.selected_roi, int) and 0 <= st.session_state.selected_roi < len(st.session_state.rois):
-                _ar = st.session_state.rois[st.session_state.selected_roi]
-                st.session_state.roi_anchor_box = {
-                    "x": int(round(float(_ar.get("x", 0)))),
-                    "y": int(round(float(_ar.get("y", 0)))),
-                    "w": int(round(float(_ar.get("w", 0)))),
-                    "h": int(round(float(_ar.get("h", 0)))),
-                }
-                st.session_state.roi_wait_user_move = True
-                st.session_state.roi_reject_anchor_events = 0
-
-            frame = _get_media_frame(t_cur)
-            drag_roi = None
-            _editing_idx = st.session_state.selected_roi
-            show_draw_box = bool(st.session_state.get("roi_draw_armed", False))
-            # Keep all existing ROIs visible; active ROI is still shown by cropper box.
-            _skip_bg = None
-            if frame is not None:
-                vis_rgb = draw_rois(frame, st.session_state.rois, _editing_idx, fw, fh, skip_idx=_skip_bg)
-            if frame is not None:
-                st.caption(f"t={t_cur:.3f}s  |  {fw}x{fh}  |  {fps:.1f}fps")
-                # Hard no-clipping mode: full frame is resized to a fixed fit size (constant per video).
-                src_w = int(fw) if int(fw) > 0 else int(vis_rgb.shape[1])
-                src_h = int(fh) if int(fh) > 0 else int(vis_rgb.shape[0])
-                disp_meta = st.session_state.get("roi_display_meta", {})
-                dims_key = (int(src_w), int(src_h))
-                if not isinstance(disp_meta, dict) or tuple(disp_meta.get("dims", ())) != dims_key:
-                    # Stable width in ROI column, height follows source aspect ratio.
-                    target_w = _get_dynamic_roi_target_width(620, "roi-left-width-probe")
-                    target_w = min(target_w, max(1, src_w))
-                    fit_w = int(target_w)
-                    fit_h = max(1, int(round(fit_w * (src_h / float(max(1, src_w))))))
-                    disp_meta = {"dims": dims_key, "w": int(fit_w), "h": int(fit_h)}
-                    st.session_state.roi_display_meta = disp_meta
-                else:
-                    target_w_now = _get_dynamic_roi_target_width(int(disp_meta.get("w", 620)), "roi-left-width-probe")
-                    target_w_now = min(target_w_now, max(1, src_w))
-                    fit_w = int(target_w_now)
-                    fit_h = max(1, int(round(fit_w * (src_h / float(max(1, src_w))))))
-                    disp_meta = {"dims": dims_key, "w": int(fit_w), "h": int(fit_h)}
-                    st.session_state.roi_display_meta = disp_meta
-                off_x = 0
-                off_y = 0
-                if fit_w != src_w or fit_h != src_h:
-                    disp_rgb = cv2.resize(vis_rgb, (fit_w, fit_h), interpolation=cv2.INTER_AREA)
-                else:
-                    disp_rgb = vis_rgb
-                scale_x = src_w / float(max(1, fit_w))
-                scale_y = src_h / float(max(1, fit_h))
-
-                sel_idx_now = st.session_state.selected_roi
-                has_active_roi = (
-                    isinstance(sel_idx_now, int)
-                    and 0 <= sel_idx_now < len(st.session_state.rois)
-                )
-                if st_cropper is not None and has_active_roi:
-                    src = st.session_state.rois[sel_idx_now]
-                    sx = int(round(float(src.get("x", 0))))
-                    sy = int(round(float(src.get("y", 0))))
-                    sw = int(round(float(src.get("w", 0))))
-                    sh = int(round(float(src.get("h", 0))))
-                    sx, sy, sw, sh = _clamp_roi_to_video(sx, sy, sw, sh, fw, fh)
-                    sx_d = int(round(float(sx) / max(scale_x, 1e-9))) + off_x
-                    sy_d = int(round(float(sy) / max(scale_y, 1e-9))) + off_y
-                    sw_d = int(round(float(sw) / max(scale_x, 1e-9)))
-                    sh_d = int(round(float(sh) / max(scale_y, 1e-9)))
-                    sx_d = max(off_x, min(off_x + fit_w - 1, sx_d))
-                    sy_d = max(off_y, min(off_y + fit_h - 1, sy_d))
-                    sw_d = max(1, min(off_x + fit_w - sx_d, sw_d))
-                    sh_d = max(1, min(off_y + fit_h - sy_d, sh_d))
-
-                    crop_box = None
-                    pil_vis = Image.fromarray(disp_rgb)
-                    cropper_key = (
-                        f"roi_cropper_main_{frame_idx}_"
-                        f"{int(sel_idx_now) if isinstance(sel_idx_now, int) else -1}_"
-                        f"{int(fit_w)}x{int(fit_h)}"
-                    )
-                    try:
-                        crop_box = st_cropper(
-                            pil_vis,
-                            realtime_update=True,
-                            box_color="#4a90a4",
-                            aspect_ratio=None,
-                            return_type="box",
-                            should_resize_image=False,
-                            default_coords=(int(sx_d), int(sx_d + sw_d), int(sy_d), int(sy_d + sh_d)),
-                            key=cropper_key,
-                        )
-                    except TypeError:
-                        crop_box = st_cropper(
-                            pil_vis,
-                            realtime_update=True,
-                            box_color="#4a90a4",
-                            aspect_ratio=None,
-                            return_type="box",
-                            key=cropper_key,
-                        )
-
-                    if isinstance(crop_box, dict):
-                        dx_d = int(round(float(crop_box.get("left", sx_d))))
-                        dy_d = int(round(float(crop_box.get("top", sy_d))))
-                        dw_d = int(round(float(crop_box.get("width", sw_d))))
-                        dh_d = int(round(float(crop_box.get("height", sh_d))))
-                        x1_d = dx_d
-                        y1_d = dy_d
-                        x2_d = dx_d + dw_d
-                        y2_d = dy_d + dh_d
-                        # Intersect with actual image area (exclude black letterbox bars).
-                        x1_fit = max(0, min(fit_w, x1_d - off_x))
-                        y1_fit = max(0, min(fit_h, y1_d - off_y))
-                        x2_fit = max(0, min(fit_w, x2_d - off_x))
-                        y2_fit = max(0, min(fit_h, y2_d - off_y))
-                        if x2_fit < x1_fit:
-                            x1_fit, x2_fit = x2_fit, x1_fit
-                        if y2_fit < y1_fit:
-                            y1_fit, y2_fit = y2_fit, y1_fit
-                        dx = int(round(x1_fit * scale_x))
-                        dy = int(round(y1_fit * scale_y))
-                        dw = int(round((x2_fit - x1_fit) * scale_x))
-                        dh = int(round((y2_fit - y1_fit) * scale_y))
-                        if dw > 0 and dh > 0:
-                            cx, cy, cw_roi, ch_roi = _clamp_roi_to_video(dx, dy, dw, dh, fw, fh)
-                            drag_roi = {"x": int(cx), "y": int(cy), "w": int(cw_roi), "h": int(ch_roi)}
-                            st.session_state.drag_roi = drag_roi
-                    st.caption("ROI direkt mit der Maus ziehen/skalieren.")
-                elif st_cropper is not None:
-                    # No active ROI selected: show frame only (no default blue box).
-                    st.image(disp_rgb, width="stretch")
-                elif streamlit_image_coordinates is not None:
-                    st.warning("Drag fehlt: installiere 'streamlit-cropper-fix' fuer Ziehen mit der Maus.")
-                    click = streamlit_image_coordinates(disp_rgb, key=f"roi_img_click_{frame_idx}")
-                    if click and isinstance(click, dict):
-                        cx_d = int(round(float(click.get("x", 0))))
-                        cy_d = int(round(float(click.get("y", 0))))
-                        cx = int(round(max(0, min(fit_w - 1, cx_d - off_x)) * scale_x))
-                        cy = int(round(max(0, min(fit_h - 1, cy_d - off_y)) * scale_y))
-                        st.session_state.drag_roi = {"x": cx, "y": cy, "w": 4, "h": 4}
-                else:
-                    st.image(disp_rgb, width="stretch")
-                    st.warning(
-                        "Fuer ROI-Drag bitte installieren: pip install streamlit-cropper-fix"
-                    )
-            else:
-                st.warning("Frame nicht verfuegbar.")
-
-            drag_state = st.session_state.get("drag_roi", {})
-            if not isinstance(drag_state, dict):
-                drag_state = {}
-            sel_idx = st.session_state.selected_roi
-            _is_active = isinstance(sel_idx, int) and 0 <= sel_idx < len(st.session_state.rois)
-            if _is_active:
-                cur_sel = st.session_state.rois[sel_idx]
-                # Prefer live cropper data; fall back to stored ROI position
-                if drag_roi is not None:
-                    dx = int(drag_state.get("x", 0))
-                    dy = int(drag_state.get("y", 0))
-                    dw = int(drag_state.get("w", 0))
-                    dh = int(drag_state.get("h", 0))
-                else:
-                    dx = int(round(float(cur_sel.get("x", 0))))
-                    dy = int(round(float(cur_sel.get("y", 0))))
-                    dw = int(round(float(cur_sel.get("w", 0))))
-                    dh = int(round(float(cur_sel.get("h", 0))))
-            else:
-                dx = int(drag_state.get("x", 0))
-                dy = int(drag_state.get("y", 0))
-                dw = int(drag_state.get("w", 0))
-                dh = int(drag_state.get("h", 0))
-
-            # Live-sync position: cropper drag updates active ROI x/y/w/h.
-            sel_idx = st.session_state.selected_roi
-            if (
-                drag_roi is not None
-                and isinstance(sel_idx, int)
-                and 0 <= sel_idx < len(st.session_state.rois)
-            ):
-                ok_drag, _ = can_add_roi_from_drag({"x": dx, "y": dy, "w": dw, "h": dh})
-                if ok_drag:
-                    cx, cy, cw_roi, ch_roi = _clamp_roi_to_video(dx, dy, dw, dh, fw, fh)
-                    cur = st.session_state.rois[sel_idx]
-                    if (
-                        int(round(float(cur.get("x", 0)))) != int(cx)
-                        or int(round(float(cur.get("y", 0)))) != int(cy)
-                        or int(round(float(cur.get("w", 0)))) != int(cw_roi)
-                        or int(round(float(cur.get("h", 0)))) != int(ch_roi)
-                    ):
-                        st.session_state.rois[sel_idx] = {
-                            **st.session_state.rois[sel_idx],
-                            "x": float(cx), "y": float(cy), "w": float(cw_roi), "h": float(ch_roi),
-                        }
-
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with col_r:
-            st.markdown('<div class="section-card">', unsafe_allow_html=True)
-            st.markdown('<div class="section-title">ROI-Liste</div>', unsafe_allow_html=True)
-
-            if st.button("ROI hinzuf\u00fcgen", type="primary", width="stretch", key="roi_add_btn"):
-                # New ROI starts from a fresh default rectangle (independent from existing ROI).
-                _d = seed_drag_roi(fw, fh)
-                _cx, _cy, _cw, _ch = _clamp_roi_to_video(
-                    int(_d["x"]), int(_d["y"]), int(_d["w"]), int(_d["h"]), fw, fh
-                )
-                st.session_state.rois.append(dict(
-                    name="_", x=float(_cx), y=float(_cy),
-                    w=float(_cw), h=float(_ch), fmt="any", max_scale=float(st.session_state.get("roi_global_scale", 1.2)),
-                ))
-                _ni = len(st.session_state.rois) - 1
-                st.session_state.selected_roi = _ni
-                st.session_state.roi_draw_armed = True
-                st.session_state.drag_roi = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
-                st.session_state.roi_anchor_box = {"x": int(_cx), "y": int(_cy), "w": int(_cw), "h": int(_ch)}
-                st.session_state.roi_wait_user_move = True
-                st.session_state.roi_reject_anchor_events = 0
-                st.session_state.roi_editor_df = None
-                set_status("ROI hinzugef\u00fcgt. Name in Tabelle setzen und Position mit K\u00e4stchen anpassen.", "ok")
-                st.rerun()
-
-            _rois = st.session_state.rois
-            _sel = st.session_state.selected_roi
-            _tbl_h = min(220, 38 * (len(_rois) + 1) + 4) if _rois else 80
-            _sel_col = "__sel__"
-            _base_rows = [
-                {
-                    _sel_col: bool(i == _sel),
-                    "Name": str(r.get("name", "_")),
-                    "Format": str(r.get("fmt", "any")) if str(r.get("fmt", "any")) != "custom" else "any",
-                    "Pattern": str(r.get("pattern", "")),
-                    "Scale": float(r.get("max_scale", st.session_state.get("roi_global_scale", 1.2)) or 1.2),
-                    "OCR OK": bool(r.get("ocr_test_ok", False)),
-                    "OCR Wert": str(r.get("ocr_test_value", "")),
-                    "OCR Details": str(r.get("ocr_test_details", "")),
-                }
-                for i, r in enumerate(_rois)
-            ]
-            _roi_cols = [_sel_col, "Name", "Format", "Pattern", "Scale", "OCR OK", "OCR Wert", "OCR Details"]
-            _base_df = pd.DataFrame(_base_rows, columns=_roi_cols)
-            if _base_df.empty:
-                _base_df = pd.DataFrame(
-                    {
-                        _sel_col: pd.Series(dtype="bool"),
-                        "Name": pd.Series(dtype="object"),
-                        "Format": pd.Series(dtype="object"),
-                        "Pattern": pd.Series(dtype="object"),
-                        "Scale": pd.Series(dtype="float"),
-                        "OCR OK": pd.Series(dtype="bool"),
-                        "OCR Wert": pd.Series(dtype="object"),
-                        "OCR Details": pd.Series(dtype="object"),
-                    }
-                )
-            else:
-                _base_df[_sel_col] = _base_df[_sel_col].fillna(False).astype(bool)
-            _cached_df = st.session_state.get("roi_editor_df")
-            if (
-                isinstance(_cached_df, pd.DataFrame)
-                and list(_cached_df.columns) == list(_base_df.columns)
-                and len(_cached_df) == len(_base_df)
-            ):
-                df_edit = _cached_df.copy().reindex(columns=_roi_cols)
-                df_edit[_sel_col] = df_edit[_sel_col].fillna(False).astype(bool)
-                df_edit[_sel_col] = [(i == _sel) for i in range(len(df_edit))]
-            else:
-                df_edit = _base_df.copy()
-
-            if _sel_col not in df_edit.columns:
-                df_edit[_sel_col] = False
-            df_edit = pd.DataFrame(
-                {
-                    _sel_col: pd.Series([bool(v) for v in df_edit[_sel_col].tolist()], dtype="bool"),
-                    "Name": pd.Series([str(v) for v in df_edit["Name"].tolist()], dtype="object"),
-                    "Format": pd.Series([str(v) if str(v) != "custom" else "any" for v in df_edit["Format"].tolist()], dtype="object"),
-                    "Pattern": pd.Series([str(v) for v in df_edit.get("Pattern", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
-                    "Scale": pd.Series([float(v or 1.2) for v in df_edit.get("Scale", pd.Series([float(st.session_state.get("roi_global_scale", 1.2))] * len(df_edit))).tolist()], dtype="float"),
-                    "OCR OK": pd.Series([bool(v) for v in df_edit.get("OCR OK", pd.Series([False] * len(df_edit))).tolist()], dtype="bool"),
-                    "OCR Wert": pd.Series([str(v) for v in df_edit.get("OCR Wert", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
-                    "OCR Details": pd.Series([str(v) for v in df_edit.get("OCR Details", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
-                },
-                columns=_roi_cols,
-            )
-
-            edited_df = st.data_editor(
-                df_edit,
-                column_config={
-                    _sel_col: st.column_config.CheckboxColumn("", width=42),
-                    "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width=150),
-                    "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width=170),
-                    "Pattern": st.column_config.TextColumn("Pat.", width=56, disabled=True),
-                    "Scale": st.column_config.NumberColumn("Sc.", width=52, disabled=True),
-                    "OCR OK": st.column_config.CheckboxColumn("OCR OK", width=70, disabled=True),
-                    "OCR Wert": st.column_config.TextColumn("OCR Wert", width=110, disabled=True, help="OCR-Testwert; Details stehen in der Spalte OCR Details."),
-                    "OCR Details": st.column_config.TextColumn("OCR Details", width=210, disabled=True, help="raw, conf, scale und frUp aus dem letzten OCR-Test."),
-                },
-                num_rows="fixed",
-                width="stretch",
-                hide_index=True,
-                height=_tbl_h,
-                key=str(st.session_state.get("roi_editor_widget_key", "roi_data_editor_v3")),
-            )
-
-            if edited_df is not None and len(edited_df) == len(_rois):
-                if _sel_col in edited_df.columns:
-                    edited_df[_sel_col] = edited_df[_sel_col].fillna(False).astype(bool)
-                st.session_state.roi_editor_df = edited_df.copy()
-                _checked_rows = [
-                    _i for _i, _row in edited_df.iterrows()
-                    if bool(_row.get(_sel_col, False))
-                ]
-                _newly_sel = int(_checked_rows[0]) if _checked_rows else _sel
-                _meta_changed = False
-                for _i, _row in edited_df.iterrows():
-                    _r = _rois[_i]
-                    _nn = str(_row["Name"]) if pd.notna(_row["Name"]) else _r.get("name", "_")
-                    _nf = str(_row["Format"]) if pd.notna(_row["Format"]) else _r.get("fmt", "any")
-                    if _nf == "custom":
-                        _nf = "any"
-                    if (_r.get("name") != _nn or _r.get("fmt") != _nf):
-                        st.session_state.rois[_i] = {**_r, "name": _nn, "fmt": _nf}
-                        st.session_state.rois[_i].pop("pattern", None)
-                        _meta_changed = True
-                if isinstance(_newly_sel, int) and _newly_sel != _sel and 0 <= _newly_sel < len(st.session_state.rois):
-                    st.session_state.selected_roi = _newly_sel
-                    st.session_state.roi_draw_armed = True
-                    _sr = st.session_state.rois[_newly_sel]
-                    st.session_state.roi_anchor_box = {
-                        "x": int(round(float(_sr.get("x", 0)))),
-                        "y": int(round(float(_sr.get("y", 0)))),
-                        "w": int(round(float(_sr.get("w", 0)))),
-                        "h": int(round(float(_sr.get("h", 0)))),
-                    }
-                    st.session_state.roi_wait_user_move = True
-                    st.session_state.roi_reject_anchor_events = 0
-                    st.rerun()
-                if _meta_changed:
-                    st.rerun()
-            act_sel = st.session_state.selected_roi
-
-            _scale_val = st.number_input(
-                "OCR Scale fuer alle ROIs",
-                min_value=0.1,
-                max_value=5.0,
-                value=float(st.session_state.get("roi_global_scale", 1.2)),
-                step=0.1,
-                key="roi_global_scale_input",
-                help="Gemeinsamer Scale-Wert fuer OCR; gilt fuer alle ROIs.",
-            )
-            if abs(float(st.session_state.get("roi_global_scale", 1.2)) - float(_scale_val)) > 1e-9:
-                st.session_state.roi_global_scale = float(_scale_val)
-                for _r in st.session_state.rois:
-                    if isinstance(_r, dict):
-                        _r["max_scale"] = float(_scale_val)
-
-            if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
-                sr = st.session_state.rois[act_sel]
-                st.caption(
-                    f"#{act_sel} {sr.get('name','')} "
-                    f"[{int(sr.get('x',0))},{int(sr.get('y',0))},{int(sr.get('w',0))},{int(sr.get('h',0))}]"
-                )
-
-            _ocr_probe_indices = _roi_ocr_probe_indices()
-            _can_ocr_probe = frame is not None and bool(_ocr_probe_indices)
-            _all_ocr_probe_ok = _roi_ocr_all_ok()
-            if _all_ocr_probe_ok:
-                st.markdown('<style>.st-key-roi_ocr_probe_btn button{background:#3ddc84!important;border-color:#3ddc84!important;color:#07100b!important;box-shadow:0 0 14px rgba(61,220,132,.22)!important;}</style>', unsafe_allow_html=True)
-
-            if bool(st.session_state.get("roi_ocr_probe_running", False)):
-                st.session_state.tab_default = "ROI Setup"
-                _render_blocking_overlay("OCR-Test ROI läuft ...")
-                tess_cmd = find_tesseract_cmd()
-                if not tess_cmd:
-                    st.session_state.roi_ocr_probe_running = False
-                    st.session_state.roi_ocr_probe_result = None
-                    set_status("Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD.", "warn")
-                    st.rerun()
-                all_probe_results = []
-                for _idx in _ocr_probe_indices:
-                    probe_roi = {
-                        **st.session_state.rois[_idx],
-                        "max_scale": float(st.session_state.get("roi_global_scale", 1.2)),
-                    }
-                    probe = diagnose_roi_ocr(
-                        frame,
-                        probe_roi,
-                        (int(fw), int(fh)),
-                        tmp_root=LOG_DIR / "ocr_tmp",
-                    )
-                    _conf = float(probe.get("confidence", 0.0) or 0.0)
-                    _scale = probe.get("scale", "")
-                    _fr_up = probe.get("frUp", probe.get("fr_up", probe.get("variant", "")))
-                    _details = (
-                        f"raw={probe.get('raw', '')}; "
-                        f"conf={_conf:.2f}; "
-                        f"scale={_scale}; "
-                        f"frUp={_fr_up}"
-                    )
-                    st.session_state.rois[_idx] = {
-                        **st.session_state.rois[_idx],
-                        "ocr_test_ok": bool(probe.get("ok")),
-                        "ocr_test_value": probe.get("value", ""),
-                        "ocr_test_raw": probe.get("raw", ""),
-                        "ocr_test_confidence": _conf,
-                        "ocr_test_scale": _scale,
-                        "ocr_test_frUp": _fr_up,
-                        "ocr_test_error": probe.get("error", ""),
-                        "ocr_test_details": _details,
-                    }
-                    all_probe_results.append({
-                        "idx": _idx,
-                        "name": st.session_state.rois[_idx].get("name", ""),
-                        **probe,
-                    })
-                st.session_state.roi_ocr_probe_result = all_probe_results
-                st.session_state.roi_editor_df = None
-                st.session_state.roi_ocr_probe_running = False
-                st.session_state.tab_default = "ROI Setup"
-                st.rerun()
-
-            if st.button(
-                "OCR-Test ROI",
-                width="stretch",
-                key="roi_ocr_probe_btn",
-                disabled=(not _can_ocr_probe) or bool(st.session_state.get("roi_ocr_probe_running", False)),
-                help="Testet alle ROIs außer track_minimap.",
-            ):
-                for _idx in _ocr_probe_indices:
-                    st.session_state.rois[_idx]["ocr_test_ok"] = False
-                st.session_state.roi_ocr_probe_running = True
-                _render_blocking_overlay("OCR-Test ROI läuft ...")
-                _ok_probe, _msg_probe = _run_roi_ocr_probe_now(frame, fw, fh, _ocr_probe_indices)
-                st.session_state.roi_ocr_probe_running = False
-                st.session_state.tab_default = "ROI Setup"
-                set_status(_msg_probe, "ok" if _ok_probe else "warn")
-                st.rerun()
-
-            if st.button("Ausgew\u00e4hlte ROI l\u00f6schen", width="stretch",
-                         key="roi_del_btn", disabled=act_sel is None):
-                if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
-                    st.session_state.roi_delete_confirm_idx = int(act_sel)
-
-            _confirm_idx = st.session_state.get("roi_delete_confirm_idx")
-            if isinstance(_confirm_idx, int) and 0 <= _confirm_idx < len(st.session_state.rois):
-                _roi_name = st.session_state.rois[_confirm_idx].get("name", "")
-                st.warning(f"ROI #{_confirm_idx} ({_roi_name}) wirklich löschen?")
-                _del_yes, _del_no = st.columns(2)
-                if _del_yes.button("Ja, löschen", width="stretch", key="roi_del_confirm_yes"):
-                    st.session_state.rois.pop(_confirm_idx)
-                    st.session_state.selected_roi = None
-                    st.session_state.roi_draw_armed = False
-                    st.session_state.roi_wait_user_move = False
-                    st.session_state.roi_anchor_box = {}
-                    st.session_state.roi_reject_anchor_events = 0
-                    st.session_state.roi_editor_df = None
-                    st.session_state.roi_delete_confirm_idx = None
-                    if st.session_state.media_source == "video":
-                        get_frame.clear()
-                    set_status("ROI gelöscht.", "info")
-                    st.rerun()
-                if _del_no.button("Nein", width="stretch", key="roi_del_confirm_no"):
-                    st.session_state.roi_delete_confirm_idx = None
-                    st.rerun()
-
-
-
-
-
+    roi_setup_tab.render(globals())
 # ----------------------------------------
 # TAB: Track analysis
 # ----------------------------------------
 with tab_track:
-    st.divider()
-    st.subheader("2 · Track Analysis")
-    has_ref   = st.session_state.ref_track_img is not None
-    track_roi = next((r for r in st.session_state.rois if r["name"]=="track_minimap"),None)
-    has_vid   = _has_media_source()
-    fw=st.session_state.vid_width; fh=st.session_state.vid_height
-    can_cmp = (has_ref and track_roi and has_vid and
-               _has_valid_8_points(st.session_state.ref_track_pts) and
-               _has_valid_8_points(st.session_state.minimap_pts))
-
-    if not track_roi:
-        st.info("[i] Keine track_minimap ROI -> Tab ROI Setup -> ROI anlegen.")
-
-    col_a,col_b=st.columns(2,gap="medium")
-    clrs=[(255,80,80),(255,160,0),(255,255,0),(80,255,80),
-          (0,200,255),(100,100,255),(200,80,255),(255,80,200)]
-
-    with col_a:
-        st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        _mat_name = st.session_state.get("ref_track_mat_name", "") or ""
-        _ref_title = f"Referenz-Track | {_mat_name}" if _mat_name else "Referenz-Track | Centerline [m]"
-        st.markdown(f'<div class="section-title">{_ref_title}</div>', unsafe_allow_html=True)
-        if has_ref:
-            # P1-P8 already baked into the rendered image by render_centerline_image(); height-limited in this tab.
-            st.markdown('<div class="ref-track-fit">', unsafe_allow_html=True)
-            st.image(st.session_state.ref_track_img, width=520,
-                     caption="P1–P8 fest aus Streckendatei")
-            st.markdown('</div>', unsafe_allow_html=True)
-            _sl_c1, _sl_c2 = st.columns(2)
-            if _sl_c1.button("Neu laden", width="stretch", key="reload_mat_btn"):
-                st.session_state.ref_track_img = None
-                st.session_state.ref_track_pts = None
-                st.session_state.centerline = None
-                st.session_state.ref_track_mat_name = ""
-                st.rerun()
-            _sl_c2.caption("Slim-Datei wird automatisch gespeichert, falls sie in der Cloud fehlt.")
-        else:
-            st.markdown('<div style="text-align:center;color:#2e3545;padding:.5rem 0;">'
-                        'Keine Streckenkarte geladen</div>', unsafe_allow_html=True)
-            if not track_roi:
-                st.caption("Referenz-Track kann erst geladen werden, wenn eine ROI 'track_minimap' vorhanden ist.")
-            # Cloud: list .mat files from reference_track_siesmann/
-            if track_roi and st.session_state.r2_connected and st.session_state.r2_client is not None:
-                pfx = st.session_state.r2_prefix.strip("/")
-                ref_dir = (pfx + "/reference_track_siesmann").strip("/") if pfx else "reference_track_siesmann"
-                ok_ls, ref_items = st.session_state.r2_client.list_files(ref_dir)
-                if ok_ls and isinstance(ref_items, list):
-                    mat_files = [f for f in ref_items if f.lower().endswith(".mat")]
-                    mat_files = sorted(
-                        mat_files,
-                        key=lambda f: (0 if Path(f).stem.lower().endswith("_slim") else 1, Path(f).name.lower()),
-                    )
-                    if mat_files:
-                        sel = st.selectbox(
-                            "Streckendatei wählen",
-                            mat_files,
-                            key="ref_track_sel",
-                            label_visibility="collapsed",
-                        )
-                        if st.button("Aus Cloud laden", width="stretch", key="ref_track_load_btn"):
-                            _load_centerline_from_r2(f"{ref_dir}/{sel}", sel)
-                            st.rerun()
-                    else:
-                        st.caption(f"Keine .mat-Dateien in Cloud-Ordner: {ref_dir}")
-                else:
-                    st.caption("Cloud-Ordner 'reference_track_siesmann' nicht gefunden.")
-            elif track_roi:
-                st.caption("Cloud nicht verbunden.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col_b:
-        st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Minimap | Kalibrierung + Farberkennung</div>',
-                    unsafe_allow_html=True)
-        if has_vid and track_roi:
-            _track_t = st.slider(
-                "Zeit fuer Farberkennung / Track [s]",
-                float(st.session_state.t_start),
-                float(st.session_state.t_end),
-                float(min(max(st.session_state.t_current, st.session_state.t_start), st.session_state.t_end)),
-                step=round(1 / max(float(st.session_state.vid_fps or 25.0), 1.0), 4),
-                format="%d s",
-                key="track_color_time_slider",
-            )
-            st.session_state.t_current = float(_track_t)
-            frame=_get_media_frame(st.session_state.t_current)
-            if frame is not None:
-                crop=extract_minimap_crop(frame,track_roi,fw,fh)
-                ch,cw=crop.shape[:2]
-                mm_pts=list(st.session_state.minimap_pts or [])
-                # Sync counter forward if points already loaded from config/MAT
-                if st.session_state.minimap_next_pt_idx < len(mm_pts):
-                    st.session_state.minimap_next_pt_idx = len(mm_pts)
-                next_idx = st.session_state.minimap_next_pt_idx
-
-                # ── Iterativer Track-Overlay ──────────────────────────────────────
-                # Ab 4 Punkten: Homographie berechnen und Centerline auf Minimap projizieren.
-                # Je mehr Punkte, desto besser die Überlagerung.
-                _cl_px   = st.session_state.get("centerline_px")
-                _ref_pts = st.session_state.ref_track_pts
-                vis_c = crop.copy()
-                if _cl_px and _ref_pts and len(mm_pts) >= 4:
-                    try:
-                        vis_overlay = vis_c.copy()
-                        n_use = min(len(mm_pts), len(_ref_pts))
-                        H_fwd, _ = cv2.findHomography(
-                            np.array(mm_pts[:n_use], dtype=np.float32),
-                            np.array(_ref_pts[:n_use], dtype=np.float32),
-                            cv2.RANSAC, 5.0,
-                        )
-                        if H_fwd is not None:
-                            H_inv = np.linalg.inv(H_fwd)
-                            # Subsample centerline (every 15th pt) for speed
-                            cl_sub = np.array(_cl_px[::15], dtype=np.float32).reshape(-1, 1, 2)
-                            cl_mm  = cv2.perspectiveTransform(cl_sub, H_inv).reshape(-1, 2)
-                            cl_int = np.round(cl_mm).astype(int)
-                            for i in range(len(cl_int) - 1):
-                                p1 = (int(cl_int[i, 0]),   int(cl_int[i, 1]))
-                                p2 = (int(cl_int[i+1, 0]), int(cl_int[i+1, 1]))
-                                if (0 <= p1[0] < cw and 0 <= p1[1] < ch and
-                                        0 <= p2[0] < cw and 0 <= p2[1] < ch):
-                                    cv2.line(vis_overlay, p1, p2, (0, 220, 100), 1)
-                            vis_c = cv2.addWeighted(vis_c, 0.70, vis_overlay, 0.30, 0)
-                            _overlay_pts = n_use
-                        else:
-                            _overlay_pts = 0
-                    except Exception:
-                        _overlay_pts = 0
-                else:
-                    _overlay_pts = 0
-
-                # Draw set points on top of overlay (white ring + colored fill + shadow label)
-                for pi, pt in enumerate(mm_pts):
-                    if pt and len(pt) == 2:
-                        px_i, py_i = int(pt[0]), int(pt[1])
-                        cv2.circle(vis_c, (px_i, py_i), 9, (255,255,255), 2)
-                        cv2.circle(vis_c, (px_i, py_i), 6, clrs[pi%8], -1)
-                        cv2.putText(vis_c, f"P{pi+1}", (px_i+10, py_i+5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, .45, (0,0,0), 3)
-                        cv2.putText(vis_c, f"P{pi+1}", (px_i+10, py_i+5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, .45, clrs[pi%8], 1)
-
-                if streamlit_image_coordinates is None:
-                    st.warning("Bitte installieren: pip install streamlit-image-coordinates")
-                    st.image(vis_c, width="stretch", caption=f"Minimap ({cw}x{ch}px)")
-                elif next_idx < 8:
-                    # ── Kalibrierung: P1 … P8 anklicken ──
-                    # Fixed widget key + dedup: avoids image disappearing when key changes.
-                    # The widget returns the last click on every rerun; we only act on a NEW click.
-                    _overlay_info = (f"  ·  Track-Overlay: {_overlay_pts} Punkte"
-                                     if _overlay_pts >= 4 else "")
-                    st.caption(
-                        f"Klicke **P{next_idx+1}** auf der Minimap  ·  {next_idx}/8 gesetzt"
-                        + _overlay_info
-                    )
-                    _last_cal = st.session_state.get("_mm_last_click")
-                    click = streamlit_image_coordinates(vis_c, key="mm_calibrate")
-                    if click and isinstance(click, dict) and click != _last_cal:
-                        st.session_state["_mm_last_click"] = click
-                        x = int(round(float(click.get("x", 0))))
-                        y = int(round(float(click.get("y", 0))))
-                        while len(mm_pts) <= next_idx:
-                            mm_pts.append([0, 0])
-                        mm_pts[next_idx] = [x, y]
-                        st.session_state.minimap_pts = mm_pts
-                        st.session_state.minimap_next_pt_idx = next_idx + 1
-                        st.rerun()
-                else:
-                    # ── 8 Punkte fertig → Farberkennung per Klick ──
-                    # Live detection with current color range (runs every render)
-                    cr = st.session_state.moving_pt_color_range
-                    mp_live = detect_moving_point(crop, cr)
-
-                    # Overlay: detected blob (yellow) + last click position (cyan cross)
-                    vis_detect = vis_c.copy()
-                    if mp_live:
-                        dx, dy = int(mp_live["x"]), int(mp_live["y"])
-                        cv2.circle(vis_detect, (dx, dy), 12, (255, 255, 0), 2)
-                        cv2.circle(vis_detect, (dx, dy),  3, (255, 255, 0), -1)
-                    _clk_pos = st.session_state.get("_mm_color_click_px")
-                    if _clk_pos and 0 <= _clk_pos[0] < cw and 0 <= _clk_pos[1] < ch:
-                        cv2.drawMarker(
-                            vis_detect, (int(_clk_pos[0]), int(_clk_pos[1])),
-                            (0, 255, 255), cv2.MARKER_CROSS, 14, 2,
-                        )
-
-                    # Color swatch for current target color
-                    h_m=(cr["h_lo"]+cr["h_hi"])//2
-                    s_m=(cr["s_lo"]+cr["s_hi"])//2
-                    v_m=(cr["v_lo"]+cr["v_hi"])//2
-                    swatch=np.zeros((20,40,3),dtype=np.uint8)
-                    swatch[:]=cv2.cvtColor(
-                        np.array([[[h_m,s_m,v_m]]],dtype=np.uint8),
-                        cv2.COLOR_HSV2RGB)[0,0]
-
-                    detected_lbl = "✓ Erkannt" if mp_live else "✗ Nicht erkannt"
-                    sc1, sc2 = st.columns([3,1])
-                    sc2.image(swatch, caption="Zielfarbe", width="stretch")
-
-                    _last_col = st.session_state.get("_mm_last_color_click")
-                    color_click = streamlit_image_coordinates(vis_detect, key="mm_color_pick")
-                    if color_click and isinstance(color_click, dict) and color_click != _last_col:
-                        st.session_state["_mm_last_color_click"] = color_click
-                        cx = max(0, min(cw-1, int(round(float(color_click.get("x",0))))))
-                        cy = max(0, min(ch-1, int(round(float(color_click.get("y",0))))))
-                        st.session_state["_mm_color_click_px"] = (cx, cy)
-                        pixel_rgb = crop[cy, cx]
-                        hsv_px = cv2.cvtColor(
-                            np.array([[pixel_rgb]],dtype=np.uint8),
-                            cv2.COLOR_RGB2HSV)[0,0]
-                        h,s,v = int(hsv_px[0]),int(hsv_px[1]),int(hsv_px[2])
-                        st.session_state.moving_pt_color_range = dict(
-                            h_lo=max(0,h-15),   h_hi=min(179,h+15),
-                            s_lo=max(0,s-60),   s_hi=min(255,s+60),
-                            v_lo=max(0,v-60),   v_hi=min(255,v+60),
-                        )
-                        set_status(f"Farbe gesetzt: HSV({h},{s},{v})","ok")
-                        st.rerun()
-
-                # Reset / Undo buttons
-                rb1, rb2 = st.columns(2)
-                if rb1.button("Zurücksetzen", width="stretch", key="mm_pts_reset"):
-                    st.session_state.minimap_pts = []
-                    st.session_state.minimap_next_pt_idx = 0
-                    st.session_state["_mm_last_click"] = None
-                    st.session_state["_mm_last_color_click"] = None
-                    st.rerun()
-                if rb2.button("Letzten entfernen", width="stretch", key="mm_pts_undo"):
-                    if next_idx > 0:
-                        st.session_state.minimap_pts = mm_pts[:next_idx-1]
-                        st.session_state.minimap_next_pt_idx = next_idx-1
-                        st.rerun()
-                if st.button("Vergleich 5 Zeiten", type="primary", width="stretch", key="cmp_5_times_btn", disabled=not can_cmp):
-                    st.session_state["_run_compare_5_times"] = True
-                if not can_cmp:
-                    st.caption("Benötigt: Referenztrack, track_minimap ROI, Video und je 8 Punkte.")
-        else:
-            st.markdown('<div style="text-align:center;color:#2e3545;padding:2rem;">'
-                        'Video + track_minimap ROI benötigt</div>',unsafe_allow_html=True)
-        st.markdown('</div>',unsafe_allow_html=True)
-
-    def _centerline_progress_percent(ref_pt, centerline_px) -> float | None:
-        if ref_pt is None or not centerline_px:
-            return None
-        try:
-            p = np.array(ref_pt, dtype=float).reshape(2)
-            cl = np.asarray(centerline_px, dtype=float).reshape(-1, 2)
-            if cl.shape[0] < 2:
-                return None
-            seg = cl[1:] - cl[:-1]
-            seg_len = np.linalg.norm(seg, axis=1)
-            total = float(np.sum(seg_len))
-            if total <= 0:
-                return None
-            best_s = 0.0
-            best_d2 = float("inf")
-            cum = np.concatenate([[0.0], np.cumsum(seg_len)])
-            for i, v in enumerate(seg):
-                l2 = float(np.dot(v, v))
-                if l2 <= 0:
-                    continue
-                u = float(np.clip(np.dot(p - cl[i], v) / l2, 0.0, 1.0))
-                q = cl[i] + u * v
-                d2 = float(np.sum((p - q) ** 2))
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_s = float(cum[i] + u * seg_len[i])
-            return float(np.clip(100.0 * best_s / total, 0.0, 100.0))
-        except Exception:
-            return None
-
-    def _comparison_overlay_low_opacity(crop, cmp):
-        overlay = draw_comparison_overlay(
-            crop, st.session_state.ref_track_img,
-            st.session_state.minimap_pts, st.session_state.ref_track_pts,
-            cmp, st.session_state.moving_pt_color_range,
-        )
-        try:
-            if overlay is not None and overlay.shape == crop.shape:
-                return cv2.addWeighted(crop, 0.15, overlay, 0.85, 0)
-        except Exception:
-            pass
-        return overlay
-
-    if st.session_state.pop("_run_compare_5_times", False) and can_cmp:
-        with st.spinner("Vergleich 5 Zeiten läuft ..."):
-            rng = np.random.default_rng(12345)
-            lo, hi = float(st.session_state.t_start), float(st.session_state.t_end)
-            times = sorted(rng.uniform(lo, hi, size=5).tolist()) if hi > lo else [lo] * 5
-            results = []
-            for _t in times:
-                _frame = _get_media_frame(float(_t))
-                if _frame is None:
-                    continue
-                _crop = extract_minimap_crop(_frame, track_roi, fw, fh)
-                _cmp = compare_minimap_to_reference(
-                    _crop, st.session_state.ref_track_img,
-                    st.session_state.minimap_pts, st.session_state.ref_track_pts,
-                )
-                if _cmp.get("error"):
-                    continue
-                _mp = detect_moving_point(_crop, st.session_state.moving_pt_color_range)
-                _ref_pt = None
-                _progress = None
-                if _mp:
-                    _ref_pt = project_point_with_homography((_mp["x"], _mp["y"]), _cmp.get("H"))
-                    _progress = _centerline_progress_percent(_ref_pt, st.session_state.get("centerline_px"))
-                _overlay = _comparison_overlay_low_opacity(_crop, _cmp)
-                results.append({
-                    "t": float(_t), "cmp": _cmp, "mp": _mp,
-                    "ref_pt": _ref_pt, "progress_pct": _progress,
-                    "overlay": _overlay,
-                })
-            st.session_state.track_comparison_samples = results
-            set_status(f"Vergleich fuer {len(results)} Zeiten durchgefuehrt.", "ok")
-        st.rerun()
-
-    st.markdown('<div class="section-card">',unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Vergleich | Ueberlagerung | Bewegende Punkte</div>',
-                unsafe_allow_html=True)
-    _samples = st.session_state.get("track_comparison_samples") or []
-    if _samples:
-        st.markdown("**Test: 5 zufaellige Zeiten zwischen Start und Ende**")
-        _cols = st.columns(5)
-        for _col, _res in zip(_cols, _samples[:5]):
-            _col.image(_res["overlay"], width="stretch", caption=f"t={_res['t']:.2f}s")
-            _c = _res.get("cmp", {})
-            _mp = _res.get("mp")
-            _progress = _res.get("progress_pct")
-            _pos_html = f"<div class='track-progress-big'>{_progress:.1f}%</div>" if _progress is not None else "<div class='track-progress-big'>n/a</div>"
-            _col.markdown(_pos_html, unsafe_allow_html=True)
-            _col.caption(
-                f"ø={_c.get('mean_dist_px', 0.0):.1f}px · max={_c.get('max_dist_px', 0.0):.1f}px · "
-                f"pt={'ja' if _mp else 'nein'}"
-            )
-    else:
-        st.caption("Noch kein Vergleich durchgeführt. Button steht unter Zurücksetzen / Letzten entfernen.")
-    st.markdown('</div>',unsafe_allow_html=True)
-
-
-
-    st.divider()
-    st.subheader("3 · Speicherung")
-    st.caption("Speichert die aktuelle ROI-, Zeit- und Track-Konfiguration gemeinsam als JSON und MAT. Downloads sind nur optional nach dem Speichern.")
-    _has_any_roi = len(st.session_state.get("rois") or []) > 0
-    _save_busy = bool(st.session_state.get("roi_save_running", False))
-    _ocr_probe_busy = bool(st.session_state.get("roi_ocr_probe_running", False))
-    _ocr_ready_to_save = _roi_ocr_all_ok()
-
-    if bool(st.session_state.get("roi_next_load_running", False)):
-        st.session_state.tab_default = "ROI Setup"
-        _render_blocking_overlay("Nächste Datei wird geladen ...")
-        ok_next, msg_next = _load_next_roi_setup_file()
-        st.session_state.roi_next_load_running = False
-        st.session_state.tab_default = "ROI Setup"
-        set_status(msg_next if isinstance(msg_next, str) else str(msg_next), "ok" if ok_next else "warn")
-        st.rerun()
-
-    # Alter/Stale Save-State darf die Seite nicht blockieren. Speichern laeuft
-    # synchron im Button-Klick und verwendet keinen persistenten Fixed-Overlay.
-    if _save_busy:
-        st.session_state.roi_save_running = False
-        _save_busy = False
-
-    if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn_bottom", disabled=(_save_busy or _ocr_probe_busy or not _has_any_roi or not _ocr_ready_to_save), help="Erst aktiv, wenn der OCR-Test ROI grün ist."):
-        st.session_state.tab_default = "ROI Setup"
-        st.session_state.roi_save_running = True
-        try:
-            with st.spinner("Speichern läuft ..."):
-                ok_save, msg_save, payload_save = _save_result_json_and_mat()
-            st.session_state["_last_save_payload"] = payload_save
-            st.session_state.roi_saved_once = bool(ok_save)
-            set_status(msg_save, "ok" if ok_save else "warn")
-        except Exception as e:
-            st.session_state.roi_saved_once = False
-            set_status(f"Speichern fehlgeschlagen: {e}", "warn")
-        finally:
-            st.session_state.roi_save_running = False
-            _save_busy = False
-
-    _next_disabled = _ocr_probe_busy or bool(st.session_state.get("roi_next_load_running", False)) or (not bool(st.session_state.get("roi_saved_once", False)))
-    if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn_bottom", disabled=_next_disabled):
-        st.session_state.roi_next_load_running = True
-        st.session_state.tab_default = "ROI Setup"
-        st.rerun()
-
-    _last_save = st.session_state.get("_last_save_payload") or {}
-    if _last_save:
-        targets = " · ".join(str(x) for x in (_last_save.get("targets") or []))
-        st.markdown(f'<div class="save-status-card">Zuletzt gespeichert: <b>{_last_save.get("json_name", "results.json")}</b> + <b>{_last_save.get("mat_name", "results.mat")}</b><br>{targets}</div>', unsafe_allow_html=True)
-        with st.expander("Optionale Downloads anzeigen", expanded=False):
-            st.caption("Die Dateien wurden bereits gespeichert. Diese Buttons sind nur für eine lokale Kopie.")
-            _dl_json_col, _dl_mat_col = st.columns(2)
-            _dl_json_col.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch", key="json_download_bottom")
-            _dl_mat_col.download_button("MAT herunterladen", _last_save.get("mat_bytes", b""), _last_save.get("mat_name", "results.mat"), "application/octet-stream", width="stretch", key="mat_download_bottom")
-
-    if False and st.session_state.moving_pt_history:
-        st.markdown('<div class="section-card">',unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Verlauf bewegender Punkt</div>',
-                    unsafe_allow_html=True)
-        import pandas as pd
-        c1,c2=st.columns([1,4])
-        c1.metric("Positionen",len(st.session_state.moving_pt_history))
-        if c1.button("Leeren",key="hist_clear"):
-            st.session_state.moving_pt_history=[]; st.rerun()
-        df=pd.DataFrame(st.session_state.moving_pt_history[-100:])
-        c2.dataframe(df, width="stretch", height=180)
-        st.markdown('</div>',unsafe_allow_html=True)
+    track_analysis_tab.render(globals())

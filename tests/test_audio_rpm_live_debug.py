@@ -223,6 +223,7 @@ def test_audio_load_current_capture_falls_back_to_video_audio_track():
 def test_app_audio_tab_contains_live_polling_and_paper_based_methods():
     repo = Path(__file__).resolve().parents[1]
     source = (repo / "app.py").read_text(encoding="utf-8")
+    source += "\n" + (repo / "app_tabs" / "audio_tab.py").read_text(encoding="utf-8")
     required_tokens = [
         "streamlit.components.v1",
         "ThreadPoolExecutor",

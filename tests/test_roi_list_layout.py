@@ -35,6 +35,9 @@ def _extract_width(block: str, column_key: str) -> int:
 def test_roi_list_uses_compact_column_widths() -> None:
     try:
         app_source = Path("app.py").read_text(encoding="utf-8")
+        roi_tab = Path("app_tabs/roi_setup_tab.py")
+        if roi_tab.exists():
+            app_source += "\n" + roi_tab.read_text(encoding="utf-8")
         block = _roi_editor_config_block(app_source)
 
         select_col_match = re.search(
