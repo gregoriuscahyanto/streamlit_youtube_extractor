@@ -3728,13 +3728,14 @@ def _extract_vehicle_title_from_mat(mat_path: str) -> str:
 
 
 def _load_audio_for_current_capture() -> tuple[bool, str, int, np.ndarray, str]:
-    """Return ok, msg, sample_rate, mono_audio_float, source_label."""
+    """Return ok, msg, sample_rate, mono_audio_float, source_label.
+
+    Cloud audio_proxy_1k.wav is preferred because it is already low-pass filtered
+    below 1000 Hz and downsampled. Local full-resolution audio is only a fallback.
+    """
     folder = str(st.session_state.get("capture_folder") or "").strip()
     candidates = []
-    if folder:
-        local_audio = _find_local_audio_file(folder)
-        if local_audio is not None:
-            candidates.append(("local", str(local_audio)))
+
     if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None and folder:
         pfx = st.session_state.r2_prefix.strip("/")
         key = f"{pfx}/captures/{folder}/{AUDIO_PROXY_NAME}" if pfx else f"captures/{folder}/{AUDIO_PROXY_NAME}"
@@ -3742,16 +3743,23 @@ def _load_audio_for_current_capture() -> tuple[bool, str, int, np.ndarray, str]:
         tmp.close()
         ok, msg = st.session_state.r2_client.download_file(key, tmp.name)
         if ok:
-            candidates.append(("cloud", tmp.name))
+            candidates.append(("cloud-proxy", tmp.name, True))
         else:
             try:
                 Path(tmp.name).unlink(missing_ok=True)
             except Exception:
                 pass
+
+    if folder:
+        local_audio = _find_local_audio_file(folder)
+        if local_audio is not None:
+            candidates.append(("local-fallback", str(local_audio), False))
+
     if not candidates:
-        return False, "Keine Audio-Datei gefunden (lokal oder audio_proxy_1k.wav in Cloud).", 0, np.array([], dtype=float), ""
+        return False, "Keine Audio-Datei gefunden (audio_proxy_1k.wav in Cloud oder lokale Audiodatei).", 0, np.array([], dtype=float), ""
+
     last_err = ""
-    for label, path in candidates:
+    for label, path, cleanup in candidates:
         try:
             sr, data = wavfile.read(path)
             y = np.asarray(data, dtype=np.float32)
@@ -3761,12 +3769,17 @@ def _load_audio_for_current_capture() -> tuple[bool, str, int, np.ndarray, str]:
                 denom = float(np.iinfo(data.dtype).max) or 1.0
                 y = y / denom
             y = np.nan_to_num(np.asarray(y, dtype=np.float32).reshape(-1).copy())
-            return True, "", int(sr), y, f"{label}: {Path(path).name}"
+            src = f"{label}: {AUDIO_PROXY_NAME if label == 'cloud-proxy' else Path(path).name}"
+            return True, "", int(sr), y, src
         except Exception as e:
             last_err = str(e)
+        finally:
+            if cleanup:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
     return False, f"Audio konnte nicht gelesen werden: {last_err}", 0, np.array([], dtype=float), ""
-
-
 def _moving_median_nan(x, k: int = 7) -> np.ndarray:
     x = np.asarray(x, dtype=float).copy()
     if k <= 1 or x.size < 3:
@@ -3796,37 +3809,31 @@ def _interp_nan(x: np.ndarray) -> np.ndarray:
     return x
 
 
-def _viterbi_frequency_path(score: np.ndarray, jump_penalty: float = 0.18, max_jump_bins: int = 35) -> np.ndarray:
-    """Find smooth high-energy path through score[freq_bin, time_bin]."""
-    sc = np.asarray(score, dtype=np.float64).copy()
+def _smooth_energy_path(score: np.ndarray, max_jump_bins: int = 35) -> np.ndarray:
+    """Fast local ridge follower for score[freq_or_rpm_bin, time_bin].
+
+    This replaces the previous Viterbi/DP implementation. It is intentionally
+    linear in time so long Streamlit runs do not hang for minutes.
+    """
+    sc = np.asarray(score, dtype=np.float32)
     if sc.ndim != 2 or sc.size == 0:
         return np.array([], dtype=int)
     nf, nt = sc.shape
-    sc = np.nan_to_num(sc, nan=np.nanmin(sc[np.isfinite(sc)]) if np.isfinite(sc).any() else 0.0)
-    # normalize per time so loud/quiet parts are comparable
-    med = np.median(sc, axis=0, keepdims=True)
-    mad = np.median(np.abs(sc - med), axis=0, keepdims=True) + 1e-9
-    scn = (sc - med) / mad
-    dp = np.full((nf, nt), -np.inf, dtype=np.float64)
-    prev = np.zeros((nf, nt), dtype=np.int32)
-    dp[:, 0] = scn[:, 0]
-    bins = np.arange(nf)
-    for t in range(1, nt):
-        for j in range(nf):
-            lo = max(0, j - max_jump_bins)
-            hi = min(nf, j + max_jump_bins + 1)
-            cand_bins = bins[lo:hi]
-            trans = dp[lo:hi, t-1] - jump_penalty * np.abs(cand_bins - j)
-            k = int(np.argmax(trans))
-            prev[j, t] = lo + k
-            dp[j, t] = scn[j, t] + trans[k]
+    sc = np.nan_to_num(sc, nan=float(np.nanmin(sc[np.isfinite(sc)])) if np.isfinite(sc).any() else 0.0)
+    max_jump_bins = int(max(1, min(max_jump_bins, max(1, nf - 1))))
     path = np.zeros(nt, dtype=np.int32)
-    path[-1] = int(np.argmax(dp[:, -1]))
-    for t in range(nt - 1, 0, -1):
-        path[t-1] = prev[path[t], t]
+    col_energy = np.nanmax(sc, axis=0)
+    t0 = int(np.nanargmax(col_energy)) if col_energy.size else 0
+    path[t0] = int(np.nanargmax(sc[:, t0]))
+    for t in range(t0 + 1, nt):
+        prev = int(path[t - 1])
+        lo, hi = max(0, prev - max_jump_bins), min(nf, prev + max_jump_bins + 1)
+        path[t] = lo + int(np.nanargmax(sc[lo:hi, t]))
+    for t in range(t0 - 1, -1, -1):
+        prev = int(path[t + 1])
+        lo, hi = max(0, prev - max_jump_bins), min(nf, prev + max_jump_bins + 1)
+        path[t] = lo + int(np.nanargmax(sc[lo:hi, t]))
     return path
-
-
 def _extract_ocr_series_from_mat(mat_path: str) -> dict:
     """Load OCR time/v/gear columns if present. Empty dict if unavailable."""
     out = {}
@@ -3974,34 +3981,36 @@ def _run_robust_audio_rpm_analysis(
     idx_peak = np.argmax(Sb, axis=0)
     lines["Original Peak"] = fb[idx_peak]
 
-    # Ridge: smooth Viterbi path through power image
-    _dbg("Methode Ridge Tracking: zusammenhängende Spektrogramm-Linie per Viterbi ...", 0.50)
+    # Ridge: fast local path through the band-energy image.
+    _dbg("Methode Ridge Tracking: schnelle lokale Spektrogramm-Linie ...", 0.50)
     max_jump_hz = max(20.0, (f_hi - f_lo) * 0.16)
     df = float(np.nanmedian(np.diff(fb))) if fb.size > 1 else 1.0
     max_jump_bins = int(max(2, min(fb.size - 1, round(max_jump_hz / max(df, 1e-9)))))
-    path = _viterbi_frequency_path(Sb, jump_penalty=0.20, max_jump_bins=max_jump_bins)
+    path = _smooth_energy_path(Sb, max_jump_bins=max_jump_bins)
     lines["Ridge Tracking"] = fb[path] if path.size else lines["Original Peak"].copy()
     _dbg("Ridge Tracking fertig", 0.58)
 
-    # Order tracking: score RPM candidates by multiple harmonics of the expected firing/order line.
-    _dbg("Methode Order Tracking: harmonische Motorordnungen bewerten ...", 0.60)
-    # 700 Kandidaten war bei langen Dateien zu langsam. 260 reicht interaktiv gut aus;
-    # die finale Linie wird danach geglättet.
-    rpm_grid = np.linspace(max(100.0, rpm_min), max(rpm_min + 100.0, rpm_max), 260)
-    f_grid_base = rpm_grid / 60.0 * engine_factor * order
-    harmonics = [1, 2, 3, 4]
+    # Order tracking: vectorized scoring of RPM candidates by multiple harmonics.
+    _dbg("Methode Order Tracking: schnelle harmonische Bewertung ...", 0.60)
+    rpm_grid = np.linspace(max(100.0, rpm_min), max(rpm_min + 100.0, rpm_max), 180, dtype=np.float32)
+    f_grid_base = rpm_grid / np.float32(60.0) * np.float32(engine_factor * order)
+    harmonics = [1, 2, 3]
     score = np.zeros((rpm_grid.size, db.shape[1]), dtype=np.float32)
     for hi, h in enumerate(harmonics):
-        fg = f_grid_base * h
-        valid = fg <= fmax
+        fg = f_grid_base * np.float32(h)
+        valid = (fg >= freqs[0]) & (fg <= freqs[-1])
         if not np.any(valid):
             continue
-        _dbg(f"Order Tracking: Harmonik {h}/{harmonics[-1]} mit {int(np.sum(valid))} RPM-Kandidaten", 0.61 + 0.03 * hi)
-        for ti in range(db.shape[1]):
-            score[valid, ti] += np.interp(fg[valid], freqs, db[:, ti], left=np.nanmin(db[:, ti]), right=np.nanmin(db[:, ti])) / float(h)
+        _dbg(f"Order Tracking: Harmonik {h}/{harmonics[-1]} mit {int(np.sum(valid))} RPM-Kandidaten", 0.61 + 0.04 * hi)
+        idx = np.searchsorted(freqs, fg[valid]).clip(1, len(freqs) - 1)
+        left = freqs[idx - 1]
+        right = freqs[idx]
+        use_left = np.abs(fg[valid] - left) <= np.abs(right - fg[valid])
+        idx = np.where(use_left, idx - 1, idx)
+        score[valid, :] += db[idx, :] / np.float32(h)
     if np.isfinite(score).any():
-        _dbg("Order Tracking: glätte optimalen RPM-Pfad ...", 0.75)
-        rpath = _viterbi_frequency_path(score, jump_penalty=0.10, max_jump_bins=max(3, int(rpm_grid.size * 0.04)))
+        _dbg("Order Tracking: schnelle Pfadglättung ...", 0.75)
+        rpath = _smooth_energy_path(score, max_jump_bins=max(3, int(rpm_grid.size * 0.035)))
         rpm_order = rpm_grid[rpath] if rpath.size else rpm_grid[np.argmax(score, axis=0)]
         lines["Order Tracking"] = rpm_order / 60.0 * engine_factor * order
     else:
