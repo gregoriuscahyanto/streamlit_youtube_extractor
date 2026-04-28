@@ -17,7 +17,7 @@ def render(ns):
                _has_valid_8_points(st.session_state.minimap_pts))
 
     if not track_roi:
-        st.info("[i] Keine track_minimap ROI -> Tab ROI Setup -> ROI anlegen.")
+        st.info("[i] Keine track_minimap ROI -> oben in ROI Setup -> ROI anlegen.")
 
     col_a,col_b=st.columns(2,gap="medium")
     clrs=[(255,80,80),(255,160,0),(255,255,0),(80,255,80),
@@ -103,37 +103,58 @@ def render(ns):
 
                 # ── Iterativer Track-Overlay ──────────────────────────────────────
                 # Ab 4 Punkten: Homographie berechnen und Centerline auf Minimap projizieren.
-                # Je mehr Punkte, desto besser die Überlagerung.
+                # Ergebnis wird in Session-State gecacht; Neuberechnung nur wenn sich Punkte aendern.
                 _cl_px   = st.session_state.get("centerline_px")
                 _ref_pts = st.session_state.ref_track_pts
                 vis_c = crop.copy()
                 if _cl_px and _ref_pts and len(mm_pts) >= 4:
-                    try:
-                        vis_overlay = vis_c.copy()
-                        n_use = min(len(mm_pts), len(_ref_pts))
-                        H_fwd, _ = cv2.findHomography(
-                            np.array(mm_pts[:n_use], dtype=np.float32),
-                            np.array(_ref_pts[:n_use], dtype=np.float32),
-                            cv2.RANSAC, 5.0,
-                        )
-                        if H_fwd is not None:
-                            H_inv = np.linalg.inv(H_fwd)
-                            # Subsample centerline (every 15th pt) for speed
-                            cl_sub = np.array(_cl_px[::15], dtype=np.float32).reshape(-1, 1, 2)
-                            cl_mm  = cv2.perspectiveTransform(cl_sub, H_inv).reshape(-1, 2)
-                            cl_int = np.round(cl_mm).astype(int)
-                            for i in range(len(cl_int) - 1):
-                                p1 = (int(cl_int[i, 0]),   int(cl_int[i, 1]))
-                                p2 = (int(cl_int[i+1, 0]), int(cl_int[i+1, 1]))
-                                if (0 <= p1[0] < cw and 0 <= p1[1] < ch and
-                                        0 <= p2[0] < cw and 0 <= p2[1] < ch):
-                                    cv2.line(vis_overlay, p1, p2, (0, 220, 100), 1)
-                            vis_c = cv2.addWeighted(vis_c, 0.70, vis_overlay, 0.30, 0)
-                            _overlay_pts = n_use
-                        else:
+                    # Cache-Key: Anzahl und Werte der Punkte + Centerline-Laenge
+                    _overlay_cache_key = (
+                        tuple(tuple(p) for p in mm_pts),
+                        tuple(tuple(p) for p in (_ref_pts or [])),
+                        len(_cl_px),
+                    )
+                    _cached_overlay = st.session_state.get("_track_overlay_cache")
+                    if (
+                        isinstance(_cached_overlay, dict)
+                        and _cached_overlay.get("key") == _overlay_cache_key
+                    ):
+                        _cl_int = _cached_overlay["cl_int"]
+                        _overlay_pts = _cached_overlay["n_pts"]
+                    else:
+                        try:
+                            n_use = min(len(mm_pts), len(_ref_pts))
+                            H_fwd, _ = cv2.findHomography(
+                                np.array(mm_pts[:n_use], dtype=np.float32),
+                                np.array(_ref_pts[:n_use], dtype=np.float32),
+                                cv2.RANSAC, 5.0,
+                            )
+                            if H_fwd is not None:
+                                H_inv = np.linalg.inv(H_fwd)
+                                cl_sub = np.array(_cl_px[::15], dtype=np.float32).reshape(-1, 1, 2)
+                                cl_mm  = cv2.perspectiveTransform(cl_sub, H_inv).reshape(-1, 2)
+                                _cl_int = np.round(cl_mm).astype(int)
+                                _overlay_pts = n_use
+                            else:
+                                _cl_int = None
+                                _overlay_pts = 0
+                        except Exception:
+                            _cl_int = None
                             _overlay_pts = 0
-                    except Exception:
-                        _overlay_pts = 0
+                        st.session_state["_track_overlay_cache"] = {
+                            "key": _overlay_cache_key,
+                            "cl_int": _cl_int,
+                            "n_pts": _overlay_pts,
+                        }
+                    if _cl_int is not None and _overlay_pts > 0:
+                        vis_overlay = vis_c.copy()
+                        for i in range(len(_cl_int) - 1):
+                            p1 = (int(_cl_int[i, 0]),   int(_cl_int[i, 1]))
+                            p2 = (int(_cl_int[i+1, 0]), int(_cl_int[i+1, 1]))
+                            if (0 <= p1[0] < cw and 0 <= p1[1] < ch and
+                                    0 <= p2[0] < cw and 0 <= p2[1] < ch):
+                                cv2.line(vis_overlay, p1, p2, (0, 220, 100), 1)
+                        vis_c = cv2.addWeighted(vis_c, 0.70, vis_overlay, 0.30, 0)
                 else:
                     _overlay_pts = 0
 

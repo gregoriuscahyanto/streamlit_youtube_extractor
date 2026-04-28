@@ -283,7 +283,7 @@ def render(ns):
             st.warning(f"Plots konnten nicht erstellt werden: {e}")
         st.download_button("Debug ZIP herunterladen", data=_audio_make_debug_zip(res, shown_lines=st.session_state.get('aud_lines_new', [])), file_name=f"audio_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", width="stretch", key="aud_debug_zip_new")
         save_mat_disabled = not bool(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or st.session_state.get("audio_last_mat_path"))
-        if st.button("Audioanalyse in ausgewählte MAT speichern", type="primary", width="stretch", key="aud_save_to_mat", disabled=save_mat_disabled):
+        if st.button("Audioanalyse in MAT + JSON speichern", type="primary", width="stretch", key="aud_save_to_mat", disabled=save_mat_disabled):
             with st.spinner("Audioanalyse wird in MAT gespeichert ..."):
                 ok_aud_save, msg_aud_save = _save_audio_result_to_selected_mat(res)
             if ok_aud_save:

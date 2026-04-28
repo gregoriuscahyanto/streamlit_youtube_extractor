@@ -11,6 +11,12 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from pathlib import Path
+try:
+    import streamlit as st
+    _cache_data = st.cache_data
+except Exception:
+    def _cache_data(fn=None, **_kw):
+        return fn if fn is not None else (lambda f: f)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,6 +69,7 @@ def load_reference_track(path: str | Path) -> np.ndarray | None:
 # 8-Punkte-Vergleich via Homographie
 # ─────────────────────────────────────────────────────────────────────────────
 
+@_cache_data(show_spinner=False)
 def compare_minimap_to_reference(
     minimap_crop: np.ndarray,
     ref_img: np.ndarray,

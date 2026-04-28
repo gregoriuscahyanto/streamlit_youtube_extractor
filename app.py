@@ -3070,7 +3070,11 @@ def _summarize_record_result_hdf5(mat_path: str) -> dict:
         out["start_end_selected"] = has("recordresult/ocr/params/start_s") and has("recordresult/ocr/params/end_s")
         out["ocr_done"] = nonempty_path("recordresult/ocr/table", "recordresult/ocr/cleaned")
         out["ocr_complete"] = bool(out.get("ocr_done") and out.get("start_end_selected"))
-        out["audio_spectrogram_done"] = nonempty_path("recordresult/audio_rpm/processed", "recordresult/audio_rpm/params")
+        out["audio_spectrogram_done"] = nonempty_path(
+            "recordresult/audio_rpm/processed/t_s",  # new 1D field
+            "recordresult/audio_rpm/processed",
+            "recordresult/audio_rpm/params",
+        )
         out["validation_done"] = nonempty_path("recordresult/validation/results")
     except Exception:
         pass
@@ -3154,7 +3158,14 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
 
         ar_processed = _mat_obj_get(audio_rpm, "processed")
         ar_params = _mat_obj_get(audio_rpm, "params")
-        out["audio_spectrogram_done"] = bool(_mat_table_height(ar_processed) > 0 or _mat_is_nonempty(ar_params))
+        # Detect via t_s field (1D array in new format) or fallback to general non-empty checks
+        _ar_t_s = _mat_obj_get(ar_processed, "t_s") if ar_processed is not None else None
+        _ar_t_s_len = int(np.asarray(_ar_t_s, dtype=float).ravel().size) if _ar_t_s is not None else 0
+        out["audio_spectrogram_done"] = bool(
+            _ar_t_s_len > 0
+            or _mat_table_height(ar_processed) > 0
+            or _mat_is_nonempty(ar_params)
+        )
 
         v_results = _mat_obj_get(validation, "results")
         out["validation_done"] = bool(_mat_is_nonempty(v_results))
@@ -4781,7 +4792,32 @@ def _matlab_field_name(name: str, fallback: str = "field") -> str:
         txt = fallback
     if txt[0].isdigit():
         txt = "x_" + txt
-    return txt[:63]
+    return txt[:31]  # MATLAB MAT-5 struct field names are limited to 31 chars
+
+
+def _sanitize_mat_dict_keys(obj):
+    """Recursively truncate all dict keys to ≤31 chars (MATLAB MAT-5 struct field limit).
+
+    Also handles collision: two keys that truncate to the same 31-char prefix get
+    a numeric suffix (_1, _2, …) on the second and later occurrences.
+    """
+    if isinstance(obj, dict):
+        seen: dict[str, int] = {}
+        result = {}
+        for k, v in obj.items():
+            base = str(k)[:31]
+            if base not in seen:
+                seen[base] = 0
+                safe_k = base
+            else:
+                seen[base] += 1
+                sfx = f"_{seen[base]}"
+                safe_k = base[: 31 - len(sfx)] + sfx
+            result[safe_k] = _sanitize_mat_dict_keys(v)
+        return result
+    if isinstance(obj, list):
+        return [_sanitize_mat_dict_keys(v) for v in obj]
+    return obj
 
 
 def _cellstr_column(values) -> np.ndarray:
@@ -4823,11 +4859,15 @@ def _build_audio_rpm_struct_from_result(res: dict) -> dict:
     t = t[:n]
     rpm = rpm[:n]
     fsel = fsel[:n] if len(fsel) else np.full(n, np.nan)
+
+    # freq_lines: 1D arrays (N,) matching MAT file convention
     freq_lines = {}
     for name, arr in (res.get("freq_lines") or {}).items():
         a = np.asarray(arr, dtype=float).reshape(-1)
         if a.size == n:
-            freq_lines[_matlab_field_name(name, "line")] = a.reshape((-1, 1))
+            freq_lines[_matlab_field_name(name, "line")] = a
+
+    # params: scalars as plain float, strings as str, complex types as JSON string
     params = {}
     base_params = dict(p)
     base_params.update({"source": res.get("source", ""), "selected_method": res.get("selected_method", "")})
@@ -4836,22 +4876,51 @@ def _build_audio_rpm_struct_from_result(res: dict) -> dict:
         if isinstance(v, (dict, list, tuple)):
             params[fn] = json.dumps(v, ensure_ascii=False, default=str)
         elif isinstance(v, (int, float, np.integer, np.floating)):
-            params[fn] = np.array([[float(v)]], dtype=float)
+            params[fn] = float(v)
         else:
             params[fn] = str(v)
     if ui:
-        params["ui"] = { _matlab_field_name(k): (json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list, tuple)) else v) for k, v in ui.items() }
+        params["ui"] = {
+            _matlab_field_name(k): (json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list, tuple)) else str(v))
+            for k, v in ui.items()
+        }
+
+    # candidate_table: column-oriented struct (each field = array of N values)
+    # Matches MATLAB table convention and the existing MAT file structure.
+    rows = list(res.get("candidate_table") or [])
+    if rows:
+        all_keys: list[str] = []
+        for r in rows:
+            for k in (r or {}).keys():
+                fn = _matlab_field_name(k)
+                if fn not in all_keys:
+                    all_keys.append(fn)
+        cand_tbl: dict = {}
+        for fn in all_keys:
+            raw_key = next((k for k in (rows[0] or {}).keys() if _matlab_field_name(k) == fn), fn)
+            vals = [(r or {}).get(raw_key, "") for r in rows]
+            if all(isinstance(v, (int, float, np.integer, np.floating)) for v in vals):
+                cand_tbl[fn] = np.array([float(v) for v in vals], dtype=float)
+            else:
+                cand_tbl[fn] = np.array([str(v) for v in vals], dtype=object)
+    else:
+        cand_tbl = {}
+
+    # debug_lines: single newline-joined string (matches MAT file convention)
+    dbg = res.get("debug_lines") or st.session_state.get("audio_debug_lines") or []
+    debug_lines_str = "\n".join(str(x) for x in dbg) if dbg else ""
+
     return {
         "params": params,
         "processed": {
-            "t_s": t.reshape((-1, 1)),
-            "rpm": rpm.reshape((-1, 1)),
-            "freq_hz": fsel.reshape((-1, 1)),
+            "t_s": t,        # 1D (N,) float64
+            "rpm": rpm,      # 1D (N,) float64
+            "freq_hz": fsel, # 1D (N,) float64
             "method": str(res.get("selected_method", "")),
         },
         "freq_lines": freq_lines,
-        "candidate_table": _struct_array_from_dicts(list(res.get("candidate_table") or [])),
-        "debug_lines": _cellstr_column(res.get("debug_lines") or st.session_state.get("audio_debug_lines") or []),
+        "candidate_table": cand_tbl,
+        "debug_lines": debug_lines_str,
         "created": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -4934,10 +5003,31 @@ def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
             meta = rr.get("metadata", {}) if isinstance(rr.get("metadata", {}), dict) else {}
             meta.setdefault("title", title_txt)
             rr["metadata"] = meta
-        rr["audio_rpm"] = _build_audio_rpm_struct_from_result(res)
+        audio_rpm_struct = _build_audio_rpm_struct_from_result(res)
+        rr["audio_rpm"] = audio_rpm_struct
         out_data = dict(extra)
         out_data["recordResult"] = rr
+        # Sanitize all nested dict keys to ≤31 chars before savemat (MATLAB MAT-5 limit)
+        out_data = _sanitize_mat_dict_keys(out_data)
         sio.savemat(tmp_out.name, out_data, do_compression=True)
+
+        # Build JSON payload for audio_rpm (serializable version of the struct)
+        def _to_json_serializable(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, dict):
+                return {k: _to_json_serializable(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_json_serializable(v) for v in obj]
+            return obj
+
+        audio_rpm_json = _to_json_serializable(audio_rpm_struct)
+        audio_rpm_json_bytes = json.dumps({"audio_rpm": audio_rpm_json}, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
         if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
             ok_up, msg_up = st.session_state.r2_client.upload_file(tmp_out.name, selected_key)
             if not ok_up:
@@ -4946,11 +5036,31 @@ def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
                 st.session_state.mat_summary_cache.pop(selected_key, None)
             except Exception:
                 pass
+            # Save JSON alongside MAT (same path, .json extension)
+            json_key = str(Path(selected_key).with_suffix(".json"))
+            tmp_json = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+            try:
+                tmp_json.write(audio_rpm_json_bytes)
+                tmp_json.close()
+                st.session_state.r2_client.upload_file(tmp_json.name, json_key)
+            except Exception:
+                pass
+            finally:
+                try:
+                    Path(tmp_json.name).unlink(missing_ok=True)
+                except Exception:
+                    pass
             note = f" ({load_note})" if load_note else ""
-            return True, f"Audioanalyse in MAT gespeichert: {selected_key}{note}"
+            return True, f"Audioanalyse in MAT + JSON gespeichert: {selected_key}{note}"
         shutil.copyfile(tmp_out.name, local_mat_path)
+        # Save JSON alongside local MAT
+        json_local_path = str(Path(local_mat_path).with_suffix(".json"))
+        try:
+            Path(json_local_path).write_bytes(audio_rpm_json_bytes)
+        except Exception:
+            pass
         note = f" ({load_note})" if load_note else ""
-        return True, f"Audioanalyse lokal gespeichert: {local_mat_path}{note}"
+        return True, f"Audioanalyse lokal gespeichert: {local_mat_path} + {Path(json_local_path).name}{note}"
     finally:
         for fp in (tmp_in.name, tmp_out.name):
             try:
@@ -4980,12 +5090,12 @@ st.markdown(
 
 # Main areas. Only one renderer is executed per Streamlit rerun; this keeps ROI
 # editing responsive even when Track/Audio/MAT pages contain expensive widgets.
+# Track Analysis is merged into ROI Setup so the full setup workflow runs in one tab.
 _tab_labels = [
     "Cloud Connection & Root",
     "Sync",
     "MAT Selection",
     "ROI Setup",
-    "Track Analysis",
     "Audio Auswertung",
 ]
 _active_tab = _render_main_navigation(_tab_labels)
@@ -4998,7 +5108,6 @@ elif _active_tab == "MAT Selection":
     mat_selection_tab.render(globals())
 elif _active_tab == "ROI Setup":
     roi_setup_tab.render(globals())
-elif _active_tab == "Track Analysis":
     track_analysis_tab.render(globals())
 elif _active_tab == "Audio Auswertung":
     audio_tab.render(globals())
