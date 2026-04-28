@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+  "logs",
+  "r2_mount",
+  "results",
+  "captures",
+  "reference_track_siesmann",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+norecursedirs = [".git", ".venv", ".pytest_cache", "__pycache__", "logs", "r2_mount", "captures", "results"]
