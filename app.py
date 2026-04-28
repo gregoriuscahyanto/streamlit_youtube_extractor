@@ -2909,6 +2909,23 @@ def _summarize_record_result_hdf5(mat_path: str) -> dict:
                 if hasattr(obj, "shape"):
                     shapes[lname] = tuple(int(v) for v in obj.shape)
             f.visititems(visitor)
+
+            # v7.3 MAT files store recordResult.metadata as HDF5 groups/datasets.
+            # Read title explicitly so the Audio tab can show the original video
+            # title above the analysis controls.
+            meta = _h5_get_path_ci(f, ["recordResult", "metadata"])
+            if meta is not None:
+                for mk in ("title", "video_title", "youtube_title", "vehicle_title", "name"):
+                    obj = _h5_get_path_ci(meta, [mk])
+                    if obj is None:
+                        continue
+                    vals = _h5_to_text_list(obj)
+                    txt = str(vals[0]).strip() if vals else _mat_to_text(_h5_decode_value(obj), "").strip()
+                    if txt:
+                        out[mk] = txt
+                        if mk == "title":
+                            out["metadata_title"] = txt
+                        break
         joined = "\n".join(paths)
         def has(*needles):
             return any(n.lower() in joined for n in needles)
@@ -2949,7 +2966,7 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
         # Relevante Anzeige-Metadaten fuer den Audio-Tab mitnehmen.
         # Je nach Erzeuger heisst der YouTube-/Video-Titel unterschiedlich.
         if meta is not None:
-            for mk in ("video_title", "title", "vehicle_title", "name", "youtube_title"):
+            for mk in ("title", "video_title", "vehicle_title", "name", "youtube_title"):
                 try:
                     mv = _mat_scalar(_mat_obj_get(meta, mk))
                     if mv is not None and str(mv).strip():
@@ -4092,7 +4109,7 @@ def _audio_get_vehicle_title() -> str:
     if isinstance(obj, dict):
         dataset = str(obj.get("capture_folder") or obj.get("mat_file") or "").strip()
         video_title = ""
-        for k in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
+        for k in ("metadata_title", "title", "video_title", "youtube_title", "vehicle_title", "name"):
             txt = str(obj.get(k, "") or "").strip()
             if txt and txt not in parts:
                 video_title = txt
@@ -4321,6 +4338,217 @@ def _audio_live_widget(job_id: str, height: int = 330):
     """
     components.html(html, height=height)
 
+
+
+def _audio_live_snapshot(job_id: str = "") -> tuple[dict, list[str], str]:
+    """Read live audio status from Python/shared state for fragment updates."""
+    job_id = str(job_id or st.session_state.get("audio_bg_live_id", "") or "")
+    progress = dict(st.session_state.get("audio_bg_progress") or {})
+    lines = [str(x) for x in (st.session_state.get("audio_debug_lines") or [])]
+    status = "idle"
+    fut = st.session_state.get("audio_bg_future")
+    if fut is not None:
+        status = "done" if fut.done() else "running"
+
+    live_ref = st.session_state.get("audio_bg_log_ref")
+    if isinstance(live_ref, list) and live_ref:
+        lines = [str(x) for x in live_ref[-300:]]
+        st.session_state.audio_debug_lines = list(lines[-200:])
+    prog_ref = st.session_state.get("audio_bg_progress_ref")
+    if isinstance(prog_ref, dict) and prog_ref:
+        progress = dict(prog_ref)
+        st.session_state.audio_bg_progress = dict(progress)
+
+    if job_id:
+        try:
+            live = _audio_live_server()
+            with live["lock"]:
+                job = dict((live["state"].get("jobs") or {}).get(job_id) or {})
+            if job:
+                jlines = [str(x) for x in (job.get("log") or [])]
+                if jlines:
+                    lines = jlines[-300:]
+                    st.session_state.audio_debug_lines = list(lines[-200:])
+                jprog = job.get("progress") or {}
+                if isinstance(jprog, dict) and jprog:
+                    progress = dict(jprog)
+                    st.session_state.audio_bg_progress = dict(progress)
+                status = str(job.get("status") or status)
+        except Exception:
+            pass
+
+    if fut is not None and not fut.done() and not progress:
+        progress = {"done": 0, "total": 1, "fraction": 0.0, "text": "Hintergrundjob gestartet ..."}
+    return progress, lines, status
+
+
+def _audio_collect_finished_future(show_messages: bool = False) -> bool:
+    """Move a finished background result into session_state without st.rerun()."""
+    fut = st.session_state.get("audio_bg_future")
+    if fut is None or not fut.done():
+        return False
+    try:
+        res_bg = fut.result()
+        st.session_state.audio_analysis_result = res_bg
+        live_done = st.session_state.get("audio_bg_log_ref")
+        if isinstance(live_done, list) and live_done:
+            st.session_state.audio_debug_lines = list(live_done[-200:])
+        else:
+            st.session_state.audio_debug_lines = list(res_bg.get("debug_lines", []))[-200:]
+        live_prog_done = st.session_state.get("audio_bg_progress_ref")
+        if isinstance(live_prog_done, dict) and live_prog_done:
+            st.session_state.audio_bg_progress = dict(live_prog_done)
+        st.session_state.audio_bg_log_ref = None
+        st.session_state.audio_bg_progress_ref = None
+        _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.get("audio_bg_progress") or {}, status="done")
+        set_status("Audioanalyse abgeschlossen.", "ok")
+        if show_messages:
+            st.success("Audioanalyse abgeschlossen.")
+    except Exception as e:
+        st.session_state.audio_analysis_result = None
+        live_err = st.session_state.get("audio_bg_log_ref")
+        base_err = list(live_err[-190:]) if isinstance(live_err, list) else list(st.session_state.get("audio_debug_lines", []) or [])[-190:]
+        st.session_state.audio_debug_lines = [*base_err, f"FEHLER: {e}"]
+        st.session_state.audio_bg_log_ref = None
+        st.session_state.audio_bg_progress_ref = None
+        st.session_state.audio_bg_progress = {"done": 0, "total": 1, "fraction": 0.0, "text": f"Fehler: {e}"}
+        _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.audio_bg_progress, log_line=f"FEHLER: {e}", status="error")
+        set_status(f"Audioanalyse fehlgeschlagen: {e}", "warn")
+        if show_messages:
+            st.error(f"Audioanalyse fehlgeschlagen: {e}")
+    finally:
+        st.session_state.audio_bg_future = None
+        try:
+            ex_done = st.session_state.get("audio_bg_executor")
+            if ex_done is not None:
+                ex_done.shutdown(wait=False, cancel_futures=True)
+            st.session_state.audio_bg_executor = None
+        except Exception:
+            pass
+    return True
+
+
+def _render_audio_start_feedback(message: str = "Audioanalyse wird gestartet ..."):
+    """Small non-blocking visual feedback after pressing the audio button."""
+    safe = str(message or "Audioanalyse wird gestartet ...").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    st.markdown(
+        f"""
+        <style>
+        .audio-start-feedback {{
+            position: fixed;
+            right: 22px;
+            bottom: 22px;
+            z-index: 9998;
+            pointer-events: none;
+            background: rgba(13, 30, 46, 0.96);
+            border: 1px solid #4a90a4;
+            color: #e8f7ff;
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 800;
+            box-shadow: 0 10px 28px rgba(0,0,0,.35);
+        }}
+        .audio-start-feedback::before {{
+            content: '';
+            display: inline-block;
+            width: 9px;
+            height: 9px;
+            margin-right: 9px;
+            border-radius: 999px;
+            background: #4a90a4;
+            box-shadow: 0 0 10px rgba(74,144,164,.75);
+            animation: audioPulse 1s infinite ease-in-out;
+        }}
+        @keyframes audioPulse {{
+            0%, 100% {{ opacity: .35; transform: scale(.85); }}
+            50% {{ opacity: 1; transform: scale(1.15); }}
+        }}
+        </style>
+        <div class="audio-start-feedback">{safe}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_audio_live_native(job_id: str = ""):
+    progress, lines, status = _audio_live_snapshot(job_id)
+    done = int(progress.get("done", 0) or 0)
+    total = max(1, int(progress.get("total", 1) or 1))
+    frac = max(0.0, min(1.0, float(progress.get("fraction", done / total) or 0.0)))
+    txt = str(progress.get("text", "") or "")
+    if status == "done":
+        label = f"Fertig: {done}/{total} Jobs ({frac*100:.0f}%)"
+    elif status == "error":
+        label = f"Fehler: {txt}" if txt else "Fehler"
+    elif st.session_state.get("audio_bg_future") is not None:
+        label = f"Audioanalyse: {done}/{total} Jobs ({frac*100:.0f}%)"
+    else:
+        label = "Keine Audioanalyse aktiv"
+    if txt and status != "error" and not label.endswith(txt):
+        label += f" - {txt}"
+    st.progress(frac, text=label)
+
+    shown = [str(x) for x in (lines[-160:] if lines else ["Noch kein Audio-Debug vorhanden."])]
+    log_rows = []
+    for ln in shown:
+        safe = ln.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        log_rows.append(f'<div class="audio-live-log-line">{safe}</div>')
+    st.markdown(f"""
+        <style>
+        .audio-live-log-box {{
+            height: 260px; min-height: 260px; max-height: 260px;
+            overflow-y: auto; overflow-x: auto;
+            background: #191c24; border: 1px solid #243049; border-radius: 6px;
+            padding: 8px 10px; margin-top: 8px;
+        }}
+        .audio-live-log-line {{
+            white-space: pre; color: #f4f7ff;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px; line-height: 1.28; min-height: 13px;
+        }}
+        </style>
+        <div class="audio-live-log-box">{''.join(log_rows)}</div>
+        """, unsafe_allow_html=True)
+    if status == "running":
+        elapsed = time.perf_counter() - float(st.session_state.get("audio_bg_started", time.perf_counter()) or time.perf_counter())
+        st.caption(f"Live seit {elapsed:.1f}s · aktualisiert nur diesen Bereich, ohne kompletten App-Rerun.")
+
+
+def _render_audio_result_plots(res: dict, key_suffix: str = ""):
+    if not (isinstance(res, dict) and res.get("t") is not None):
+        return
+    p = res.get('params', {})
+    zyl_txt = "EV" if p.get('cyl') == 0 else p.get('cyl')
+    st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} · Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz · NFFT: {p.get('nfft')} · Overlap: {p.get('overlap_pct')}%")
+    if res.get('candidate_table'):
+        with st.expander("Kandidatenbewertung", expanded=False):
+            st.dataframe(pd.DataFrame(res['candidate_table']), width="stretch", hide_index=True)
+    try:
+        import plotly.graph_objects as go
+        t = np.asarray(res['t'], dtype=float)
+        f = np.asarray(res['freqs'], dtype=float)
+        db = np.asarray(res['db'], dtype=float)
+        step_t = max(1, int(np.ceil(db.shape[1] / 1800))) if db.ndim == 2 else 1
+        step_f = max(1, int(np.ceil(db.shape[0] / 900))) if db.ndim == 2 else 1
+        fig = go.Figure(data=go.Heatmap(x=t[::step_t], y=f[::step_f], z=db[::step_f, ::step_t], colorscale="Viridis", colorbar=dict(title="dB")))
+        line_keys = list((res.get('freq_lines') or {}).keys())
+        default_line = [res.get('selected_method', 'Auto robust')] if res.get('selected_method', 'Auto robust') in line_keys else (line_keys[:1] if line_keys else [])
+        show = st.multiselect("Frequenzlinien im Spektrogramm anzeigen", line_keys, default=default_line, key=f"aud_lines_new{key_suffix}")
+        for nm in show:
+            a = np.asarray(res.get('freq_lines', {}).get(nm, []), dtype=float)
+            if a.size == t.size:
+                fig.add_trace(go.Scatter(x=t, y=a, mode="lines", name=nm, line=dict(width=2)))
+        fig.update_layout(title="Spektrogramm f [Hz] über t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
+        st.plotly_chart(fig, width="stretch")
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=t, y=np.asarray(res['rpm'], dtype=float), mode="lines", name="RPM"))
+        fig2.update_layout(title="RPM", xaxis_title="t [s]", yaxis_title="1/min", height=330, template="plotly_dark")
+        st.plotly_chart(fig2, width="stretch")
+    except Exception as e:
+        st.warning(f"Plots konnten nicht erstellt werden: {e}")
+    st.download_button("Debug ZIP herunterladen", data=_audio_make_debug_zip(res, shown_lines=st.session_state.get(f'aud_lines_new{key_suffix}', [])), file_name=f"audio_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", width="stretch", key=f"aud_debug_zip_new{key_suffix}")
 
 def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_progress=None, live_job_id=None):
     log = []
@@ -5327,91 +5555,49 @@ with tab_audio:
     if isinstance(_live_progress_ref, dict) and _live_progress_ref:
         st.session_state.audio_bg_progress = dict(_live_progress_ref)
 
-    main_progress_box = st.empty()
-    main_prog_state = st.session_state.get("audio_bg_progress") or {}
-    if isinstance(main_prog_state, dict) and (main_prog_state or st.session_state.get("audio_bg_future") is not None):
-        done = int(main_prog_state.get("done", 0) or 0)
-        total = max(1, int(main_prog_state.get("total", 1) or 1))
-        frac = max(0.0, min(1.0, float(main_prog_state.get("fraction", done / total) or 0.0)))
-        txt = str(main_prog_state.get("text", "") or "")
-        label = f"Audioanalyse: {done}/{total} Jobs ({frac*100:.0f}%)"
-        if txt:
-            label += f" - {txt}"
-        main_progress_box.progress(frac, text=label)
-
     show_live_debug = st.checkbox("Live-Debug während Audioanalyse anzeigen", value=True, key="aud_show_live_debug")
 
     with st.expander("Live-Debug Audioanalyse", expanded=show_live_debug):
-        st.caption("Zeigt Quelle, Segment, STFT-Größe, Kandidatenfortschritt, Laufzeit pro Job und finale Auswahl. Die letzten Zeilen bleiben nach der Analyse sichtbar.")
-        dbg_progress_box = st.empty()
-        dbg_box = st.empty()
-        old_dbg = st.session_state.get("audio_debug_lines", []) or []
-        if old_dbg:
-            dbg_box.code("\n".join([str(x) for x in old_dbg[-40:]]), language="text")
-        else:
-            dbg_box.code("Noch kein Audio-Debug vorhanden.", language="text")
-        prog_state = st.session_state.get("audio_bg_progress") or {}
-        if isinstance(prog_state, dict) and prog_state:
-            done = int(prog_state.get("done", 0) or 0)
-            total = max(1, int(prog_state.get("total", 1) or 1))
-            frac = max(0.0, min(1.0, float(prog_state.get("fraction", done / total) or 0.0)))
-            txt = str(prog_state.get("text", "") or "")
-            label = f"Audioanalyse: {done}/{total} Jobs ({frac*100:.0f}%)"
-            if txt:
-                label += f" - {txt}"
-            dbg_progress_box.progress(frac, text=label)
-        elif st.session_state.get("audio_bg_future") is not None:
-            dbg_progress_box.progress(0.0, text="Audioanalyse laeuft ...")
+        st.caption("Zeigt Quelle, Segment, STFT-Größe, Kandidatenfortschritt, Laufzeit pro Job und finale Auswahl. Dieser Bereich aktualisiert sich live ohne kompletten App-Rerun.")
 
-    # Hintergrundlauf: Der Future bleibt in st.session_state erhalten. Ein Tab-Wechsel
-    # triggert nur einen Streamlit-Rerun, bricht aber den Thread nicht mehr ab.
-    fut = st.session_state.get("audio_bg_future")
-    if fut is not None:
-        if fut.done():
-            try:
-                res_bg = fut.result()
-                st.session_state.audio_analysis_result = res_bg
-                live_done = st.session_state.get("audio_bg_log_ref")
-                if isinstance(live_done, list) and live_done:
-                    st.session_state.audio_debug_lines = list(live_done[-200:])
-                else:
-                    st.session_state.audio_debug_lines = list(res_bg.get("debug_lines", []))[-200:]
-                st.session_state.audio_bg_log_ref = None
-                live_prog_done = st.session_state.get("audio_bg_progress_ref")
-                if isinstance(live_prog_done, dict) and live_prog_done:
-                    st.session_state.audio_bg_progress = dict(live_prog_done)
-                st.session_state.audio_bg_progress_ref = None
-                _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.get("audio_bg_progress") or {}, status="done")
-                set_status("Audioanalyse abgeschlossen.", "ok")
-                st.success("Audioanalyse abgeschlossen.")
-            except Exception as e:
-                st.session_state.audio_analysis_result = None
-                live_err = st.session_state.get("audio_bg_log_ref")
-                base_err = list(live_err[-190:]) if isinstance(live_err, list) else list(st.session_state.get("audio_debug_lines", []) or [])[-190:]
-                st.session_state.audio_debug_lines = [*base_err, f"FEHLER: {e}"]
-                st.session_state.audio_bg_log_ref = None
-                st.session_state.audio_bg_progress_ref = None
-                st.session_state.audio_bg_progress = {"done": 0, "total": 1, "fraction": 0.0, "text": f"Fehler: {e}"}
-                _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.audio_bg_progress, log_line=f"FEHLER: {e}", status="error")
-                st.error(f"Audioanalyse fehlgeschlagen: {e}")
-                set_status(f"Audioanalyse fehlgeschlagen: {e}", "warn")
-            finally:
-                st.session_state.audio_bg_future = None
+        def _audio_live_and_result_panel():
+            _audio_collect_finished_future(show_messages=False)
+            _render_audio_live_native(str(st.session_state.get("audio_bg_live_id", "") or ""))
+            res_live = st.session_state.get("audio_analysis_result")
+            if isinstance(res_live, dict) and res_live.get("t") is not None and st.session_state.get("audio_bg_future") is None:
+                st.markdown("---")
+                st.subheader("Audioanalyse Ergebnis")
+                _render_audio_result_plots(res_live, key_suffix="_live")
+
+        if hasattr(st, "fragment"):
+            @st.fragment(run_every=1.0)
+            def _audio_live_fragment():
+                _audio_live_and_result_panel()
+            _audio_live_fragment()
         else:
-            live_run = st.session_state.get("audio_bg_log_ref")
-            if isinstance(live_run, list) and live_run:
-                st.session_state.audio_debug_lines = list(live_run[-200:])
-            live_prog_run = st.session_state.get("audio_bg_progress_ref")
-            if isinstance(live_prog_run, dict) and live_prog_run:
-                st.session_state.audio_bg_progress = dict(live_prog_run)
-            elapsed = time.perf_counter() - float(st.session_state.get("audio_bg_started", time.perf_counter()) or time.perf_counter())
-            st.info(f"Audioanalyse laeuft im Hintergrund seit {elapsed:.1f}s. Status, Progressbar und Live-Debug aktualisieren sich unten ohne Seiten-Refresh.")
-            _audio_live_widget(str(st.session_state.get("audio_bg_live_id", "")))
+            _audio_collect_finished_future(show_messages=True)
+            _render_audio_live_native(str(st.session_state.get("audio_bg_live_id", "") or ""))
+
+    # Auch ausserhalb des Fragments pruefen, falls durch eine Nutzerinteraktion
+    # bereits ein abgeschlossener Future vorliegt. Kein st.rerun(): Ergebnis wird
+    # direkt in session_state uebernommen.
+    _audio_collect_finished_future(show_messages=True)
 
     running_bg = st.session_state.get("audio_bg_future") is not None
+    start_feedback_slot = st.empty()
+    if running_bg:
+        start_feedback_slot.info("Audioanalyse läuft bereits. Live-Debug steht oben im Expander.")
     if st.button("Audioanalyse starten", type="primary", width="stretch", key="aud_run_new", disabled=running_bg):
-        ok,msg,fs,y,source=_audio_load_current_capture()
+        start_feedback_slot.info("Audioanalyse wird gestartet ... Audioquelle wird geladen.")
+        _render_audio_start_feedback("Audioanalyse wird gestartet ...")
+        try:
+            st.toast("Audioanalyse wird gestartet ...", icon="⏳")
+        except Exception:
+            pass
+        with st.spinner("Audioquelle laden und Hintergrundjob starten ..."):
+            ok,msg,fs,y,source=_audio_load_current_capture()
         if not ok:
+            start_feedback_slot.error(msg)
             st.error(msg); set_status(msg,"warn")
         else:
             params_bg = dict(
@@ -5447,34 +5633,34 @@ with tab_audio:
             st.session_state.audio_bg_params = params_bg
             st.session_state.audio_bg_source = source
             st.session_state.audio_bg_started = time.perf_counter()
-            st.session_state.audio_bg_future = _audio_executor().submit(_audio_background_worker, y, fs, source, params_bg, ui_bg, live_log, live_progress, live_job_id)
+            st.session_state.audio_analysis_result = None
+            # Wichtig: keinen gecachten Single-Worker-Executor wiederverwenden.
+            # Wenn ein alter Audio-Job im ThreadPool haengt, wuerde ein neuer Job nur
+            # in der Queue stehen und nie starten -> Live-Log bleibt bei 0/1 Jobs.
+            try:
+                old_ex = st.session_state.get("audio_bg_executor")
+                old_fut = st.session_state.get("audio_bg_future")
+                if old_ex is not None and (old_fut is None or old_fut.done()):
+                    old_ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"audio_rpm_{int(time.time())}")
+            st.session_state.audio_bg_executor = ex
+            live_log.append(f"[   0.00s] Parameter: Methode={aud_method}, STFT={aud_stft_mode}, Zyl={cyl_mode}/{aud_cyl}, Harm={harm_mode}/{aud_order}, NFFT={aud_nfft}, OV={aud_ov:g}%, fmax={aud_fmax:g} Hz")
+            live_progress.update({"text": "Worker wird gestartet ...", "updated": time.time()})
+            _audio_live_update(live_job_id, log_line=live_log[-1], progress=live_progress, status="running")
+            st.session_state.audio_bg_future = ex.submit(_audio_background_worker, y, fs, source, params_bg, ui_bg, live_log, live_progress, live_job_id)
             set_status("Audioanalyse im Hintergrund gestartet.", "info")
-            st.info("Audioanalyse wurde im Hintergrund gestartet. Tab-Wechsel bricht sie nicht mehr ab. Der Live-Status unten aktualisiert ohne Seiten-Refresh.")
-            _audio_live_widget(live_job_id)
+            start_feedback_slot.success("Audioanalyse gestartet. Live-Debug läuft oben im Expander weiter.")
+            _render_audio_start_feedback("Audioanalyse gestartet - Live-Debug oben aktiv")
+            st.info("Audioanalyse wurde im Hintergrund gestartet. Live-Status und Ergebnis erscheinen oben im Expander ohne kompletten App-Rerun.")
 
+    # Fallback/Normalanzeige nach manueller Interaktion oder auf Streamlit-Versionen
+    # ohne Fragment. Wenn das Ergebnis bereits im Live-Fragment angezeigt wird, bleibt
+    # diese Stelle leer, solange kein neuer kompletter Run passiert.
     res=st.session_state.get("audio_analysis_result")
-    if isinstance(res,dict) and res.get("t") is not None:
-        p=res.get('params',{})
-        zyl_txt = "EV" if p.get('cyl') == 0 else p.get('cyl')
-        st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} · Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz · NFFT: {p.get('nfft')} · Overlap: {p.get('overlap_pct')}%")
-        if res.get('candidate_table'):
-            with st.expander("Kandidatenbewertung", expanded=False):
-                st.dataframe(pd.DataFrame(res['candidate_table']), width="stretch", hide_index=True)
-        try:
-            import plotly.graph_objects as go
-            t=np.asarray(res['t'],dtype=float); f=np.asarray(res['freqs'],dtype=float); db=np.asarray(res['db'],dtype=float)
-            step_t=max(1,int(np.ceil(db.shape[1]/1800))) if db.ndim==2 else 1; step_f=max(1,int(np.ceil(db.shape[0]/900))) if db.ndim==2 else 1
-            fig=go.Figure(data=go.Heatmap(x=t[::step_t], y=f[::step_f], z=db[::step_f,::step_t], colorscale="Viridis", colorbar=dict(title="dB")))
-            show=st.multiselect("Frequenzlinien im Spektrogramm anzeigen", list((res.get('freq_lines') or {}).keys()), default=[res.get('selected_method','Auto robust')], key="aud_lines_new")
-            for nm in show:
-                a=np.asarray(res.get('freq_lines',{}).get(nm,[]),dtype=float)
-                if a.size==t.size: fig.add_trace(go.Scatter(x=t,y=a,mode="lines",name=nm,line=dict(width=2)))
-            fig.update_layout(title="Spektrogramm f [Hz] über t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
-            st.plotly_chart(fig, width="stretch")
-            fig2=go.Figure(); fig2.add_trace(go.Scatter(x=t,y=np.asarray(res['rpm'],dtype=float),mode="lines",name="RPM")); fig2.update_layout(title="RPM", xaxis_title="t [s]", yaxis_title="1/min", height=330, template="plotly_dark"); st.plotly_chart(fig2,width="stretch")
-        except Exception as e:
-            st.warning(f"Plots konnten nicht erstellt werden: {e}")
-        st.download_button("Debug ZIP herunterladen", data=_audio_make_debug_zip(res, shown_lines=st.session_state.get('aud_lines_new', [])), file_name=f"audio_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", width="stretch", key="aud_debug_zip_new")
+    if isinstance(res,dict) and res.get("t") is not None and not hasattr(st, "fragment"):
+        _render_audio_result_plots(res, key_suffix="")
 
 # ==============================
 # TAB ROI SETUP
