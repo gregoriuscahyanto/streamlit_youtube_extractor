@@ -5,7 +5,8 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('track_analysis.py'\\).read\\(\\)\\); print\\('track_analysis.py OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('app_tabs/track_analysis_tab.py'\\).read\\(\\)\\); print\\('track_analysis_tab.py OK'\\)\")",
       "Bash(python -c ' *)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

@@ -187,6 +187,11 @@ def _render_main_navigation(labels: list[str]) -> str:
     current = st.session_state.get(state_key)
     if current not in labels:
         current = labels[0]
+        st.session_state[state_key] = current
+    # If the widget session-state value is stale (e.g. "Track Analysis" no longer exists),
+    # clear it so the widget re-renders with the correct default instead of breaking.
+    if st.session_state.get(widget_key) not in labels:
+        st.session_state.pop(widget_key, None)
 
     selected = current
     try:
@@ -377,6 +382,7 @@ MAT_OVERVIEW_COLCFG = {
     "remote_key": st.column_config.TextColumn("remote_key", width="large"),
     "audio_video_vorhanden": st.column_config.TextColumn("Audio+Video vorhanden", width="small"),
     "kein_roi_vorhanden": st.column_config.TextColumn("Kein ROI", width="small"),
+    "video_fehlerhaft": st.column_config.TextColumn("Video fehlerhaft", width="small"),
     "roi_ausgewaehlt": st.column_config.TextColumn("ROI", width="small"),
     "track_ausgewaehlt": st.column_config.TextColumn("Track", width="small"),
     "anfang_ende_ausgewaehlt": st.column_config.TextColumn("Start/Ende", width="small"),
@@ -1678,6 +1684,45 @@ def _merge_recordresult_template(mat_struct: dict, template_fields: dict) -> dic
     return out
 
 
+def _stamp_video_faulty(mat_struct: dict, reason: str = "video fehlerhaft - neu herunterladen") -> dict:
+    """Mark a capture as having a faulty video that needs to be re-downloaded."""
+    out = dict(mat_struct or {})
+    rr = _mat_struct_to_plain(out.get("recordResult", {}))
+    if not isinstance(rr, dict):
+        rr = {"data": rr}
+    meta = rr.get("metadata", {}) if isinstance(rr.get("metadata", {}), dict) else {}
+    meta["video_faulty"] = True
+    meta["video_status"] = "video_fehlerhaft"
+    meta["video_note"] = str(reason or "video fehlerhaft - neu herunterladen")
+    meta["video_stamped_at"] = datetime.now().isoformat(timespec="seconds")
+    rr["metadata"] = meta
+
+    ocr = rr.get("ocr", {}) if isinstance(rr.get("ocr", {}), dict) else {}
+    params = ocr.get("params", {}) if isinstance(ocr.get("params", {}), dict) else {}
+    params["start_s"] = float(st.session_state.get("t_start", 0.0) or 0.0)
+    params["end_s"] = float(st.session_state.get("t_end", 0.0) or 0.0)
+    ocr["params"] = params
+    ocr["video_faulty"] = True
+    ocr["video_status"] = "video_fehlerhaft"
+    ocr["video_note"] = str(reason or "video fehlerhaft - neu herunterladen")
+    ocr["created"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        ocr["roi_table"] = _build_roi_table_for_matlab([])
+        ocr["roi_table_raw"] = _build_roi_table_for_matlab([])
+    except Exception:
+        ocr["roi_table"] = []
+        ocr["roi_table_raw"] = []
+    ocr["roi_catalog"] = {
+        "roiNames": _matlab_cellstr(ROI_NAMES),
+        "fmtOptions": _matlab_cellstr(FMT_OPTIONS),
+    }
+    rr["ocr"] = ocr
+    rr.pop("audio_rpm", None)
+    rr.pop("validation", None)
+    out["recordResult"] = rr
+    return out
+
+
 def _stamp_no_roi_available(mat_struct: dict, reason: str = "kein roi vorhanden") -> dict:
     """Mark a capture as intentionally not OCR/ROI-processable."""
     out = dict(mat_struct or {})
@@ -1718,7 +1763,7 @@ def _stamp_no_roi_available(mat_struct: dict, reason: str = "kein roi vorhanden"
     return out
 
 
-def _build_save_mat_struct(result, no_roi: bool = False):
+def _build_save_mat_struct(result, no_roi: bool = False, video_faulty: bool = False):
     mat_struct = build_mat_struct(result)
     template_path = _download_template_mat_for_save()
     try:
@@ -1726,6 +1771,8 @@ def _build_save_mat_struct(result, no_roi: bool = False):
         merged = _merge_recordresult_template(mat_struct, template_fields)
         if no_roi:
             merged = _stamp_no_roi_available(merged)
+        if video_faulty:
+            merged = _stamp_video_faulty(merged)
         return merged
     finally:
         try:
@@ -1764,10 +1811,10 @@ def _server_results_dir() -> Path:
     return (Path.cwd() / "results").resolve()
 
 
-def _save_result_json_and_mat(no_roi: bool = False) -> tuple[bool, str, dict]:
+def _save_result_json_and_mat(no_roi: bool = False, video_faulty: bool = False) -> tuple[bool, str, dict]:
     cf = st.session_state.capture_folder or Path(str(st.session_state.video_name or "output")).stem or "output"
     safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(cf)).strip("._") or "output"
-    if no_roi:
+    if no_roi or video_faulty:
         result = build_result_payload(
             t_start=st.session_state.t_start,
             t_end=st.session_state.t_end,
@@ -1786,7 +1833,7 @@ def _save_result_json_and_mat(no_roi: bool = False) -> tuple[bool, str, dict]:
         )
     else:
         result = build_result_json()
-    mat_struct_for_save = _build_save_mat_struct(result, no_roi=no_roi)
+    mat_struct_for_save = _build_save_mat_struct(result, no_roi=no_roi, video_faulty=video_faulty)
     json_payload = _mat_export_to_jsonable(mat_struct_for_save)
     json_bytes = json.dumps(json_payload, indent=2, ensure_ascii=False, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
     mat_name = f"results_{safe_cf}.mat"
@@ -1821,13 +1868,18 @@ def _save_result_json_and_mat(no_roi: bool = False) -> tuple[bool, str, dict]:
                 st.session_state.mat_summary_cache.pop(mat_key, None)
             except Exception:
                 pass
-            _invalidate_and_update_mat_selection_for_capture(str(cf), saved_mat_key, no_roi=no_roi)
+            _invalidate_and_update_mat_selection_for_capture(str(cf), saved_mat_key, no_roi=no_roi, video_faulty=video_faulty)
         else:
             saved_targets.append(f"R2 results fehlgeschlagen: JSON={msg_json or ok_json}, MAT={msg_mat or ok_mat}")
     else:
         saved_targets.append("R2 nicht verbunden: nicht gespeichert")
     payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=saved_targets, mat_key=saved_mat_key, local_dir=local_saved_dir)
-    msg_prefix = "Kein ROI vorhanden abgestempelt" if no_roi else "Gespeichert"
+    if video_faulty:
+        msg_prefix = "Video fehlerhaft abgestempelt"
+    elif no_roi:
+        msg_prefix = "Kein ROI vorhanden abgestempelt"
+    else:
+        msg_prefix = "Gespeichert"
     return True, f"{msg_prefix}: {json_name} + {mat_name}", payload
 
 
@@ -3065,6 +3117,8 @@ def _summarize_record_result_hdf5(mat_path: str) -> dict:
             return False
         no_roi_paths = [p for p in paths if ("no_roi_available" in p or "roi_status" in p)]
         out["no_roi_available"] = bool(no_roi_paths)
+        vf_paths = [p for p in paths if ("video_faulty" in p or "video_status" in p)]
+        out["video_faulty"] = bool(vf_paths)
         out["roi_selected"] = bool((not out.get("no_roi_available")) and nonempty_path("recordresult/ocr/roi_table", "roi_table"))
         out["track_selected"] = bool((not out.get("no_roi_available")) and nonempty_path("recordresult/ocr/trkcalslim/roi"))
         out["start_end_selected"] = has("recordresult/ocr/params/start_s") and has("recordresult/ocr/params/end_s")
@@ -3117,6 +3171,11 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
         roi_status_meta = _mat_to_text(_mat_obj_get(meta, "roi_status") if meta is not None else None, "")
         roi_status_ocr = _mat_to_text(_mat_obj_get(ocr, "roi_status") if ocr is not None else None, "")
         out["no_roi_available"] = bool(_mat_truthy(no_roi_meta) or _mat_truthy(no_roi_ocr) or "kein_roi" in roi_status_meta.lower() or "kein roi" in roi_status_meta.lower() or "no_roi" in roi_status_meta.lower() or "kein_roi" in roi_status_ocr.lower() or "kein roi" in roi_status_ocr.lower() or "no_roi" in roi_status_ocr.lower())
+        vf_meta = _mat_obj_get(meta, "video_faulty") if meta is not None else None
+        vf_ocr = _mat_obj_get(ocr, "video_faulty") if ocr is not None else None
+        vs_meta = _mat_to_text(_mat_obj_get(meta, "video_status") if meta is not None else None, "")
+        vs_ocr = _mat_to_text(_mat_obj_get(ocr, "video_status") if ocr is not None else None, "")
+        out["video_faulty"] = bool(_mat_truthy(vf_meta) or _mat_truthy(vf_ocr) or "video_fehlerhaft" in vs_meta.lower() or "video fehlerhaft" in vs_meta.lower() or "video_fehlerhaft" in vs_ocr.lower() or "video fehlerhaft" in vs_ocr.lower())
 
         params = _mat_obj_get(ocr, "params")
         start_s = _mat_to_float(_mat_obj_get(params, "start_s"))
@@ -3176,30 +3235,179 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
     return out
 
 
-def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
-    tmp.close()
-    ok, msg = client.download_file(remote_key, tmp.name)
-    if not ok:
-        return {"mat_file": Path(remote_key).name, "remote_key": remote_key, "error": f"Download: {msg}"}
+def _summary_from_json_sidecar(data: dict) -> tuple[dict, dict]:
+    """Extract record_summary and top-level key set from a JSON sidecar (fast path).
 
-    _mat_keys = set()
-    record_summary = {}
+    Returns (record_summary_dict, mat_keys_set) in the same shape that
+    _summarize_record_result_mat + sio.loadmat produce so the caller can
+    run the same merging logic regardless of which path was taken.
+    """
+    record_summary: dict = {}
+    mat_keys: set = set(data.keys())
+
+    rr = data.get("recordResult") or {}
+    if not isinstance(rr, dict):
+        return record_summary, mat_keys
+
+    meta = rr.get("metadata") or {}
+    ocr  = rr.get("ocr") or {}
+    arpm = rr.get("audio_rpm") or {}
+    vali = rr.get("validation") or {}
+
+    # metadata fields
+    for mk in ("video_title", "title", "vehicle_title", "name", "youtube_title"):
+        v = str(meta.get(mk) or "").strip()
+        if v:
+            record_summary[mk] = v
+            break
+    for path_key in ("video", "recordresult_video_path"):
+        v = meta.get(path_key) or rr.get("video")
+        if v and isinstance(v, str):
+            record_summary["recordresult_video_path"] = v
+            break
+    for path_key in ("audio", "recordresult_audio_path"):
+        v = meta.get(path_key) or rr.get("audio")
+        if v and isinstance(v, str):
+            record_summary["recordresult_audio_path"] = v
+            break
+
+    def _truthy_json(v) -> bool:
+        if v is None: return False
+        if isinstance(v, bool): return v
+        if isinstance(v, (int, float)): return bool(v)
+        s = str(v).lower().strip()
+        return s in {"1", "true", "yes", "ja", "y", "ok"}
+
+    # no_roi_available
+    nra = _truthy_json(meta.get("no_roi_available")) or _truthy_json(ocr.get("no_roi_available"))
+    rs_meta = str(meta.get("roi_status") or "").lower()
+    rs_ocr  = str(ocr.get("roi_status") or "").lower()
+    record_summary["no_roi_available"] = bool(nra or "kein_roi" in rs_meta or "kein_roi" in rs_ocr or "no_roi" in rs_meta or "no_roi" in rs_ocr)
+
+    # video_faulty
+    vf = _truthy_json(meta.get("video_faulty")) or _truthy_json(ocr.get("video_faulty"))
+    vs_meta = str(meta.get("video_status") or "").lower()
+    vs_ocr  = str(ocr.get("video_status") or "").lower()
+    record_summary["video_faulty"] = bool(vf or "video_fehlerhaft" in vs_meta or "video_fehlerhaft" in vs_ocr)
+
+    # start/end
+    ocr_params = ocr.get("params") or {}
+    try: start_s = float(ocr_params.get("start_s") or "nan")
+    except Exception: start_s = float("nan")
+    try: end_s = float(ocr_params.get("end_s") or "nan")
+    except Exception: end_s = float("nan")
+    record_summary["start_end_selected"] = bool(not (start_s != start_s) and not (end_s != end_s) and end_s > start_s)
+    if not (start_s != start_s): record_summary["t_start"] = start_s
+    if not (end_s != end_s):     record_summary["t_end"]   = end_s
+
+    # ROI table
+    roi_table = ocr.get("roi_table")
+    roi_rows = len(roi_table) if isinstance(roi_table, list) else 0
+    record_summary["roi_selected"] = bool((not record_summary["no_roi_available"]) and roi_rows > 0)
+    record_summary["roi_count"] = roi_rows
+
+    # Track calibration
+    trk = ocr.get("trkCalSlim") or {}
+    if isinstance(trk, dict):
+        ref_pts  = trk.get("ref_pts") or []
+        mini_pts = trk.get("minimap_pts") or []
+        record_summary["track_selected"] = bool(
+            (not record_summary["no_roi_available"])
+            and isinstance(ref_pts, list) and len(ref_pts) >= 8
+            and isinstance(mini_pts, list) and len(mini_pts) >= 8
+        )
+    else:
+        record_summary["track_selected"] = False
+
+    # OCR done/complete
+    raw  = ocr.get("table") or ocr.get("roi_table_raw")
+    clean = ocr.get("cleaned")
+    raw_rows   = len(raw)   if isinstance(raw,   list) else 0
+    clean_rows = len(clean) if isinstance(clean, list) else 0
+    record_summary["ocr_done"]      = bool(raw_rows > 0 or clean_rows > 0)
+    record_summary["ocr_row_count"] = int(max(raw_rows, clean_rows))
+    if record_summary["ocr_done"] and not (end_s != end_s):
+        t_vals = []
+        for row in (raw or []):
+            try: t_vals.append(float(row.get("time_s") or row.get("t_s") or "nan"))
+            except Exception: pass
+        record_summary["ocr_complete"] = bool(t_vals and max(t_vals) >= (end_s - 1.0))
+    else:
+        record_summary["ocr_complete"] = bool(record_summary["ocr_done"] and (end_s != end_s))
+
+    # audio_rpm
+    proc = arpm.get("processed") or {}
+    t_s  = proc.get("t_s") or []
+    record_summary["audio_spectrogram_done"] = bool(
+        (isinstance(t_s, list) and len(t_s) > 0)
+        or bool(arpm.get("params"))
+    )
+
+    # validation
+    record_summary["validation_done"] = bool(vali.get("results"))
+
+    return record_summary, mat_keys
+
+
+def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
+    # ── Fast path: try JSON sidecar first (much smaller than MAT) ────────────
+    json_key = str(Path(remote_key).with_suffix(".json"))
+    _mat_keys: set = set()
+    record_summary: dict = {}
+    summary: dict = {}
+    used_json = False
+
+    tmp_json = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+    tmp_json.close()
     try:
-        summary = summarize_mat_file(tmp.name)
-        record_summary = _summarize_record_result_mat(tmp.name)
-        try:
-            _mat_keys = set(sio.loadmat(tmp.name, squeeze_me=True, struct_as_record=False).keys())
-        except Exception:
-            _mat_keys = set()
-    except Exception as e:
-        summary = {"error": f"{e.__class__.__name__}: {e}"}
-        record_summary = _summarize_record_result_mat(tmp.name)
+        ok_j, _ = client.download_file(json_key, tmp_json.name)
+        if ok_j:
+            try:
+                json_data = json.loads(Path(tmp_json.name).read_text(encoding="utf-8", errors="ignore"))
+                record_summary, _mat_keys = _summary_from_json_sidecar(json_data)
+                summary = {
+                    "mat_file": Path(remote_key).name,
+                    "remote_key": remote_key,
+                    "error": "",
+                }
+                used_json = True
+            except Exception:
+                pass
     finally:
+        try: Path(tmp_json.name).unlink(missing_ok=True)
+        except Exception: pass
+
+    # ── Slow path: download and parse MAT file ────────────────────────────────
+    _mat_json_bytes_for_sidecar: bytes | None = None  # generated during slow path, uploaded later
+    if not used_json:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+        tmp.close()
+        ok, msg = client.download_file(remote_key, tmp.name)
+        if not ok:
+            return {"mat_file": Path(remote_key).name, "remote_key": remote_key, "error": f"Download: {msg}"}
         try:
-            Path(tmp.name).unlink(missing_ok=True)
-        except Exception:
-            pass
+            summary = summarize_mat_file(tmp.name)
+            record_summary = _summarize_record_result_mat(tmp.name)
+            try:
+                mat_data_raw = sio.loadmat(tmp.name, squeeze_me=True, struct_as_record=False)
+                _mat_keys = set(mat_data_raw.keys())
+                # Build JSON sidecar bytes while we have the MAT in memory
+                try:
+                    _json_payload = _mat_export_to_jsonable(mat_data_raw)
+                    _mat_json_bytes_for_sidecar = json.dumps(
+                        _json_payload, indent=2, ensure_ascii=False,
+                        default=lambda o: _mat_export_to_jsonable(o),
+                    ).encode("utf-8")
+                except Exception:
+                    _mat_json_bytes_for_sidecar = None
+            except Exception:
+                _mat_keys = set()
+        except Exception as e:
+            summary = {"error": f"{e.__class__.__name__}: {e}"}
+            record_summary = _summarize_record_result_mat(tmp.name)
+        finally:
+            try: Path(tmp.name).unlink(missing_ok=True)
+            except Exception: pass
 
     def _mat_has_any(keys):
         lk = {str(k).lower() for k in _mat_keys}
@@ -3209,6 +3417,7 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
         if v is not None:
             summary[k] = v
     summary["no_roi_available"] = bool(summary.get("no_roi_available") or _mat_has_any(["no_roi_available"]))
+    summary["video_faulty"] = bool(summary.get("video_faulty") or _mat_has_any(["video_faulty"]))
     if summary.get("no_roi_available"):
         summary["roi_selected"] = False
     elif "roi_selected" in record_summary:
@@ -3290,6 +3499,32 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
     else:
         summary["media_detail"] = ""
 
+    # Auto-convert MAT → JSON sidecar when OCR + video + audio are present.
+    # Condition: slow MAT path was used (not used_json), JSON bytes were generated,
+    # and the file has meaningful content worth caching for the fast path next time.
+    if (
+        not used_json
+        and _mat_json_bytes_for_sidecar is not None
+        and summary.get("ocr_done")
+        and summary.get("video_file_exists")
+        and summary.get("audio_file_exists")
+    ):
+        _sidecar_key = str(Path(remote_key).with_suffix(".json"))
+        _tmp_sj = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        try:
+            _tmp_sj.write(_mat_json_bytes_for_sidecar)
+            _tmp_sj.close()
+            try:
+                if hasattr(client, "upload_bytes"):
+                    client.upload_bytes(_mat_json_bytes_for_sidecar, _sidecar_key, content_type="application/json")
+                else:
+                    client.upload_file(_tmp_sj.name, _sidecar_key)
+            except Exception:
+                pass
+        finally:
+            try: Path(_tmp_sj.name).unlink(missing_ok=True)
+            except Exception: pass
+
     return summary
 
 
@@ -3301,6 +3536,7 @@ def _compute_folder_only_summary(folder: str, client, prefix: str) -> dict:
         "video_file_exists": False,
         "audio_file_exists": False,
         "no_roi_available": False,
+        "video_faulty": False,
         "roi_selected": False,
         "track_selected": False,
         "start_end_selected": False,
@@ -3397,6 +3633,7 @@ def _summary_to_overview_row(summary: dict, display_folder: str = "") -> dict:
             bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists"))
         ),
         "kein_roi_vorhanden": _jn(summary.get("no_roi_available")),
+        "video_fehlerhaft": _jn(summary.get("video_faulty")),
         "roi_ausgewaehlt": _jn(summary.get("roi_selected")),
         "track_ausgewaehlt": _jn(summary.get("track_selected")),
         "anfang_ende_ausgewaehlt": _jn(summary.get("start_end_selected")),
@@ -3421,6 +3658,7 @@ def _placeholder_overview_row(target) -> dict:
         "remote_key": mat_key,
         "audio_video_vorhanden": "...",
         "kein_roi_vorhanden": "...",
+        "video_fehlerhaft": "...",
         "roi_ausgewaehlt": "...",
         "track_ausgewaehlt": "...",
         "anfang_ende_ausgewaehlt": "...",
@@ -3519,6 +3757,7 @@ def _style_overview_dataframe(df: pd.DataFrame):
     status_cols = [
         "audio_video_vorhanden",
         "kein_roi_vorhanden",
+        "video_fehlerhaft",
         "roi_ausgewaehlt",
         "track_ausgewaehlt",
         "anfang_ende_ausgewaehlt",
@@ -3563,6 +3802,7 @@ def _normalize_overview_lamps(df: pd.DataFrame) -> pd.DataFrame:
     status_cols = [
         "audio_video_vorhanden",
         "kein_roi_vorhanden",
+        "video_fehlerhaft",
         "roi_ausgewaehlt",
         "track_ausgewaehlt",
         "anfang_ende_ausgewaehlt",
@@ -3588,6 +3828,7 @@ def _render_mat_selection_analysis(df: pd.DataFrame, title_suffix: str = "") -> 
     status_items = [
         ("Audio+Video", "audio_video_vorhanden"),
         ("Kein ROI", "kein_roi_vorhanden"),
+        ("Video fehlerhaft", "video_fehlerhaft"),
         ("ROI", "roi_ausgewaehlt"),
         ("Track", "track_ausgewaehlt"),
         ("Start/Ende", "anfang_ende_ausgewaehlt"),
@@ -3756,7 +3997,7 @@ def _capture_results_dir_key(capture_folder: str) -> str:
     return f"{pfx}/captures/{folder}" if pfx else f"captures/{folder}"
 
 
-def _build_current_roi_save_summary(capture_folder: str, mat_key: str, no_roi: bool = False) -> dict:
+def _build_current_roi_save_summary(capture_folder: str, mat_key: str, no_roi: bool = False, video_faulty: bool = False) -> dict:
     """Build an immediate MAT-selection summary from the current UI state.
 
     This avoids waiting for R2 overwrite consistency or a second MAT download right
@@ -3783,6 +4024,7 @@ def _build_current_roi_save_summary(capture_folder: str, mat_key: str, no_roi: b
         "remote_key": mat_key,
         "capture_folder": capture_folder,
         "no_roi_available": bool(no_roi),
+        "video_faulty": bool(video_faulty),
         "roi_selected": bool(has_roi),
         "roi_count": int(len(rois) if has_roi else 0),
         "track_selected": bool(has_track),
@@ -3792,7 +4034,7 @@ def _build_current_roi_save_summary(capture_folder: str, mat_key: str, no_roi: b
     }
 
 
-def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_key: str = "", no_roi: bool = False) -> None:
+def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_key: str = "", no_roi: bool = False, video_faulty: bool = False) -> None:
     """Refresh cached MAT-selection status for the saved capture without rescanning everything."""
     folder = str(capture_folder or "").strip("/\\")
     key = str(mat_key or "").strip("/")
@@ -3800,7 +4042,7 @@ def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_ke
         if key and isinstance(st.session_state.get("mat_summary_cache"), dict):
             st.session_state.mat_summary_cache.pop(key, None)
         if key and st.session_state.get("r2_client") is not None:
-            summary = _build_current_roi_save_summary(folder, key, no_roi=no_roi)
+            summary = _build_current_roi_save_summary(folder, key, no_roi=no_roi, video_faulty=video_faulty)
             cache = st.session_state.get("mat_summary_cache")
             if isinstance(cache, dict):
                 cache[key] = dict(summary)
@@ -3852,8 +4094,9 @@ def _find_next_roi_setup_target() -> dict | None:
             continue
         media_ok = _overview_status_is_green(row.get("audio_video_vorhanden"))
         no_roi_stamped = _overview_status_is_green(row.get("kein_roi_vorhanden"))
+        video_faulty_stamped = _overview_status_is_green(row.get("video_fehlerhaft"))
         roi_missing = not _overview_status_is_green(row.get("roi_ausgewaehlt"))
-        if media_ok and roi_missing and not no_roi_stamped:
+        if media_ok and roi_missing and not no_roi_stamped and not video_faulty_stamped:
             candidates.append({"idx": idx, "folder": folder, "remote_key": str(row.get("remote_key", "") or "")})
     if candidates:
         return candidates[0]
@@ -3865,7 +4108,7 @@ def _find_next_roi_setup_target() -> dict | None:
         key = str(t.get("mat_key", "") or "")
         try:
             summary = _get_mat_summary_from_r2(key) if key else _compute_folder_only_summary(folder, st.session_state.r2_client, st.session_state.r2_prefix.strip("/"))
-            if bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists")) and not bool(summary.get("roi_selected")) and not bool(summary.get("no_roi_available")):
+            if bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists")) and not bool(summary.get("roi_selected")) and not bool(summary.get("no_roi_available")) and not bool(summary.get("video_faulty")):
                 return {"idx": -1, "folder": folder, "remote_key": key}
         except Exception:
             continue
