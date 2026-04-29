@@ -352,96 +352,110 @@ def render(ns):
     st.divider()
     st.subheader("RPM Validierung")
 
-    def _validation_table_from_upload(uploaded):
-        if uploaded is None:
-            return pd.DataFrame()
-        name = str(getattr(uploaded, "name", "") or "").lower()
-        raw = uploaded.getvalue()
-        if name.endswith(".csv"):
-            return pd.read_csv(io.BytesIO(raw))
-        if name.endswith((".xlsx", ".xls")):
-            return pd.read_excel(io.BytesIO(raw))
-        if name.endswith(".mat"):
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
-            try:
-                tmp.write(raw)
-                tmp.close()
-                data = sio.loadmat(tmp.name, squeeze_me=True, struct_as_record=False, verify_compressed_data_integrity=False)
-                cols = {}
-                for key, value in data.items():
-                    if str(key).startswith("__"):
-                        continue
-                    try:
-                        arr = np.asarray(value, dtype=float).ravel()
-                    except Exception:
-                        continue
-                    if arr.size >= 2 and np.isfinite(arr).any():
-                        cols[str(key)] = arr
-                if not cols:
-                    return pd.DataFrame()
-                n = min(len(v) for v in cols.values())
-                return pd.DataFrame({k: np.asarray(v[:n], dtype=float) for k, v in cols.items()})
-            finally:
-                try:
-                    Path(tmp.name).unlink(missing_ok=True)
-                except Exception:
-                    pass
-        return pd.DataFrame()
-
     val_file = st.file_uploader(
-        "Referenzdatei laden",
+        "Referenzdatei laden (MAT, CSV, XLSX)",
         type=["mat", "csv", "xlsx", "xls"],
         key="aud_validation_file",
-        help="Laedt eine Referenz-Zeitreihe fuer den RPM-Abgleich.",
+        help="MAT-Dateien werden vollstaendig traversiert (auch verschachtelte Strukturen wie recordResult.audio_rpm.processed.t_s).",
     )
-    try:
-        val_df = _validation_table_from_upload(val_file)
-    except Exception as e:
-        val_df = pd.DataFrame()
-        st.warning(f"Referenzdatei konnte nicht gelesen werden: {e}")
+    val_df = pd.DataFrame()
+    if val_file is not None:
+        try:
+            from audio_validation import dataframe_from_upload
+            val_df = dataframe_from_upload(val_file.getvalue(), val_file.name)
+        except Exception as e:
+            st.warning(f"Referenzdatei konnte nicht gelesen werden: {e}")
 
     if not val_df.empty:
         numeric_cols = [c for c in val_df.columns if pd.api.types.is_numeric_dtype(val_df[c])]
         if len(numeric_cols) >= 2:
-            vc = st.columns(4)
-            time_col = vc[0].selectbox("Zeitspalte", numeric_cols, key="aud_val_time_col")
-            rpm_col = vc[1].selectbox("Parameter/RPM", numeric_cols, index=1 if len(numeric_cols) > 1 else 0, key="aud_val_rpm_col")
-            metric_mode = vc[2].selectbox("Genauigkeit", ["Absolutwert", "Prozentual"], key="aud_val_metric_mode")
-            time_shift = float(vc[3].number_input("Zeitverschiebung [s]", -60.0, 60.0, 0.0, step=0.05, key="aud_val_shift_s"))
+            vc = st.columns(5)
+            time_col    = vc[0].selectbox("Zeitspalte", numeric_cols, key="aud_val_time_col")
+            rpm_col     = vc[1].selectbox("Parameter/RPM", numeric_cols,
+                                          index=min(1, len(numeric_cols) - 1),
+                                          key="aud_val_rpm_col")
+            metric_mode = vc[2].selectbox("Genauigkeit", ["Absolutwert", "Prozentual"],
+                                          key="aud_val_metric_mode")
+            time_shift  = float(vc[3].number_input("Zeitversatz [s]", -3600.0, 3600.0, 0.0,
+                                                    step=0.01, key="aud_val_shift_s"))
+            shift_step  = float(vc[4].number_input("Suchschrittweite [s]", 0.001, 10.0, 0.05,
+                                                    step=0.001, format="%.3f",
+                                                    key="aud_val_shift_step",
+                                                    help="Zeitschritt fuer 'Find best match'"))
 
             res_now = st.session_state.get("audio_analysis_result") or {}
-            has_rpm = isinstance(res_now, dict) and res_now.get("t") is not None and res_now.get("rpm") is not None
+            has_rpm = (isinstance(res_now, dict)
+                       and res_now.get("t") is not None
+                       and res_now.get("rpm") is not None)
+
+            # Search range for Find best match — must be outside the button handler
+            # so the user can configure them before clicking.
+            bm_c = st.columns(2)
+            bm_min = float(bm_c[0].number_input("Suche von [s]", -3600.0, 0.0, -5.0,
+                                                 step=0.5, key="aud_val_bm_min"))
+            bm_max = float(bm_c[1].number_input("Suche bis [s]", 0.0, 3600.0, 5.0,
+                                                 step=0.5, key="aud_val_bm_max"))
+
             run_c1, run_c2 = st.columns(2)
-            if run_c1.button("Validierung berechnen", width="stretch", key="aud_val_calc", disabled=not has_rpm):
+            if run_c1.button("Validierung berechnen", width="stretch",
+                             key="aud_val_calc", disabled=not has_rpm):
                 st.session_state.audio_validation_result = _audio_validation_metrics(
                     res_now.get("t"), res_now.get("rpm"),
-                    val_df[time_col].to_numpy(), val_df[rpm_col].to_numpy(),
+                    val_df[time_col].dropna().to_numpy(),
+                    val_df[rpm_col].dropna().to_numpy(),
                     time_shift, metric_mode,
                 )
-            if run_c2.button("Find best match", width="stretch", key="aud_val_find_best", disabled=not has_rpm):
+
+            if run_c2.button("Find best match", width="stretch",
+                             key="aud_val_find_best", disabled=not has_rpm):
                 prog = st.progress(0.0, text="Best Match startet ...")
                 best, dbg = _audio_find_best_validation_shift(
                     res_now.get("t"), res_now.get("rpm"),
-                    val_df[time_col].to_numpy(), val_df[rpm_col].to_numpy(),
-                    metric_mode, -5.0, 5.0, 0.05,
+                    val_df[time_col].dropna().to_numpy(),
+                    val_df[rpm_col].dropna().to_numpy(),
+                    metric_mode, bm_min, bm_max, shift_step,
                     progress_cb=lambda frac, msg: prog.progress(float(frac), text=msg),
                 )
                 st.session_state.audio_validation_result = best
                 st.session_state.audio_validation_debug = dbg
                 prog.empty()
+
             if not has_rpm:
-                st.caption("Bitte zuerst eine Audioanalyse starten, damit eine RPM-Zeitreihe fuer die Validierung vorhanden ist.")
+                st.caption("Bitte zuerst eine Audioanalyse starten.")
 
             vr = st.session_state.get("audio_validation_result")
             if isinstance(vr, dict):
                 if vr.get("ok"):
-                    st.metric("Match Score", f"{vr.get('score', 0.0):.3f}", help=f"Modus: {vr.get('mode')}, Punkte: {vr.get('n')}")
-                    st.caption(f"MAE={vr.get('mae', 0.0):.2f} RPM · Median={vr.get('median_abs', 0.0):.2f} RPM · MAPE={vr.get('mape_pct', 0.0):.2f}% · Shift={vr.get('shift_s', 0.0):.3f}s")
+                    vc2 = st.columns(4)
+                    vc2[0].metric("MAE [RPM]",   f"{vr.get('mae', 0.0):.1f}")
+                    vc2[1].metric("RMSE [RPM]",  f"{vr.get('rmse', 0.0):.1f}")
+                    vc2[2].metric("MAPE [%]",    f"{vr.get('mape_pct', 0.0):.2f}")
+                    vc2[3].metric("Zeitversatz", f"{vr.get('shift_s', 0.0):+.3f}s")
+                    st.caption(
+                        f"Summe |Fehler|={vr.get('sum_abs_err', 0.0):.1f} RPM·n  ·  "
+                        f"Median={vr.get('median_abs', 0.0):.1f} RPM  ·  "
+                        f"n={vr.get('n', 0)}  ·  Modus={vr.get('mode', '')}"
+                    )
+                    # Validation plot: both curves + error panel
+                    from audio_validation import build_validation_figure
+                    _val_fig = build_validation_figure(
+                        res_now.get("t"),
+                        res_now.get("rpm"),
+                        val_df[time_col].dropna().to_numpy(),
+                        val_df[rpm_col].dropna().to_numpy(),
+                        shift_s=float(vr.get("shift_s", 0.0)),
+                        label_audio="RPM Analyse",
+                        label_ref=f"RPM Messung ({rpm_col})",
+                    )
+                    if _val_fig is not None:
+                        st.plotly_chart(_val_fig, use_container_width=True)
                 elif vr.get("error"):
-                    st.warning(str(vr.get("error")))
+                    st.warning(str(vr["error"]))
+
             if st.session_state.get("audio_validation_debug"):
                 with st.expander("Debug Logs Best Match", expanded=False):
-                    st.code("\n".join(str(x) for x in st.session_state.audio_validation_debug[-120:]), language="text")
+                    st.code("\n".join(str(x) for x in st.session_state.audio_validation_debug[-120:]),
+                            language="text")
         else:
             st.info("Die Referenzdatei braucht mindestens zwei numerische Spalten.")
     else:

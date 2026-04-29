@@ -5372,76 +5372,105 @@ def _build_audio_config_from_values(values: dict) -> dict:
     return cfg
 
 
-def _save_audio_config_to_selected_mat(config: dict) -> tuple[bool, str]:
-    selected_key = str(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
-    local_mat_path = str(st.session_state.get("audio_last_mat_path") or "").strip()
-    if not selected_key and not local_mat_path:
-        return False, "Keine MAT-Datei ausgewaehlt. Bitte zuerst MAT + Video laden."
-    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp_in.close()
-    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp_out.close()
+_SAVE_NEEDS_CONFIRM = "NEEDS_CONFIRM"
+
+
+def _r2_download_mat_bytes(selected_key: str) -> tuple[bytes, str]:
+    """Download MAT from R2 → bytes.  r2_client only accepts file paths, so a
+    temp file is required. Returns (raw_bytes, ""). Returns (b"", error) on failure.
+    """
+    if not st.session_state.get("r2_connected") or st.session_state.get("r2_client") is None:
+        return b"", "Cloud (R2) nicht verbunden."
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+    tmp.close()
     try:
-        if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
-            ok, msg = st.session_state.r2_client.download_file(selected_key, tmp_in.name)
-            if not ok:
-                return False, f"MAT-Download fehlgeschlagen: {msg}"
-        elif local_mat_path:
-            shutil.copyfile(local_mat_path, tmp_in.name)
-        else:
-            return False, "Keine Cloud-Verbindung und keine lokale MAT-Datei verfuegbar."
-
-        load_note = ""
-        try:
-            mat_data, load_note = _loadmat_audio_save_robust(tmp_in.name)
-            if mat_data is None:
-                raise ValueError(load_note or "MAT konnte nicht gelesen werden.")
-            rr = _mat_struct_to_plain(mat_data.get("recordResult", {}))
-            if not isinstance(rr, dict):
-                rr = {"data": rr}
-            extra = {k: v for k, v in mat_data.items() if not str(k).startswith("__") and k != "recordResult"}
-        except Exception as e:
-            base = _build_save_mat_struct(build_result_json())
-            rr = _mat_struct_to_plain(base.get("recordResult", {}))
-            if not isinstance(rr, dict):
-                rr = {}
-            extra = {}
-            load_note = f"MAT-Lesefallback genutzt: {e}"
-
-        rr["audio_config"] = dict(config or {})
-        out_data = dict(extra)
-        out_data["recordResult"] = rr
-        out_data = _sanitize_mat_dict_keys(out_data)
-        sio.savemat(tmp_out.name, out_data, do_compression=True)
-
-        json_bytes = json.dumps(_mat_export_to_jsonable(out_data), ensure_ascii=False, indent=2, default=str).encode("utf-8")
-
-        if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
-            ok_up, msg_up = st.session_state.r2_client.upload_file(tmp_out.name, selected_key)
-            if not ok_up:
-                return False, f"MAT-Upload fehlgeschlagen: {msg_up}"
-            json_key = str(Path(selected_key).with_suffix(".json"))
-            ok_json, msg_json = _upload_bytes_compat(st.session_state.r2_client, json_key, json_bytes, "application/json")
-            if not ok_json:
-                return False, f"Audio Config in MAT gespeichert, JSON-Upload fehlgeschlagen: {msg_json}"
-            try:
-                st.session_state.mat_summary_cache.pop(selected_key, None)
-            except Exception:
-                pass
-            _invalidate_and_update_mat_selection_for_capture(_current_capture_folder(), selected_key)
-            st.session_state.audio_config_last_saved_key = selected_key
-            note = f" ({load_note})" if load_note else ""
-            return True, f"Audio Config gespeichert: {selected_key}{note}"
-
-        shutil.copyfile(tmp_out.name, local_mat_path)
-        Path(str(Path(local_mat_path).with_suffix(".json"))).write_bytes(json_bytes)
-        st.session_state.audio_config_last_saved_key = local_mat_path
-        note = f" ({load_note})" if load_note else ""
-        return True, f"Audio Config lokal gespeichert: {local_mat_path}{note}"
+        ok, msg = st.session_state.r2_client.download_file(selected_key, tmp.name)
+        if not ok:
+            return b"", f"MAT-Download fehlgeschlagen: {msg}"
+        return Path(tmp.name).read_bytes(), ""
     finally:
-        for fp in (tmp_in.name, tmp_out.name):
-            try:
-                Path(fp).unlink(missing_ok=True)
-            except Exception:
-                pass
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _r2_upload_mat_json(selected_key: str, mat_bytes: bytes, json_bytes: bytes) -> tuple[bool, str]:
+    """Upload MAT + JSON sidecar to R2. Returns (ok, error_msg)."""
+    client = st.session_state.get("r2_client")
+    if not st.session_state.get("r2_connected") or client is None:
+        return False, "Cloud (R2) nicht verbunden. Speichern nur in R2 moeglich."
+    ok_mat, msg_mat = _upload_bytes_compat(client, selected_key, mat_bytes, "application/octet-stream")
+    if not ok_mat:
+        return False, f"MAT-Upload fehlgeschlagen: {msg_mat}"
+    json_key = str(Path(selected_key).with_suffix(".json"))
+    ok_json, msg_json = _upload_bytes_compat(client, json_key, json_bytes, "application/json")
+    if not ok_json:
+        return False, f"MAT gespeichert, JSON-Upload fehlgeschlagen: {msg_json}"
+    try:
+        st.session_state.mat_summary_cache.pop(selected_key, None)
+    except Exception:
+        pass
+    return True, ""
+
+
+def _save_field_to_r2_mat(
+    field_name: str,
+    new_value: object,
+    force: bool = False,
+    extra_rr_fields: dict | None = None,
+) -> tuple[bool, str]:
+    """Core helper: download → merge field → upload MAT+JSON to R2.
+
+    Returns (False, _SAVE_NEEDS_CONFIRM) when the field exists and force=False.
+    Returns (True, selected_key) on success.
+    Aborts with (False, error) when download fails to prevent silent data loss.
+    """
+    from save_helpers import build_merged_mat_json, rr_from_mat_bytes
+
+    selected_key = str(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
+    if not selected_key:
+        return False, "Keine MAT-Datei in R2 ausgewaehlt. Bitte zuerst in MAT Selection eine Datei laden."
+    if not st.session_state.get("r2_connected"):
+        return False, "Cloud (R2) nicht verbunden. Speichern ist nur in R2 moeglich."
+
+    existing_bytes, dl_err = _r2_download_mat_bytes(selected_key)
+    if dl_err:
+        return False, dl_err  # abort — don't silently overwrite with blank data
+
+    # Single parse: reused for both existence check and extra-field injection
+    existing_rr, _ = rr_from_mat_bytes(existing_bytes)
+    if not force and existing_rr.get(field_name) is not None:
+        return False, _SAVE_NEEDS_CONFIRM
+
+    # Merge caller-supplied extra fields (e.g. metadata.title) into existing_rr
+    # without overwriting values already present in the MAT.
+    merged_extra: dict | None = None
+    if extra_rr_fields:
+        merged_extra = {}
+        for k, v in extra_rr_fields.items():
+            if existing_rr.get(k) is None:
+                merged_extra[k] = v
+
+    mat_bytes, json_bytes = build_merged_mat_json(existing_bytes, field_name, new_value, merged_extra)
+    ok, msg = _r2_upload_mat_json(selected_key, mat_bytes, json_bytes)
+    if not ok:
+        return False, msg
+    return True, selected_key
+
+
+def _save_audio_config_to_selected_mat(config: dict, force: bool = False) -> tuple[bool, str]:
+    """Save audio_config into recordResult in R2 (MAT + JSON).
+
+    Returns (False, _SAVE_NEEDS_CONFIRM) when the field already exists and force=False.
+    """
+    ok, result = _save_field_to_r2_mat("audio_config", dict(config or {}), force)
+    if not ok:
+        return False, result
+    selected_key = result
+    _invalidate_and_update_mat_selection_for_capture(_current_capture_folder(), selected_key)
+    st.session_state.audio_config_last_saved_key = selected_key
+    return True, f"Audio Config in R2 gespeichert: {selected_key}"
 
 
 def _find_next_audio_config_target() -> dict | None:
@@ -5486,181 +5515,40 @@ def _load_next_audio_config_file() -> tuple[bool, str]:
     return True, folder
 
 
+from audio_validation import validation_metrics as _audio_validation_metrics_impl
+from audio_validation import find_best_shift as _audio_find_best_shift_impl
+
+
 def _audio_validation_metrics(t_audio, rpm_audio, t_ref, y_ref, shift_s: float, mode: str) -> dict:
-    ta = np.asarray(t_audio, dtype=float).ravel()
-    ra = np.asarray(rpm_audio, dtype=float).ravel()
-    tr = np.asarray(t_ref, dtype=float).ravel() + float(shift_s)
-    yr = np.asarray(y_ref, dtype=float).ravel()
-    if ta.size == 0 or ra.size == 0 or tr.size == 0 or yr.size == 0:
-        return {"ok": False, "error": "Leere Zeitreihe."}
-    n = min(ta.size, ra.size)
-    ta, ra = ta[:n], ra[:n]
-    m = np.isfinite(ta) & np.isfinite(ra)
-    ta, ra = ta[m], ra[m]
-    mr = np.isfinite(tr) & np.isfinite(yr)
-    tr, yr = tr[mr], yr[mr]
-    if ta.size < 2 or tr.size < 2:
-        return {"ok": False, "error": "Zu wenige gueltige Punkte."}
-    order = np.argsort(tr)
-    tr, yr = tr[order], yr[order]
-    lo, hi = max(float(np.min(ta)), float(np.min(tr))), min(float(np.max(ta)), float(np.max(tr)))
-    keep = (ta >= lo) & (ta <= hi)
-    if int(keep.sum()) < 2:
-        return {"ok": False, "error": "Keine ueberlappende Zeitspanne."}
-    ta2 = ta[keep]
-    ra2 = ra[keep]
-    yr_i = np.interp(ta2, tr, yr)
-    err = ra2 - yr_i
-    abs_err = np.abs(err)
-    denom = np.maximum(np.abs(yr_i), 1e-9)
-    pct = abs_err / denom * 100.0
-    use_pct = "Prozent" in str(mode)
-    score = float(np.nanmean(pct if use_pct else abs_err))
-    return {
-        "ok": True,
-        "shift_s": float(shift_s),
-        "mode": str(mode),
-        "score": score,
-        "mae": float(np.nanmean(abs_err)),
-        "median_abs": float(np.nanmedian(abs_err)),
-        "mape_pct": float(np.nanmean(pct)),
-        "n": int(ta2.size),
-    }
+    return _audio_validation_metrics_impl(t_audio, rpm_audio, t_ref, y_ref, shift_s, mode)
 
 
 def _audio_find_best_validation_shift(t_audio, rpm_audio, t_ref, y_ref, mode: str, min_s: float, max_s: float, step_s: float, progress_cb=None) -> tuple[dict, list[str]]:
-    step = max(0.001, abs(float(step_s)))
-    shifts = np.arange(float(min_s), float(max_s) + 0.5 * step, step)
-    best = None
-    log = []
-    total = max(1, int(shifts.size))
-    for i, sh in enumerate(shifts, 1):
-        cur = _audio_validation_metrics(t_audio, rpm_audio, t_ref, y_ref, float(sh), mode)
-        if cur.get("ok") and (best is None or cur["score"] < best["score"]):
-            best = cur
-        if i == 1 or i == total or i % max(1, total // 20) == 0:
-            msg = f"Shift {sh:.3f}s getestet ({i}/{total})"
-            log.append(msg)
-            if callable(progress_cb):
-                progress_cb(i / total, msg)
-    if best is None:
-        best = {"ok": False, "error": "Kein gueltiger Shift gefunden."}
-    log.append(f"Best match: shift={best.get('shift_s', float('nan')):.3f}s, score={best.get('score', float('nan')):.3f}")
-    return best, log
+    return _audio_find_best_shift_impl(t_audio, rpm_audio, t_ref, y_ref, mode, min_s, max_s, step_s, progress_cb)
 
 
-def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
+def _save_audio_result_to_selected_mat(res: dict, force: bool = False) -> tuple[bool, str]:
+    """Save audio_rpm into recordResult in R2 (MAT + JSON).
+
+    Returns (False, _SAVE_NEEDS_CONFIRM) when the field already exists and force=False.
+    """
     if not isinstance(res, dict) or res.get("t") is None:
         return False, "Keine Audioanalyse-Ergebnisse zum Speichern vorhanden."
-    selected_key = str(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
-    local_mat_path = str(st.session_state.get("audio_last_mat_path") or "").strip()
-    if not selected_key and not local_mat_path:
-        return False, "Keine MAT-Datei ausgewählt. Bitte zuerst MAT + Video laden."
-    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp_in.close()
-    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp_out.close()
-    try:
-        if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
-            ok, msg = st.session_state.r2_client.download_file(selected_key, tmp_in.name)
-            if not ok:
-                return False, f"MAT-Download fehlgeschlagen: {msg}"
-        elif local_mat_path:
-            shutil.copyfile(local_mat_path, tmp_in.name)
-        else:
-            return False, "Keine Cloud-Verbindung und keine lokale MAT-Datei verfügbar."
-        load_note = ""
-        try:
-            mat_data, load_note = _loadmat_audio_save_robust(tmp_in.name)
-            if mat_data is None:
-                raise ValueError(load_note or "MAT konnte nicht gelesen werden.")
-            rr = _mat_struct_to_plain(mat_data.get("recordResult", {}))
-            if not isinstance(rr, dict):
-                rr = {"data": rr}
-            extra = {k: v for k, v in mat_data.items() if not str(k).startswith("__") and k != "recordResult"}
-        except NotImplementedError:
-            base = _build_save_mat_struct(build_result_json())
-            rr = _mat_struct_to_plain(base.get("recordResult", {}))
-            if not isinstance(rr, dict):
-                rr = {}
-            extra = {}
-            load_note = "v7.3/HDF5-Fallback genutzt"
-        except Exception as e:
-            base = _build_save_mat_struct(build_result_json())
-            rr = _mat_struct_to_plain(base.get("recordResult", {}))
-            if not isinstance(rr, dict):
-                rr = {}
-            extra = {}
-            load_note = f"MAT-Lesefallback genutzt: {e}"
-        title_txt = _audio_title_from_summary(st.session_state.get("mat_selected_summary") or {})
-        if not title_txt:
-            title_txt = str(st.session_state.get("audio_vehicle_title", "") or "").strip()
-        if title_txt:
-            meta = rr.get("metadata", {}) if isinstance(rr.get("metadata", {}), dict) else {}
-            meta.setdefault("title", title_txt)
-            rr["metadata"] = meta
-        audio_rpm_struct = _build_audio_rpm_struct_from_result(res)
-        rr["audio_rpm"] = audio_rpm_struct
-        out_data = dict(extra)
-        out_data["recordResult"] = rr
-        # Sanitize all nested dict keys to ≤31 chars before savemat (MATLAB MAT-5 limit)
-        out_data = _sanitize_mat_dict_keys(out_data)
-        sio.savemat(tmp_out.name, out_data, do_compression=True)
 
-        # Build JSON payload for audio_rpm (serializable version of the struct)
-        def _to_json_serializable(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            if isinstance(obj, (np.integer,)):
-                return int(obj)
-            if isinstance(obj, (np.floating,)):
-                return float(obj)
-            if isinstance(obj, dict):
-                return {k: _to_json_serializable(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple)):
-                return [_to_json_serializable(v) for v in obj]
-            return obj
+    audio_rpm_struct = _build_audio_rpm_struct_from_result(res)
 
-        audio_rpm_json = _to_json_serializable(audio_rpm_struct)
-        audio_rpm_json_bytes = json.dumps({"audio_rpm": audio_rpm_json}, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    # Inject title into metadata only when not already set in the MAT.
+    extra_rr: dict | None = None
+    title_txt = _audio_title_from_summary(st.session_state.get("mat_selected_summary") or {})
+    if not title_txt:
+        title_txt = str(st.session_state.get("audio_vehicle_title", "") or "").strip()
+    if title_txt:
+        extra_rr = {"metadata": {"title": title_txt}}
 
-        if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
-            ok_up, msg_up = st.session_state.r2_client.upload_file(tmp_out.name, selected_key)
-            if not ok_up:
-                return False, f"MAT-Upload fehlgeschlagen: {msg_up}"
-            try:
-                st.session_state.mat_summary_cache.pop(selected_key, None)
-            except Exception:
-                pass
-            # Save JSON alongside MAT (same path, .json extension)
-            json_key = str(Path(selected_key).with_suffix(".json"))
-            tmp_json = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-            try:
-                tmp_json.write(audio_rpm_json_bytes)
-                tmp_json.close()
-                st.session_state.r2_client.upload_file(tmp_json.name, json_key)
-            except Exception:
-                pass
-            finally:
-                try:
-                    Path(tmp_json.name).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            note = f" ({load_note})" if load_note else ""
-            return True, f"Audioanalyse in MAT + JSON gespeichert: {selected_key}{note}"
-        shutil.copyfile(tmp_out.name, local_mat_path)
-        # Save JSON alongside local MAT
-        json_local_path = str(Path(local_mat_path).with_suffix(".json"))
-        try:
-            Path(json_local_path).write_bytes(audio_rpm_json_bytes)
-        except Exception:
-            pass
-        note = f" ({load_note})" if load_note else ""
-        return True, f"Audioanalyse lokal gespeichert: {local_mat_path} + {Path(json_local_path).name}{note}"
-    finally:
-        for fp in (tmp_in.name, tmp_out.name):
-            try:
-                Path(fp).unlink(missing_ok=True)
-            except Exception:
-                pass
+    ok, result = _save_field_to_r2_mat("audio_rpm", audio_rpm_struct, force, extra_rr)
+    if not ok:
+        return False, result
+    return True, f"Audioanalyse in R2 gespeichert: {result}"
 
 _try_auto_connect_once()
 _try_auto_connect_local_once()
