@@ -1,4 +1,4 @@
-import ast
+﻿import ast
 import concurrent.futures as cf
 import io
 import json
@@ -13,9 +13,60 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
-import pandas as pd
-from scipy import signal
 from scipy.io import wavfile
+
+
+class _RollingStub:
+    def __init__(self, values, window):
+        self.values = np.asarray(values, dtype=float)
+        self.window = int(max(1, window))
+
+    def median(self):
+        half = self.window // 2
+        out = np.empty_like(self.values, dtype=float)
+        for idx in range(self.values.size):
+            lo = max(0, idx - half)
+            hi = min(self.values.size, idx + half + 1)
+            out[idx] = np.nanmedian(self.values[lo:hi])
+        return _SeriesStub(out)
+
+
+class _SeriesStub:
+    def __init__(self, values):
+        self.values = np.asarray(values, dtype=float)
+
+    def rolling(self, window, center=True, min_periods=1):
+        del center, min_periods
+        return _RollingStub(self.values, window)
+
+    def to_numpy(self, dtype=float):
+        return np.asarray(self.values, dtype=dtype).copy()
+
+
+class _PandasStub:
+    Series = _SeriesStub
+
+
+class _SignalStub:
+    @staticmethod
+    def spectrogram(x, fs, window="hann", nperseg=256, noverlap=0, nfft=None, detrend=False, scaling="spectrum", mode="magnitude"):
+        del window, detrend, scaling
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        nperseg = int(max(1, min(nperseg, len(x))))
+        nfft = int(nfft or nperseg)
+        noverlap = int(max(0, min(noverlap, nperseg - 1)))
+        hop = max(1, nperseg - noverlap)
+        starts = list(range(0, max(1, len(x) - nperseg + 1), hop)) or [0]
+        win = np.hanning(nperseg).astype(np.float32)
+        cols = []
+        for start in starts:
+            frame = x[start:start + nperseg]
+            if frame.size < nperseg:
+                frame = np.pad(frame, (0, nperseg - frame.size))
+            cols.append(np.abs(np.fft.rfft(frame * win, n=nfft)))
+        freqs = np.fft.rfftfreq(nfft, d=1.0 / float(fs))
+        times = (np.asarray(starts, dtype=float) + nperseg / 2.0) / float(fs)
+        return freqs, times, np.stack(cols, axis=1).astype(np.float32)
 
 
 class _DummyStreamlit:
@@ -43,8 +94,8 @@ def _load_audio_namespace():
     ]
     namespace = {
         "np": np,
-        "pd": pd,
-        "signal": signal,
+        "pd": _PandasStub,
+        "signal": _SignalStub,
         "wavfile": wavfile,
         "Path": Path,
         "tempfile": tempfile,
@@ -239,3 +290,4 @@ def test_app_audio_tab_contains_live_polling_and_paper_based_methods():
     ]
     for token in required_tokens:
         assert token in source
+

@@ -85,6 +85,14 @@ from track_analysis import (
     project_point_with_homography,
 )
 from app_tabs import audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, track_analysis_tab
+try:
+    # Streamlit reruns app.py in the same Python process. Reload extracted tab modules
+    # so changes in app_tabs/*.py are visible without a full server restart.
+    import importlib
+    for _tab_module in (audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, track_analysis_tab):
+        importlib.reload(_tab_module)
+except Exception:
+    pass
 
 if DeltaGenerator is not None and not getattr(st.button, "_ocr_form_fallback", False):
     _ORIG_DELTA_BUTTON = DeltaGenerator.button
@@ -458,6 +466,9 @@ def init_state():
         mat_summary_cache={},
         mat_overview_rows=[],
         mat_auto_updated_prefix=None,
+        mat_json_sidecar_created_count=0,
+        mat_json_sidecar_used_count=0,
+        mat_json_sidecar_last_run_total=0,
         jump_to_mat_tab=False,
         mat_update_running=False,
         mat_update_idx=0,
@@ -3356,6 +3367,7 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
     record_summary: dict = {}
     summary: dict = {}
     used_json = False
+    json_sidecar_created = False
 
     tmp_json = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
     tmp_json.close()
@@ -3364,13 +3376,19 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
         if ok_j:
             try:
                 json_data = json.loads(Path(tmp_json.name).read_text(encoding="utf-8", errors="ignore"))
-                record_summary, _mat_keys = _summary_from_json_sidecar(json_data)
-                summary = {
-                    "mat_file": Path(remote_key).name,
-                    "remote_key": remote_key,
-                    "error": "",
-                }
-                used_json = True
+                # Nur vollstaendige recordResult-Sidecars als Fast-Path nutzen.
+                # Aeltere Audio-JSONs mit nur {"audio_rpm": ...} duerfen die MAT-Analyse nicht ueberspringen.
+                if isinstance(json_data.get("recordResult"), dict):
+                    record_summary, _mat_keys = _summary_from_json_sidecar(json_data)
+                    summary = {
+                        "mat_file": Path(remote_key).name,
+                        "remote_key": remote_key,
+                        "error": "",
+                        "json_sidecar_used": True,
+                        "json_sidecar_created": False,
+                        "json_sidecar_key": json_key,
+                    }
+                    used_json = True
             except Exception:
                 pass
     finally:
@@ -3516,14 +3534,23 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
             _tmp_sj.close()
             try:
                 if hasattr(client, "upload_bytes"):
-                    client.upload_bytes(_mat_json_bytes_for_sidecar, _sidecar_key, content_type="application/json")
+                    ok_upload, _msg_upload = client.upload_bytes(
+                        _mat_json_bytes_for_sidecar,
+                        _sidecar_key,
+                        content_type="application/json",
+                    )
                 else:
-                    client.upload_file(_tmp_sj.name, _sidecar_key)
+                    ok_upload, _msg_upload = client.upload_file(_tmp_sj.name, _sidecar_key)
+                json_sidecar_created = bool(ok_upload)
             except Exception:
-                pass
+                json_sidecar_created = False
         finally:
             try: Path(_tmp_sj.name).unlink(missing_ok=True)
             except Exception: pass
+
+    summary["json_sidecar_used"] = bool(used_json)
+    summary["json_sidecar_created"] = bool(json_sidecar_created)
+    summary["json_sidecar_key"] = str(Path(remote_key).with_suffix(".json"))
 
     return summary
 
@@ -3878,7 +3905,10 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
     Backward-compatible synchronous updater for MAT overview rows.
     """
     _start_mat_update(remote_keys)
+    st.session_state.mat_json_sidecar_created_count = 0
+    st.session_state.mat_json_sidecar_used_count = 0
     total = len(st.session_state.mat_update_keys or [])
+    st.session_state.mat_json_sidecar_last_run_total = total
     progress = progress_slot.progress(0, text=f"0/0 aktuell analysiert · {total} offen") if (total > 0 and progress_slot is not None) else None
     try:
         cache = st.session_state.get("mat_summary_cache")
@@ -3892,7 +3922,10 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
             mk = str(t.get("mat_key", "") or "")
             folder = str(t.get("folder", "") or "")
             if mk and mk in cache:
-                st.session_state.mat_overview_rows[i] = _summary_to_overview_row(cache[mk], display_folder=folder)
+                cached_summary = dict(cache[mk])
+                if cached_summary.get("json_sidecar_used"):
+                    st.session_state.mat_json_sidecar_used_count += 1
+                st.session_state.mat_overview_rows[i] = _summary_to_overview_row(cached_summary, display_folder=folder)
                 done += 1
             else:
                 pending_idx.append(i)
@@ -3928,6 +3961,10 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                         summary = fut.result()
                     except Exception as e:
                         summary = {"mat_file": Path(mk).name if mk else "", "remote_key": mk, "error": f"{e.__class__.__name__}: {e}"}
+                    if summary.get("json_sidecar_used"):
+                        st.session_state.mat_json_sidecar_used_count += 1
+                    if summary.get("json_sidecar_created"):
+                        st.session_state.mat_json_sidecar_created_count += 1
                     if mk:
                         cache[mk] = dict(summary)
                     st.session_state.mat_overview_rows[i] = _summary_to_overview_row(summary, display_folder=folder)
@@ -5333,12 +5370,12 @@ st.markdown(
 
 # Main areas. Only one renderer is executed per Streamlit rerun; this keeps ROI
 # editing responsive even when Track/Audio/MAT pages contain expensive widgets.
-# Track Analysis is merged into ROI Setup so the full setup workflow runs in one tab.
 _tab_labels = [
     "Cloud Connection & Root",
     "Sync",
     "MAT Selection",
     "ROI Setup",
+    "Track Analysis",
     "Audio Auswertung",
 ]
 _active_tab = _render_main_navigation(_tab_labels)
@@ -5351,6 +5388,7 @@ elif _active_tab == "MAT Selection":
     mat_selection_tab.render(globals())
 elif _active_tab == "ROI Setup":
     roi_setup_tab.render(globals())
+elif _active_tab == "Track Analysis":
     track_analysis_tab.render(globals())
 elif _active_tab == "Audio Auswertung":
     audio_tab.render(globals())

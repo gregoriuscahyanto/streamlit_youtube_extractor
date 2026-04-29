@@ -5,14 +5,14 @@ install-dev:
 	python -m pip install -r requirements-dev.txt
 
 test:
-	python -m pytest
+	python scripts/run_tests_rtk.py
 
 lint:
 	python scripts/harness_lint.py
-	ruff check .
+	python scripts/agent_context.py
 
 ci: lint test
-	python -m compileall .
+	python -m py_compile app.py app_tabs/setup_tab.py app_tabs/sync_tab.py app_tabs/mat_selection_tab.py app_tabs/roi_setup_tab.py app_tabs/track_analysis_tab.py app_tabs/audio_tab.py
 
 run:
 	streamlit run app.py

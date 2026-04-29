@@ -1,4 +1,4 @@
-__pycache__/
+﻿__pycache__/
 *.pyc
 *.pyo
 .env
@@ -21,6 +21,9 @@ Thumbs.db
 
 # Andere
 r2_mount/*
+captures/
+results/
+tools/rtk/
 *.pptx
 *.docx
 logs/run.log

@@ -5,6 +5,7 @@ This repository is optimized for agent-assisted engineering. Keep this file shor
 ## Start here
 - Product purpose: `docs/PRODUCT.md`
 - Architecture and boundaries: `ARCHITECTURE.md`
+- Compact context map: `docs/CONTEXT.md` and `python scripts/agent_context.py`
 - Reliability and observability rules: `docs/RELIABILITY.md`
 - Security and secrets rules: `docs/SECURITY.md`
 - Quality gates and test commands: `docs/QUALITY.md`
@@ -15,9 +16,10 @@ Use the same commands locally and in CI:
 
 ```bash
 python -m pip install -r requirements-dev.txt
-python -m pytest
+python scripts/agent_context.py
+python scripts/run_tests_rtk.py
 python scripts/harness_lint.py
-python -m compileall .
+python -m py_compile app.py app_tabs/setup_tab.py app_tabs/sync_tab.py app_tabs/mat_selection_tab.py app_tabs/roi_setup_tab.py app_tabs/track_analysis_tab.py app_tabs/audio_tab.py
 ```
 
 ## Non-negotiable invariants

@@ -8,6 +8,26 @@ def render(ns):
     globals().update(ns)
     st.markdown('<div class="section-card mat-selection-no-scroll">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">MAT-Auswahl und Analyse</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div style="
+            margin: .45rem 0 .75rem 0;
+            padding: .55rem .75rem;
+            border: 1px solid #2b4f77;
+            border-radius: 6px;
+            background: #0b1524;
+            color: #cfeaff;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: .68rem;
+            line-height: 1.45;
+        ">
+          <b>MAT -> JSON Auto-Cache aktiv:</b> Vorhandene JSON-Sidecars werden automatisch genutzt.
+          Fehlt die JSON, liest das Update die MAT-Datei und erzeugt bei vollstaendigen Daten automatisch
+          eine gleichnamige JSON-Datei in R2/results.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     connected = st.session_state.r2_connected and st.session_state.r2_client is not None
     if connected and st.session_state.mat_scan_prefix != st.session_state.r2_prefix:
@@ -46,6 +66,7 @@ def render(ns):
     progress_slot = st.empty()
     table_slot = st.empty()
 
+
     if update_clicked:
         if running:
             st.session_state.mat_update_running = False
@@ -75,6 +96,13 @@ def render(ns):
         st.session_state.mat_update_running = False
         st.session_state.mat_run_state = "idle"
         set_status(f"Analyse fuer {len(mat_targets)} Eintraege abgeschlossen.", "ok")
+
+    json_created = int(st.session_state.get("mat_json_sidecar_created_count", 0) or 0)
+    json_used = int(st.session_state.get("mat_json_sidecar_used_count", 0) or 0)
+    if json_created:
+        st.success(f"MAT->JSON Cache aktualisiert: {json_created} JSON-Sidecar(s) automatisch erzeugt.")
+    elif json_used:
+        st.caption(f"JSON-Cache aktiv: {json_used} vorhandene JSON-Sidecar(s) fuer die schnelle Analyse verwendet.")
 
     if not connected:
         st.caption("Erst in Tab 'Verbindung & Root' verbinden und Projektroot waehlen.")
