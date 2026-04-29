@@ -5987,10 +5987,24 @@ def _load_next_audio_config_file() -> tuple[bool, str]:
     return True, folder
 
 
-def _audio_validation_metrics(t_audio, rpm_audio, t_ref, y_ref, shift_s: float, mode: str) -> dict:
+def _audio_validation_metrics(
+    t_audio,
+    rpm_audio,
+    t_ref,
+    y_ref,
+    shift_s: float,
+    mode: str,
+    tol_abs_rpm: float | None = None,
+    tol_pct: float | None = None,
+    tol_logic: str = "ODER",
+) -> dict:
     impl = globals().get("_audio_validation_metrics_impl")
     if callable(impl):
-        return impl(t_audio, rpm_audio, t_ref, y_ref, shift_s, mode)
+        try:
+            return impl(t_audio, rpm_audio, t_ref, y_ref, shift_s, mode, tol_abs_rpm, tol_pct, tol_logic)
+        except TypeError:
+            # Backward-compatible fallback for older helper implementations.
+            return impl(t_audio, rpm_audio, t_ref, y_ref, shift_s, mode)
     t_audio = np.asarray(t_audio, dtype=float).ravel()
     rpm_audio = np.asarray(rpm_audio, dtype=float).ravel()
     t_ref = np.asarray(t_ref, dtype=float).ravel() + float(shift_s)
@@ -6018,6 +6032,51 @@ def _audio_validation_metrics(t_audio, rpm_audio, t_ref, y_ref, shift_s: float, 
     abs_err = np.abs(err)
     denom = np.maximum(np.abs(y_interp), 1e-9)
     pct = abs_err / denom * 100.0
+
+    tol_abs = None
+    tol_pct_val = None
+    try:
+        if tol_abs_rpm is not None and np.isfinite(float(tol_abs_rpm)) and float(tol_abs_rpm) >= 0.0:
+            tol_abs = float(tol_abs_rpm)
+    except Exception:
+        tol_abs = None
+    try:
+        if tol_pct is not None and np.isfinite(float(tol_pct)) and float(tol_pct) >= 0.0:
+            tol_pct_val = float(tol_pct)
+    except Exception:
+        tol_pct_val = None
+
+    if tol_abs is None:
+        within_abs = np.ones(abs_err.shape, dtype=bool)
+    else:
+        within_abs = abs_err <= tol_abs
+    if tol_pct_val is None:
+        within_pct = np.ones(abs_err.shape, dtype=bool)
+    else:
+        within_pct = pct <= tol_pct_val
+
+    logic_txt = str(tol_logic or "ODER").strip().upper()
+    if tol_abs is not None and tol_pct_val is not None:
+        if logic_txt.startswith("UND"):
+            within_tol = within_abs & within_pct
+            effective_logic = "UND"
+        else:
+            within_tol = within_abs | within_pct
+            effective_logic = "ODER"
+    elif tol_abs is not None:
+        within_tol = within_abs
+        effective_logic = "ABS"
+    elif tol_pct_val is not None:
+        within_tol = within_pct
+        effective_logic = "PCT"
+    else:
+        within_tol = np.ones(abs_err.shape, dtype=bool)
+        effective_logic = "AUS"
+
+    within_cnt = int(np.count_nonzero(within_tol))
+    n_points = int(t_audio.size)
+    within_ratio = (100.0 * float(within_cnt) / float(max(1, n_points)))
+
     use_pct = "Prozent" in str(mode)
     return {
         "ok": True,
@@ -6029,21 +6088,51 @@ def _audio_validation_metrics(t_audio, rpm_audio, t_ref, y_ref, shift_s: float, 
         "median_abs": float(np.nanmedian(abs_err)),
         "mape_pct": float(np.nanmean(pct)),
         "sum_abs_err": float(np.nansum(abs_err)),
-        "n": int(t_audio.size),
+        "n": n_points,
+        "tolerance_abs_rpm": tol_abs,
+        "tolerance_pct": tol_pct_val,
+        "tolerance_logic": effective_logic,
+        "within_tolerance_count": within_cnt,
+        "within_tolerance_ratio_pct": float(within_ratio),
+        "outside_tolerance_count": int(max(0, n_points - within_cnt)),
     }
 
 
-def _audio_find_best_validation_shift(t_audio, rpm_audio, t_ref, y_ref, mode: str, min_s: float, max_s: float, step_s: float, progress_cb=None) -> tuple[dict, list[str]]:
+def _audio_find_best_validation_shift(
+    t_audio,
+    rpm_audio,
+    t_ref,
+    y_ref,
+    mode: str,
+    min_s: float,
+    max_s: float,
+    step_s: float,
+    tol_abs_rpm: float | None = None,
+    tol_pct: float | None = None,
+    tol_logic: str = "ODER",
+    progress_cb=None,
+) -> tuple[dict, list[str]]:
     impl = globals().get("_audio_find_best_shift_impl")
     if callable(impl):
-        return impl(t_audio, rpm_audio, t_ref, y_ref, mode, min_s, max_s, step_s, progress_cb)
+        try:
+            return impl(
+                t_audio, rpm_audio, t_ref, y_ref, mode, min_s, max_s, step_s,
+                tol_abs_rpm, tol_pct, tol_logic, progress_cb,
+            )
+        except TypeError:
+            return impl(t_audio, rpm_audio, t_ref, y_ref, mode, min_s, max_s, step_s, progress_cb)
     step = max(0.001, abs(float(step_s)))
     shifts = np.arange(float(min_s), float(max_s) + 0.5 * step, step)
     best = None
     log = []
     total = max(1, int(shifts.size))
     for i, sh in enumerate(shifts, 1):
-        cur = _audio_validation_metrics(t_audio, rpm_audio, t_ref, y_ref, float(sh), mode)
+        cur = _audio_validation_metrics(
+            t_audio, rpm_audio, t_ref, y_ref, float(sh), mode,
+            tol_abs_rpm=tol_abs_rpm,
+            tol_pct=tol_pct,
+            tol_logic=tol_logic,
+        )
         if cur.get("ok") and (best is None or cur["score"] < best["score"]):
             best = cur
         if i == 1 or i == total or i % max(1, total // 20) == 0:
@@ -6140,6 +6229,12 @@ def _save_audio_validation_to_selected_mat(vr: dict, force: bool = False) -> tup
         "n": int(vr.get("n") or 0),
         "mode": str(vr.get("mode") or ""),
         "score": float(vr.get("score") or 0.0),
+        "tolerance_abs_rpm": (float("nan") if vr.get("tolerance_abs_rpm") is None else float(vr.get("tolerance_abs_rpm"))),
+        "tolerance_pct": (float("nan") if vr.get("tolerance_pct") is None else float(vr.get("tolerance_pct"))),
+        "tolerance_logic": str(vr.get("tolerance_logic") or ""),
+        "within_tolerance_count": int(vr.get("within_tolerance_count") or 0),
+        "within_tolerance_ratio_pct": float(vr.get("within_tolerance_ratio_pct") or 0.0),
+        "outside_tolerance_count": int(vr.get("outside_tolerance_count") or 0),
         "created": datetime.now().isoformat(timespec="seconds"),
     }
     save_field = globals().get("_save_field_to_r2_mat")

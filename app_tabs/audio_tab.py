@@ -422,6 +422,17 @@ def render(ns):
                                                     step=0.001, format="%.3f",
                                                     key="aud_val_shift_step",
                                                     help="Zeitschritt fuer 'Find best match'"))
+            tol_en = st.columns(2)
+            use_tol_abs = bool(tol_en[0].checkbox("Absolute Toleranz aktiv", value=True, key="aud_val_tol_abs_enabled"))
+            use_tol_pct = bool(tol_en[1].checkbox("Prozentuale Toleranz aktiv", value=True, key="aud_val_tol_pct_enabled"))
+            tol_v = st.columns(3)
+            tol_abs_rpm = float(tol_v[0].number_input("Toleranz absolut [RPM]", 0.0, 50000.0, 500.0,
+                                                       step=10.0, key="aud_val_tol_abs_rpm",
+                                                       disabled=not use_tol_abs))
+            tol_pct = float(tol_v[1].number_input("Toleranz prozentual [%]", 0.0, 100.0, 5.0,
+                                                  step=0.5, key="aud_val_tol_pct",
+                                                  disabled=not use_tol_pct))
+            tol_logic = tol_v[2].selectbox("Toleranz-Logik", ["ODER", "UND"], key="aud_val_tol_logic")
 
             res_now = st.session_state.get("audio_analysis_result") or {}
             has_rpm = (isinstance(res_now, dict)
@@ -444,6 +455,9 @@ def render(ns):
                     val_df[time_col].dropna().to_numpy(),
                     val_df[rpm_col].dropna().to_numpy(),
                     time_shift, metric_mode,
+                    tol_abs_rpm=(tol_abs_rpm if use_tol_abs else None),
+                    tol_pct=(tol_pct if use_tol_pct else None),
+                    tol_logic=tol_logic,
                 )
 
             if run_c2.button("Find best match", width="stretch",
@@ -454,6 +468,9 @@ def render(ns):
                     val_df[time_col].dropna().to_numpy(),
                     val_df[rpm_col].dropna().to_numpy(),
                     metric_mode, bm_min, bm_max, shift_step,
+                    tol_abs_rpm=(tol_abs_rpm if use_tol_abs else None),
+                    tol_pct=(tol_pct if use_tol_pct else None),
+                    tol_logic=tol_logic,
                     progress_cb=lambda frac, msg: prog.progress(float(frac), text=msg),
                 )
                 st.session_state.audio_validation_result = best
@@ -471,6 +488,16 @@ def render(ns):
                     vc2[1].metric("RMSE [RPM]",  f"{vr.get('rmse', 0.0):.1f}")
                     vc2[2].metric("MAPE [%]",    f"{vr.get('mape_pct', 0.0):.2f}")
                     vc2[3].metric("Zeitversatz", f"{vr.get('shift_s', 0.0):+.3f}s")
+                    tol_ratio = float(vr.get("within_tolerance_ratio_pct", 100.0) or 0.0)
+                    tol_ok_n = int(vr.get("within_tolerance_count", vr.get("n", 0)) or 0)
+                    tol_n = int(vr.get("n", 0) or 0)
+                    tol_bad_n = int(vr.get("outside_tolerance_count", max(0, tol_n - tol_ok_n)) or 0)
+                    vc3 = st.columns(3)
+                    vc3[0].metric("Zulaessig [%]", f"{tol_ratio:.1f}%")
+                    vc3[1].metric("Zulaessig [n]", f"{tol_ok_n}/{tol_n}")
+                    vc3[2].metric("Nicht zulaessig [n]", f"{tol_bad_n}")
+                    st.success(f"{tol_ratio:.1f}% sind im zulaessigen Bereich.")
+                    st.caption(f"Toleranz-Logik: {vr.get('tolerance_logic', 'AUS')}")
                     st.caption(
                         f"Summe |Fehler|={vr.get('sum_abs_err', 0.0):.1f} RPM·n  ·  "
                         f"Median={vr.get('median_abs', 0.0):.1f} RPM  ·  "
