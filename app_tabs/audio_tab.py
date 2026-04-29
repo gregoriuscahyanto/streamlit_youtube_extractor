@@ -102,9 +102,31 @@ def render(ns):
         if ok_cfg:
             st.success(msg_cfg)
             set_status("Audio Config gespeichert.", "ok")
+        elif msg_cfg == _SAVE_NEEDS_CONFIRM:
+            st.session_state["_audio_config_overwrite_pending"] = dict(current_audio_config)
         else:
             st.error(msg_cfg)
             set_status(msg_cfg, "warn")
+
+    _cfg_pending = st.session_state.get("_audio_config_overwrite_pending")
+    if _cfg_pending is not None:
+        st.warning("Audio Config ist bereits in der Datei vorhanden. Soll sie ueberschrieben werden?")
+        _ow_c1, _ow_c2 = st.columns(2)
+        if _ow_c1.button("Ja, ueberschreiben", width="stretch", key="aud_cfg_overwrite_yes"):
+            with st.spinner("Audio Config wird ueberschrieben ..."):
+                ok2, msg2 = _save_audio_config_to_selected_mat(_cfg_pending, force=True)
+            st.session_state["_audio_config_overwrite_pending"] = None
+            if ok2:
+                st.success(msg2)
+                set_status("Audio Config ueberschrieben.", "ok")
+            else:
+                st.error(msg2)
+                set_status(msg2, "warn")
+            st.rerun()
+        if _ow_c2.button("Nein, abbrechen", width="stretch", key="aud_cfg_overwrite_no"):
+            st.session_state["_audio_config_overwrite_pending"] = None
+            st.rerun()
+
     if cfg_c2.button("Hole naechste Datei", width="stretch", key="aud_load_next_config_target"):
         with st.spinner("Naechste Datei wird geladen ..."):
             ok_next, msg_next = _load_next_audio_config_file()
@@ -113,17 +135,6 @@ def render(ns):
             st.rerun()
     if save_cfg_disabled:
         st.caption("Audio Config kann gespeichert werden, sobald eine MAT-Datei ueber MAT Selection geladen ist.")
-    _cur_summary = st.session_state.get("mat_selected_summary") or {}
-    _automation_ready = bool(
-        _cur_summary.get("start_end_selected")
-        and _cur_summary.get("audio_config_done")
-    )
-    st.caption(
-        "Automatisierung bereit: Start/Ende und Audio Config vorhanden."
-        if _automation_ready
-        else "Automatisierung gesperrt: benoetigt mindestens Start/Ende und gespeicherte Audio Config."
-    )
-
     _live_log_ref = st.session_state.get("audio_bg_log_ref")
     if isinstance(_live_log_ref, list) and _live_log_ref:
         st.session_state.audio_debug_lines = list(_live_log_ref[-200:])
@@ -343,9 +354,31 @@ def render(ns):
             if ok_aud_save:
                 st.success(msg_aud_save)
                 set_status("Audioanalyse in MAT gespeichert.", "ok")
+            elif msg_aud_save == _SAVE_NEEDS_CONFIRM:
+                st.session_state["_audio_result_overwrite_pending"] = dict(res)
             else:
                 st.error(msg_aud_save)
                 set_status(msg_aud_save, "warn")
+
+        _res_pending = st.session_state.get("_audio_result_overwrite_pending")
+        if _res_pending is not None:
+            st.warning("Audioanalyse ist bereits in der Datei gespeichert. Soll sie ueberschrieben werden?")
+            _row_c1, _row_c2 = st.columns(2)
+            if _row_c1.button("Ja, ueberschreiben", width="stretch", key="aud_res_overwrite_yes"):
+                with st.spinner("Audioanalyse wird ueberschrieben ..."):
+                    ok3, msg3 = _save_audio_result_to_selected_mat(_res_pending, force=True)
+                st.session_state["_audio_result_overwrite_pending"] = None
+                if ok3:
+                    st.success(msg3)
+                    set_status("Audioanalyse ueberschrieben.", "ok")
+                else:
+                    st.error(msg3)
+                    set_status(msg3, "warn")
+                st.rerun()
+            if _row_c2.button("Nein, abbrechen", width="stretch", key="aud_res_overwrite_no"):
+                st.session_state["_audio_result_overwrite_pending"] = None
+                st.rerun()
+
         if save_mat_disabled:
             st.caption("Zum Speichern zuerst in MAT Selection eine MAT-Datei mit MAT + Video laden.")
 
@@ -451,6 +484,39 @@ def render(ns):
                         st.plotly_chart(_val_fig, use_container_width=True)
                 elif vr.get("error"):
                     st.warning(str(vr["error"]))
+
+            _val_save_disabled = not bool(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key"))
+            if st.button("Validierung in MAT + JSON speichern", width="stretch", key="aud_val_save_btn", disabled=_val_save_disabled):
+                with st.spinner("Validierung wird gespeichert ..."):
+                    ok_val_save, msg_val_save = _save_audio_validation_to_selected_mat(vr)
+                if ok_val_save:
+                    st.success(msg_val_save)
+                    set_status("Validierung gespeichert.", "ok")
+                elif msg_val_save == _SAVE_NEEDS_CONFIRM:
+                    st.session_state["_audio_val_overwrite_pending"] = dict(vr)
+                else:
+                    st.error(msg_val_save)
+                    set_status(msg_val_save, "warn")
+            _val_pending = st.session_state.get("_audio_val_overwrite_pending")
+            if _val_pending is not None:
+                st.warning("Validierung ist bereits gespeichert. Soll sie ueberschrieben werden?")
+                _vp_c1, _vp_c2 = st.columns(2)
+                if _vp_c1.button("Ja, ueberschreiben", width="stretch", key="aud_val_overwrite_yes"):
+                    with st.spinner("Validierung wird ueberschrieben ..."):
+                        ok4, msg4 = _save_audio_validation_to_selected_mat(_val_pending, force=True)
+                    st.session_state["_audio_val_overwrite_pending"] = None
+                    if ok4:
+                        st.success(msg4)
+                        set_status("Validierung ueberschrieben.", "ok")
+                    else:
+                        st.error(msg4)
+                        set_status(msg4, "warn")
+                    st.rerun()
+                if _vp_c2.button("Nein, abbrechen", width="stretch", key="aud_val_overwrite_no"):
+                    st.session_state["_audio_val_overwrite_pending"] = None
+                    st.rerun()
+            if _val_save_disabled:
+                st.caption("Zum Speichern zuerst in MAT Selection eine MAT-Datei laden.")
 
             if st.session_state.get("audio_validation_debug"):
                 with st.expander("Debug Logs Best Match", expanded=False):

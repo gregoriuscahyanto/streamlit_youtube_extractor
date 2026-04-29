@@ -497,6 +497,7 @@ def init_state():
         audio_bg_progress={},
         audio_bg_progress_ref=None,
         audio_config_last_saved_key="",
+        audio_location="",
         audio_validation_result=None,
         audio_validation_debug=[],
         # Datei-Browser
@@ -1857,17 +1858,10 @@ def _save_result_json_and_mat(no_roi: bool = False, video_faulty: bool = False) 
     json_name = f"results_{safe_cf}.json"
     saved_targets = []
     saved_mat_key = ""
-    local_saved_dir = ""
-    try:
-        out_dir = _server_results_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / json_name).write_bytes(json_bytes)
-        (out_dir / mat_name).write_bytes(mat_bytes)
-        local_saved_dir = str(out_dir)
-        saved_targets.append(f"Server lokal: {local_saved_dir}")
-    except Exception as e:
-        saved_targets.append(f"Server lokal fehlgeschlagen: {e}")
-    if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+    if not (st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None):
+        payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=["R2 nicht verbunden: nicht gespeichert"], mat_key="")
+        return False, "R2 nicht verbunden. ROI Setup wird ausschliesslich in R2 gespeichert.", payload
+    if True:
         # ROI-Setup speichert nur zentral in der Cloud unter <prefix>/results.
         # Keine lokalen Kopien und keine Duplikate im Capture-Ordner.
         res_dir = _results_dir_key().strip("/")
@@ -1887,7 +1881,7 @@ def _save_result_json_and_mat(no_roi: bool = False, video_faulty: bool = False) 
             saved_targets.append(f"R2 results fehlgeschlagen: JSON={msg_json or ok_json}, MAT={msg_mat or ok_mat}")
     else:
         saved_targets.append("R2 nicht verbunden: nicht gespeichert")
-    payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=saved_targets, mat_key=saved_mat_key, local_dir=local_saved_dir)
+    payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=saved_targets, mat_key=saved_mat_key)
     if video_faulty:
         msg_prefix = "Video fehlerhaft abgestempelt"
     elif no_roi:
@@ -3545,16 +3539,10 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
     else:
         summary["media_detail"] = ""
 
-    # Auto-convert MAT → JSON sidecar when OCR + video + audio are present.
-    # Condition: slow MAT path was used (not used_json), JSON bytes were generated,
-    # and the file has meaningful content worth caching for the fast path next time.
-    if (
-        not used_json
-        and _mat_json_bytes_for_sidecar is not None
-        and summary.get("ocr_done")
-        and summary.get("video_file_exists")
-        and summary.get("audio_file_exists")
-    ):
+    # Auto-convert MAT → JSON sidecar whenever the slow path was used and JSON bytes
+    # were successfully generated.  No content conditions — every MAT without a sidecar
+    # gets one so the fast path is available on the next scan.
+    if not used_json and _mat_json_bytes_for_sidecar is not None:
         _sidecar_key = str(Path(remote_key).with_suffix(".json"))
         _tmp_sj = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
         try:
@@ -4279,6 +4267,12 @@ def _load_mat_from_r2(remote_key):
         if _track_name:
             st.session_state["loaded_track_name"] = _track_name
             _try_auto_load_reference_track_for_name(_track_name)
+        try:
+            _ac_dict = _extract_audio_config_from_mat(tmp.name)
+            if _ac_dict:
+                _apply_audio_config_to_widgets(_ac_dict)
+        except Exception:
+            pass
         set_status("MAT geladen OK","ok")
         return tmp.name
     except Exception as e: set_status(f"MAT-Parse: {e}","warn")
@@ -5375,6 +5369,108 @@ def _build_audio_config_from_values(values: dict) -> dict:
 _SAVE_NEEDS_CONFIRM = "NEEDS_CONFIRM"
 
 
+def _extract_audio_config_from_mat(mat_path: str) -> dict:
+    """Read recordResult.audio_config from a MAT file. Returns {} on any error."""
+    try:
+        data = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+        rr = _mat_scalar(data.get("recordResult"))
+        if rr is None:
+            return {}
+        ac = _mat_obj_get(rr, "audio_config")
+        if ac is None:
+            return {}
+        result = _mat_struct_to_plain(ac)
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def _apply_audio_config_to_widgets(audio_config: dict) -> None:
+    """Copy audio_config dict values into Streamlit session-state widget keys.
+
+    Called after loading a MAT file so the Audio Tab widgets reflect the saved config.
+    """
+    def _g(key):
+        v = audio_config.get(key)
+        if v is None:
+            return None
+        if hasattr(v, "item"):  # numpy scalar
+            return v.item()
+        return v
+
+    mapping = {
+        "stft_mode":      ("aud_stft_mode_new", str),
+        "nfft":           ("aud_nfft_new",       int),
+        "overlap_pct":    ("aud_ov_new",          float),
+        "fmax":           ("aud_fmax_new",        float),
+        "method":         ("aud_method_new",      str),
+        "drive_type":     ("aud_drive_type",      str),
+        "cyl_mode":       ("aud_cyl_mode",        str),
+        "harmonic_mode":  ("aud_harm_mode",       str),
+        "cyl":            ("aud_cyl_new",         int),
+        "order":          ("aud_order_new",       int),
+        "takt":           ("aud_takt_new",        int),
+        "rpm_min":        ("aud_rpm_min_new",     float),
+        "rpm_max":        ("aud_rpm_max_new",     float),
+        "audio_offset_s": ("aud_offset_new",      float),
+        "use_ocr_v":      ("aud_use_v_new",       bool),
+        "r_dyn_m":        ("aud_rdyn_new",        float),
+        "tol_pct":        ("aud_tol_new",         float),
+        "axle_ratio":     ("aud_axle_ratio",      float),
+        "prefer_low":     ("aud_prefer_low",      bool),
+    }
+    for cfg_key, (ss_key, cast) in mapping.items():
+        val = _g(cfg_key)
+        if val is not None:
+            try:
+                st.session_state[ss_key] = cast(val)
+            except Exception:
+                pass
+
+    # gear_ratios → comma-separated text widget
+    gear_ratios = audio_config.get("gear_ratios")
+    if gear_ratios is not None:
+        try:
+            if hasattr(gear_ratios, "tolist"):
+                gear_ratios = gear_ratios.tolist()
+            if isinstance(gear_ratios, (list, tuple)) and gear_ratios:
+                st.session_state["aud_gears_text"] = ", ".join(f"{float(g):.2f}" for g in gear_ratios)
+        except Exception:
+            pass
+
+    # method_params sub-dict
+    mp = audio_config.get("method_params")
+    if isinstance(mp, dict):
+        mp_map = {
+            "ridge_smooth":    ("aud_ridge_smooth",    int),
+            "viterbi_jump_hz": ("aud_viterbi_jump_hz", float),
+            "viterbi_penalty": ("aud_viterbi_penalty", float),
+            "viterbi_smooth":  ("aud_viterbi_smooth",  int),
+            "comb_harmonics":  ("aud_comb_harmonics",  int),
+            "hybrid_smooth":   ("aud_hybrid_smooth",   int),
+            "always_run_cwt":  ("aud_run_cwt_all",     bool),
+            "fast_mode":       ("aud_fast_mode",       bool),
+        }
+        for k, (ss_k, cast) in mp_map.items():
+            v = mp.get(k)
+            if v is not None:
+                try:
+                    if hasattr(v, "item"):
+                        v = v.item()
+                    st.session_state[ss_k] = cast(v)
+                except Exception:
+                    pass
+        # ridge_jump_frac is stored as fraction, widget uses %
+        rfrac = mp.get("ridge_jump_frac")
+        if rfrac is not None:
+            try:
+                if hasattr(rfrac, "item"):
+                    rfrac = rfrac.item()
+                st.session_state["aud_ridge_jump_pct"] = float(rfrac) * 100.0
+            except Exception:
+                pass
+
+
 def _r2_download_mat_bytes(selected_key: str) -> tuple[bytes, str]:
     """Download MAT from R2 → bytes.  r2_client only accepts file paths, so a
     temp file is required. Returns (raw_bytes, ""). Returns (b"", error) on failure.
@@ -5537,18 +5633,50 @@ def _save_audio_result_to_selected_mat(res: dict, force: bool = False) -> tuple[
 
     audio_rpm_struct = _build_audio_rpm_struct_from_result(res)
 
-    # Inject title into metadata only when not already set in the MAT.
+    # Inject title + location into metadata only when not already set in the MAT.
     extra_rr: dict | None = None
     title_txt = _audio_title_from_summary(st.session_state.get("mat_selected_summary") or {})
     if not title_txt:
         title_txt = str(st.session_state.get("audio_vehicle_title", "") or "").strip()
+    location_txt = str(st.session_state.get("audio_location", "") or "").strip()
+    meta_inject: dict = {}
     if title_txt:
-        extra_rr = {"metadata": {"title": title_txt}}
+        meta_inject["title"] = title_txt
+    if location_txt:
+        meta_inject["location"] = location_txt
+    if meta_inject:
+        extra_rr = {"metadata": meta_inject}
 
     ok, result = _save_field_to_r2_mat("audio_rpm", audio_rpm_struct, force, extra_rr)
     if not ok:
         return False, result
     return True, f"Audioanalyse in R2 gespeichert: {result}"
+
+
+def _save_audio_validation_to_selected_mat(vr: dict, force: bool = False) -> tuple[bool, str]:
+    """Save audio_validation metrics into recordResult in R2 (MAT + JSON).
+
+    Returns (False, _SAVE_NEEDS_CONFIRM) when the field already exists and force=False.
+    """
+    if not isinstance(vr, dict) or not vr.get("ok"):
+        return False, "Keine gueltigen Validierungsergebnisse zum Speichern vorhanden."
+    validation_struct = {
+        "mae": float(vr.get("mae") or 0.0),
+        "rmse": float(vr.get("rmse") or 0.0),
+        "mape_pct": float(vr.get("mape_pct") or 0.0),
+        "median_abs": float(vr.get("median_abs") or 0.0),
+        "sum_abs_err": float(vr.get("sum_abs_err") or 0.0),
+        "shift_s": float(vr.get("shift_s") or 0.0),
+        "n": int(vr.get("n") or 0),
+        "mode": str(vr.get("mode") or ""),
+        "score": float(vr.get("score") or 0.0),
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+    ok, result = _save_field_to_r2_mat("audio_validation", validation_struct, force)
+    if not ok:
+        return False, result
+    return True, f"Validierung in R2 gespeichert: {result}"
+
 
 _try_auto_connect_once()
 _try_auto_connect_local_once()

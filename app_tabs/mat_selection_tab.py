@@ -136,6 +136,28 @@ def render(ns):
 
     current_selected_key = str(st.session_state.get("mat_pending_selected_key", "") or "")
 
+    # Location field: Aufnahmeort / Strecke – saved in session state, used by automation logic.
+    _loc_col1, _loc_col2 = st.columns([2, 1])
+    _loc_val = _loc_col1.text_input(
+        "Aufnahmeort / Strecke",
+        value=str(st.session_state.get("audio_location", "") or ""),
+        key="audio_location_input",
+        placeholder="z.B. Nuerburgring, Spa, ...",
+        help="Wird beim Speichern als Metadaten-Feld 'location' in die Datei uebernommen.",
+    )
+    st.session_state["audio_location"] = str(_loc_val or "").strip()
+
+    # Automatisierungs-Status fuer die aktuell geladene Datei
+    _cur_summary = st.session_state.get("mat_selected_summary") or {}
+    _automation_ready = bool(
+        _cur_summary.get("start_end_selected") and _cur_summary.get("audio_config_done")
+    )
+    _loc_col2.markdown("<br>", unsafe_allow_html=True)
+    if _automation_ready:
+        _loc_col2.success("Automatisierung bereit")
+    else:
+        _loc_col2.info("Automatisierung gesperrt")
+
     if st.session_state.mat_overview_rows:
         df_overview = pd.DataFrame(st.session_state.mat_overview_rows)
         df_overview = _normalize_overview_lamps(df_overview)
