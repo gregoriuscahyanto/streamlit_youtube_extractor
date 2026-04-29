@@ -84,12 +84,12 @@ from track_analysis import (
     extract_minimap_crop,
     project_point_with_homography,
 )
-from app_tabs import audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, track_analysis_tab
+from app_tabs import audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab
 try:
     # Streamlit reruns app.py in the same Python process. Reload extracted tab modules
     # so changes in app_tabs/*.py are visible without a full server restart.
     import importlib
-    for _tab_module in (audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, track_analysis_tab):
+    for _tab_module in (audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab):
         importlib.reload(_tab_module)
 except Exception:
     pass
@@ -191,12 +191,11 @@ def _render_main_navigation(labels: list[str]) -> str:
     requested = st.session_state.get("tab_default")
     if isinstance(requested, str) and requested in labels:
         st.session_state[state_key] = requested
-        st.session_state[widget_key] = requested
     current = st.session_state.get(state_key)
     if current not in labels:
         current = labels[0]
         st.session_state[state_key] = current
-    # If the widget session-state value is stale (e.g. "Track Analysis" no longer exists),
+    # If the widget session-state value is stale after navigation changes,
     # clear it so the widget re-renders with the correct default instead of breaking.
     if st.session_state.get(widget_key) not in labels:
         st.session_state.pop(widget_key, None)
@@ -394,6 +393,7 @@ MAT_OVERVIEW_COLCFG = {
     "roi_ausgewaehlt": st.column_config.TextColumn("ROI", width="small"),
     "track_ausgewaehlt": st.column_config.TextColumn("Track", width="small"),
     "anfang_ende_ausgewaehlt": st.column_config.TextColumn("Start/Ende", width="small"),
+    "audio_config": st.column_config.TextColumn("Audio Config", width="small"),
     "ocr_durchgefuehrt": st.column_config.TextColumn("OCR", width="small"),
     "ocr_vollstaendig": st.column_config.TextColumn("OCR vollstaendig", width="small"),
     "audioanalyse_spektrogramm": st.column_config.TextColumn("Audio/Spektrogramm", width="small"),
@@ -496,6 +496,9 @@ def init_state():
         audio_bg_source="",
         audio_bg_progress={},
         audio_bg_progress_ref=None,
+        audio_config_last_saved_key="",
+        audio_validation_result=None,
+        audio_validation_debug=[],
         # Datei-Browser
         fb_path="", fb_items=[], fb_selected=None,
         # Aufnahme
@@ -3117,6 +3120,14 @@ def _summarize_record_result_hdf5(mat_path: str) -> dict:
                     if vals and str(vals[0]).strip():
                         out[mk] = str(vals[0]).strip()
                         break
+                for mk in ("youtube_url", "video_url", "url", "link", "source_url"):
+                    obj = _h5_get_path_ci(meta, [mk])
+                    if obj is None:
+                        continue
+                    vals = _h5_to_text_list(obj)
+                    if vals and str(vals[0]).strip():
+                        out[mk] = str(vals[0]).strip()
+                        break
         joined = "\n".join(paths)
         def has(*needles):
             return any(n.lower() in joined for n in needles)
@@ -3140,6 +3151,7 @@ def _summarize_record_result_hdf5(mat_path: str) -> dict:
             "recordresult/audio_rpm/processed",
             "recordresult/audio_rpm/params",
         )
+        out["audio_config_done"] = nonempty_path("recordresult/audio_config")
         out["validation_done"] = nonempty_path("recordresult/validation/results")
     except Exception:
         pass
@@ -3170,6 +3182,14 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
         # Je nach Erzeuger heisst der YouTube-/Video-Titel unterschiedlich.
         if meta is not None:
             for mk in ("video_title", "title", "vehicle_title", "name", "youtube_title"):
+                try:
+                    mv = _mat_to_text(_mat_obj_get(meta, mk), "")
+                    if mv:
+                        out[mk] = str(mv).strip()
+                        break
+                except Exception:
+                    pass
+            for mk in ("youtube_url", "video_url", "url", "link", "source_url"):
                 try:
                     mv = _mat_to_text(_mat_obj_get(meta, mk), "")
                     if mv:
@@ -3236,6 +3256,7 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
             or _mat_table_height(ar_processed) > 0
             or _mat_is_nonempty(ar_params)
         )
+        out["audio_config_done"] = bool(_mat_is_nonempty(_mat_obj_get(rr, "audio_config")))
 
         v_results = _mat_obj_get(validation, "results")
         out["validation_done"] = bool(_mat_is_nonempty(v_results))
@@ -3267,6 +3288,11 @@ def _summary_from_json_sidecar(data: dict) -> tuple[dict, dict]:
 
     # metadata fields
     for mk in ("video_title", "title", "vehicle_title", "name", "youtube_title"):
+        v = str(meta.get(mk) or "").strip()
+        if v:
+            record_summary[mk] = v
+            break
+    for mk in ("youtube_url", "video_url", "url", "link", "source_url"):
         v = str(meta.get(mk) or "").strip()
         if v:
             record_summary[mk] = v
@@ -3353,6 +3379,7 @@ def _summary_from_json_sidecar(data: dict) -> tuple[dict, dict]:
         (isinstance(t_s, list) and len(t_s) > 0)
         or bool(arpm.get("params"))
     )
+    record_summary["audio_config_done"] = bool(rr.get("audio_config"))
 
     # validation
     record_summary["validation_done"] = bool(vali.get("results"))
@@ -3448,6 +3475,7 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
     summary["ocr_done"] = bool(summary.get("ocr_done") or _mat_has_any(["ocr_results", "ocr_values", "results_table"]))
     summary["ocr_complete"] = bool(summary.get("ocr_complete") or (summary.get("ocr_done") and not _mat_has_any(["ocr_missing", "ocr_errors", "missing_values"])))
     summary["audio_spectrogram_done"] = bool(summary.get("audio_spectrogram_done") or _mat_has_any(["spectrogram", "audio_spectrogram", "audioanalysis", "audio_analysis", "pxx", "audio_rpm"]))
+    summary["audio_config_done"] = bool(summary.get("audio_config_done") or _mat_has_any(["audio_config", "audioconfig"]))
     summary["validation_done"] = bool(summary.get("validation_done") or _mat_has_any(["validation", "validated", "validierung", "validation_results"]))
 
     summary["mat_file"] = Path(remote_key).name
@@ -3569,6 +3597,7 @@ def _compute_folder_only_summary(folder: str, client, prefix: str) -> dict:
         "start_end_selected": False,
         "ocr_done": False,
         "ocr_complete": False,
+        "audio_config_done": False,
         "audio_spectrogram_done": False,
         "validation_done": False,
         "error": "",
@@ -3664,6 +3693,7 @@ def _summary_to_overview_row(summary: dict, display_folder: str = "") -> dict:
         "roi_ausgewaehlt": _jn(summary.get("roi_selected")),
         "track_ausgewaehlt": _jn(summary.get("track_selected")),
         "anfang_ende_ausgewaehlt": _jn(summary.get("start_end_selected")),
+        "audio_config": _jn(summary.get("audio_config_done")),
         "ocr_durchgefuehrt": _jn(summary.get("ocr_done")),
         "ocr_vollstaendig": _jn(summary.get("ocr_complete")),
         "audioanalyse_spektrogramm": _jn(summary.get("audio_spectrogram_done")),
@@ -3689,6 +3719,7 @@ def _placeholder_overview_row(target) -> dict:
         "roi_ausgewaehlt": "...",
         "track_ausgewaehlt": "...",
         "anfang_ende_ausgewaehlt": "...",
+        "audio_config": "...",
         "ocr_durchgefuehrt": "...",
         "ocr_vollstaendig": "...",
         "audioanalyse_spektrogramm": "...",
@@ -3788,6 +3819,7 @@ def _style_overview_dataframe(df: pd.DataFrame):
         "roi_ausgewaehlt",
         "track_ausgewaehlt",
         "anfang_ende_ausgewaehlt",
+        "audio_config",
         "ocr_durchgefuehrt",
         "ocr_vollstaendig",
         "audioanalyse_spektrogramm",
@@ -3833,6 +3865,7 @@ def _normalize_overview_lamps(df: pd.DataFrame) -> pd.DataFrame:
         "roi_ausgewaehlt",
         "track_ausgewaehlt",
         "anfang_ende_ausgewaehlt",
+        "audio_config",
         "ocr_durchgefuehrt",
         "ocr_vollstaendig",
         "audioanalyse_spektrogramm",
@@ -3859,6 +3892,7 @@ def _render_mat_selection_analysis(df: pd.DataFrame, title_suffix: str = "") -> 
         ("ROI", "roi_ausgewaehlt"),
         ("Track", "track_ausgewaehlt"),
         ("Start/Ende", "anfang_ende_ausgewaehlt"),
+        ("Audio Config", "audio_config"),
         ("OCR", "ocr_durchgefuehrt"),
         ("OCR vollst.", "ocr_vollstaendig"),
         ("Audioanalyse", "audioanalyse_spektrogramm"),
@@ -5235,6 +5269,286 @@ def _audio_title_from_summary(summary: dict) -> str:
     return ""
 
 
+def _summary_video_link(summary: dict) -> str:
+    if not isinstance(summary, dict):
+        return ""
+    for key in ("youtube_url", "video_url", "url", "link", "source_url"):
+        txt = str(summary.get(key, "") or "").strip()
+        if txt:
+            return txt
+    return ""
+
+
+def _build_youtube_title_excel_bytes(rows: list[dict]) -> bytes:
+    """Build an Excel workbook for matching MAT folders with vehicle metadata."""
+    from xml.sax.saxutils import escape
+
+    out_rows = []
+    for row in rows or []:
+        folder = str(row.get("mat_datei", "") or "").strip()
+        remote_key = str(row.get("remote_key", "") or "").strip()
+        summary = {}
+        if remote_key and isinstance(st.session_state.get("mat_summary_cache"), dict):
+            summary = dict(st.session_state.mat_summary_cache.get(remote_key) or {})
+        if remote_key and not summary and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+            try:
+                summary = _get_mat_summary_from_r2(remote_key)
+            except Exception:
+                summary = {}
+        out_rows.append({
+            "youtube video title": _audio_title_from_summary(summary),
+            "link": _summary_video_link(summary),
+            "folder/.mat-name": folder or summary.get("capture_folder") or Path(remote_key).name,
+            "remote_key": remote_key,
+            "mat_file": summary.get("mat_file", Path(remote_key).name if remote_key else ""),
+        })
+    columns = ["youtube video title", "link", "folder/.mat-name", "remote_key", "mat_file"]
+    df = pd.DataFrame(out_rows, columns=columns)
+    buf = io.BytesIO()
+    sheet_rows = [columns] + df.fillna("").astype(str).values.tolist()
+
+    def _cell_ref(row_idx: int, col_idx: int) -> str:
+        name = ""
+        n = col_idx
+        while n:
+            n, rem = divmod(n - 1, 26)
+            name = chr(65 + rem) + name
+        return f"{name}{row_idx}"
+
+    rows_xml = []
+    for r_idx, row_vals in enumerate(sheet_rows, 1):
+        cells = []
+        for c_idx, val in enumerate(row_vals, 1):
+            cells.append(f'<c r="{_cell_ref(r_idx, c_idx)}" t="inlineStr"><is><t>{escape(str(val))}</t></is></c>')
+        rows_xml.append(f'<row r="{r_idx}">{"".join(cells)}</row>')
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData>' + "".join(rows_xml) + '</sheetData>'
+        '</worksheet>'
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="youtube_titles" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types_xml)
+        z.writestr("_rels/.rels", rels_xml)
+        z.writestr("xl/workbook.xml", workbook_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buf.getvalue()
+
+
+def _build_audio_config_from_values(values: dict) -> dict:
+    """Return the persistent Audio Config block stored in recordResult."""
+    cfg = dict(values or {})
+    cfg["created"] = datetime.now().isoformat(timespec="seconds")
+    cfg["version"] = 1
+    return cfg
+
+
+def _save_audio_config_to_selected_mat(config: dict) -> tuple[bool, str]:
+    selected_key = str(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
+    local_mat_path = str(st.session_state.get("audio_last_mat_path") or "").strip()
+    if not selected_key and not local_mat_path:
+        return False, "Keine MAT-Datei ausgewaehlt. Bitte zuerst MAT + Video laden."
+    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp_in.close()
+    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp_out.close()
+    try:
+        if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+            ok, msg = st.session_state.r2_client.download_file(selected_key, tmp_in.name)
+            if not ok:
+                return False, f"MAT-Download fehlgeschlagen: {msg}"
+        elif local_mat_path:
+            shutil.copyfile(local_mat_path, tmp_in.name)
+        else:
+            return False, "Keine Cloud-Verbindung und keine lokale MAT-Datei verfuegbar."
+
+        load_note = ""
+        try:
+            mat_data, load_note = _loadmat_audio_save_robust(tmp_in.name)
+            if mat_data is None:
+                raise ValueError(load_note or "MAT konnte nicht gelesen werden.")
+            rr = _mat_struct_to_plain(mat_data.get("recordResult", {}))
+            if not isinstance(rr, dict):
+                rr = {"data": rr}
+            extra = {k: v for k, v in mat_data.items() if not str(k).startswith("__") and k != "recordResult"}
+        except Exception as e:
+            base = _build_save_mat_struct(build_result_json())
+            rr = _mat_struct_to_plain(base.get("recordResult", {}))
+            if not isinstance(rr, dict):
+                rr = {}
+            extra = {}
+            load_note = f"MAT-Lesefallback genutzt: {e}"
+
+        rr["audio_config"] = dict(config or {})
+        out_data = dict(extra)
+        out_data["recordResult"] = rr
+        out_data = _sanitize_mat_dict_keys(out_data)
+        sio.savemat(tmp_out.name, out_data, do_compression=True)
+
+        json_bytes = json.dumps(_mat_export_to_jsonable(out_data), ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+        if selected_key and st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+            ok_up, msg_up = st.session_state.r2_client.upload_file(tmp_out.name, selected_key)
+            if not ok_up:
+                return False, f"MAT-Upload fehlgeschlagen: {msg_up}"
+            json_key = str(Path(selected_key).with_suffix(".json"))
+            ok_json, msg_json = _upload_bytes_compat(st.session_state.r2_client, json_key, json_bytes, "application/json")
+            if not ok_json:
+                return False, f"Audio Config in MAT gespeichert, JSON-Upload fehlgeschlagen: {msg_json}"
+            try:
+                st.session_state.mat_summary_cache.pop(selected_key, None)
+            except Exception:
+                pass
+            _invalidate_and_update_mat_selection_for_capture(_current_capture_folder(), selected_key)
+            st.session_state.audio_config_last_saved_key = selected_key
+            note = f" ({load_note})" if load_note else ""
+            return True, f"Audio Config gespeichert: {selected_key}{note}"
+
+        shutil.copyfile(tmp_out.name, local_mat_path)
+        Path(str(Path(local_mat_path).with_suffix(".json"))).write_bytes(json_bytes)
+        st.session_state.audio_config_last_saved_key = local_mat_path
+        note = f" ({load_note})" if load_note else ""
+        return True, f"Audio Config lokal gespeichert: {local_mat_path}{note}"
+    finally:
+        for fp in (tmp_in.name, tmp_out.name):
+            try:
+                Path(fp).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _find_next_audio_config_target() -> dict | None:
+    current = _current_capture_folder()
+    for row in list(st.session_state.get("mat_overview_rows") or []):
+        folder = str(row.get("mat_datei", "") or "").strip()
+        if not folder:
+            folder = _mat_capture_guess_from_key(str(row.get("remote_key", "") or ""))
+        if not folder or folder == current:
+            continue
+        if not _overview_status_is_green(row.get("anfang_ende_ausgewaehlt")):
+            continue
+        if _overview_status_is_green(row.get("audio_config")):
+            continue
+        return {"folder": folder, "remote_key": str(row.get("remote_key", "") or "")}
+    return None
+
+
+def _load_next_audio_config_file() -> tuple[bool, str]:
+    if not st.session_state.get("r2_connected") or st.session_state.get("r2_client") is None:
+        return False, "Cloud ist nicht verbunden."
+    nxt = _find_next_audio_config_target()
+    if not nxt:
+        return False, "Keine naechste Datei mit Start/Ende und fehlender Audio Config gefunden."
+    folder = str(nxt.get("folder") or "")
+    key = str(nxt.get("remote_key") or "")
+    if not _try_load_video_for_capture_folder(folder):
+        return False, f"Reduzierte Datei konnte nicht geladen werden: {folder}"
+    st.session_state.capture_folder = folder
+    if key:
+        st.session_state.mat_selected_key = key
+        st.session_state.mat_pending_selected_key = key
+        try:
+            _analyze_mat_from_r2(key)
+        except Exception:
+            pass
+        mat_loaded = _load_mat_from_r2(key)
+        if mat_loaded:
+            st.session_state.audio_last_mat_path = mat_loaded
+    st.session_state.tab_default = "Audio Auswertung"
+    set_status(f"Naechste Audio-Datei geladen: {folder}", "ok")
+    return True, folder
+
+
+def _audio_validation_metrics(t_audio, rpm_audio, t_ref, y_ref, shift_s: float, mode: str) -> dict:
+    ta = np.asarray(t_audio, dtype=float).ravel()
+    ra = np.asarray(rpm_audio, dtype=float).ravel()
+    tr = np.asarray(t_ref, dtype=float).ravel() + float(shift_s)
+    yr = np.asarray(y_ref, dtype=float).ravel()
+    if ta.size == 0 or ra.size == 0 or tr.size == 0 or yr.size == 0:
+        return {"ok": False, "error": "Leere Zeitreihe."}
+    n = min(ta.size, ra.size)
+    ta, ra = ta[:n], ra[:n]
+    m = np.isfinite(ta) & np.isfinite(ra)
+    ta, ra = ta[m], ra[m]
+    mr = np.isfinite(tr) & np.isfinite(yr)
+    tr, yr = tr[mr], yr[mr]
+    if ta.size < 2 or tr.size < 2:
+        return {"ok": False, "error": "Zu wenige gueltige Punkte."}
+    order = np.argsort(tr)
+    tr, yr = tr[order], yr[order]
+    lo, hi = max(float(np.min(ta)), float(np.min(tr))), min(float(np.max(ta)), float(np.max(tr)))
+    keep = (ta >= lo) & (ta <= hi)
+    if int(keep.sum()) < 2:
+        return {"ok": False, "error": "Keine ueberlappende Zeitspanne."}
+    ta2 = ta[keep]
+    ra2 = ra[keep]
+    yr_i = np.interp(ta2, tr, yr)
+    err = ra2 - yr_i
+    abs_err = np.abs(err)
+    denom = np.maximum(np.abs(yr_i), 1e-9)
+    pct = abs_err / denom * 100.0
+    use_pct = "Prozent" in str(mode)
+    score = float(np.nanmean(pct if use_pct else abs_err))
+    return {
+        "ok": True,
+        "shift_s": float(shift_s),
+        "mode": str(mode),
+        "score": score,
+        "mae": float(np.nanmean(abs_err)),
+        "median_abs": float(np.nanmedian(abs_err)),
+        "mape_pct": float(np.nanmean(pct)),
+        "n": int(ta2.size),
+    }
+
+
+def _audio_find_best_validation_shift(t_audio, rpm_audio, t_ref, y_ref, mode: str, min_s: float, max_s: float, step_s: float, progress_cb=None) -> tuple[dict, list[str]]:
+    step = max(0.001, abs(float(step_s)))
+    shifts = np.arange(float(min_s), float(max_s) + 0.5 * step, step)
+    best = None
+    log = []
+    total = max(1, int(shifts.size))
+    for i, sh in enumerate(shifts, 1):
+        cur = _audio_validation_metrics(t_audio, rpm_audio, t_ref, y_ref, float(sh), mode)
+        if cur.get("ok") and (best is None or cur["score"] < best["score"]):
+            best = cur
+        if i == 1 or i == total or i % max(1, total // 20) == 0:
+            msg = f"Shift {sh:.3f}s getestet ({i}/{total})"
+            log.append(msg)
+            if callable(progress_cb):
+                progress_cb(i / total, msg)
+    if best is None:
+        best = {"ok": False, "error": "Kein gueltiger Shift gefunden."}
+    log.append(f"Best match: shift={best.get('shift_s', float('nan')):.3f}s, score={best.get('score', float('nan')):.3f}")
+    return best, log
+
+
 def _save_audio_result_to_selected_mat(res: dict) -> tuple[bool, str]:
     if not isinstance(res, dict) or res.get("t") is None:
         return False, "Keine Audioanalyse-Ergebnisse zum Speichern vorhanden."
@@ -5375,7 +5689,6 @@ _tab_labels = [
     "Sync",
     "MAT Selection",
     "ROI Setup",
-    "Track Analysis",
     "Audio Auswertung",
 ]
 _active_tab = _render_main_navigation(_tab_labels)
@@ -5388,7 +5701,6 @@ elif _active_tab == "MAT Selection":
     mat_selection_tab.render(globals())
 elif _active_tab == "ROI Setup":
     roi_setup_tab.render(globals())
-elif _active_tab == "Track Analysis":
-    track_analysis_tab.render(globals())
 elif _active_tab == "Audio Auswertung":
     audio_tab.render(globals())
+

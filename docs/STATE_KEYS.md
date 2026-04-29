@@ -10,5 +10,5 @@ This document tracks shared keys that cross module boundaries. Add new cross-tab
 | `mat_*` | MAT selection tab | Selected MAT file and scan state |
 | `roi_*` | ROI setup tab | ROI editor, OCR probe, save/load state |
 | `audio_*` | audio tab | Audio/RPM background analysis state |
-| `track_*` | track tab | Track calibration and detection outputs |
+| `track_*` | ROI Setup tab | Track calibration and detection outputs |
 | `tab_default`, `active_main_tab` | app shell | Navigation behavior |

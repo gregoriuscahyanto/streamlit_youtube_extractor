@@ -38,7 +38,7 @@ def render(ns):
     running = bool(st.session_state.mat_update_running)
     load_running = bool(st.session_state.mat_load_running)
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     update_label = "Stop" if running else "Update"
     update_clicked = c1.button(
         update_label,
@@ -62,10 +62,37 @@ def render(ns):
         key="mat_load_all_tab",
         disabled=not can_load,
     )
+    title_export_clicked = c3.button(
+        "YouTube-Titel Excel",
+        width="stretch",
+        key="mat_youtube_title_excel_btn",
+        disabled=not bool(st.session_state.get("mat_overview_rows")),
+        help="Erstellt eine lokale Excel-Datei fuer den Match mit der Fahrzeugdatenbank. Es wird nichts in die Cloud gespeichert.",
+    )
 
     progress_slot = st.empty()
     table_slot = st.empty()
 
+    if title_export_clicked:
+        try:
+            excel_rows = list(st.session_state.get("mat_overview_rows") or [])
+            st.session_state["mat_youtube_title_excel_bytes"] = _build_youtube_title_excel_bytes(excel_rows)
+            st.session_state["mat_youtube_title_excel_name"] = f"youtube_titles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            set_status(f"YouTube-Titel Excel erstellt ({len(excel_rows)} Zeilen).", "ok")
+        except Exception as e:
+            st.session_state["mat_youtube_title_excel_bytes"] = b""
+            set_status(f"YouTube-Titel Excel konnte nicht erstellt werden: {e}", "warn")
+
+    _title_xlsx = st.session_state.get("mat_youtube_title_excel_bytes") or b""
+    if _title_xlsx:
+        st.download_button(
+            "YouTube-Titel Excel herunterladen",
+            data=_title_xlsx,
+            file_name=st.session_state.get("mat_youtube_title_excel_name", "youtube_titles.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+            key="mat_youtube_title_excel_download",
+        )
 
     if update_clicked:
         if running:
@@ -262,7 +289,6 @@ def render(ns):
         st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
-
 
 
 

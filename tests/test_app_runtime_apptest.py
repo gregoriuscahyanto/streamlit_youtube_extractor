@@ -23,7 +23,6 @@ class TestAppRuntimeWithAppTest(unittest.TestCase):
         # The app intentionally avoids st.tabs because Streamlit renders every
         # tab body on each rerun. Force each active area once through the
         # segmented navigation.
-        expected_tabs = 6
         self.assertEqual(len(at.button_group), 1, "Hauptnavigation fehlt.")
         self.assertEqual(
             list(at.button_group[0].options),
@@ -32,7 +31,6 @@ class TestAppRuntimeWithAppTest(unittest.TestCase):
                 "Sync",
                 "MAT Selection",
                 "ROI Setup",
-                "Track Analysis",
                 "Audio Auswertung",
             ],
         )

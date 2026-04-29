@@ -70,6 +70,60 @@ def render(ns):
             gear_ratios = []
         st.caption("Getriebe wird nur genutzt, wenn nutzbare Geschwindigkeit/OCR-v vorhanden ist. Ohne v bleibt die RPM-Erkennung rein audio-basiert.")
 
+    current_audio_config = _build_audio_config_from_values({
+        "stft_mode": aud_stft_mode,
+        "nfft": aud_nfft,
+        "overlap_pct": aud_ov,
+        "fmax": aud_fmax,
+        "method": aud_method,
+        "drive_type": drive_type,
+        "cyl_mode": cyl_mode,
+        "harmonic_mode": harm_mode,
+        "cyl": aud_cyl,
+        "order": aud_order,
+        "takt": aud_takt,
+        "rpm_min": aud_rpm_min,
+        "rpm_max": aud_rpm_max,
+        "audio_offset_s": aud_offset,
+        "use_ocr_v": use_ocr_v,
+        "r_dyn_m": r_dyn,
+        "tol_pct": tol_pct,
+        "axle_ratio": axle_ratio,
+        "gear_ratios": gear_ratios,
+        "prefer_low": prefer_low,
+        "method_params": method_params,
+    })
+
+    cfg_c1, cfg_c2 = st.columns(2)
+    save_cfg_disabled = not bool(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or st.session_state.get("audio_last_mat_path"))
+    if cfg_c1.button("Audio Config speichern", width="stretch", key="aud_save_config", disabled=save_cfg_disabled):
+        with st.spinner("Audio Config wird gespeichert ..."):
+            ok_cfg, msg_cfg = _save_audio_config_to_selected_mat(current_audio_config)
+        if ok_cfg:
+            st.success(msg_cfg)
+            set_status("Audio Config gespeichert.", "ok")
+        else:
+            st.error(msg_cfg)
+            set_status(msg_cfg, "warn")
+    if cfg_c2.button("Hole naechste Datei", width="stretch", key="aud_load_next_config_target"):
+        with st.spinner("Naechste Datei wird geladen ..."):
+            ok_next, msg_next = _load_next_audio_config_file()
+        set_status(msg_next, "ok" if ok_next else "warn")
+        if ok_next:
+            st.rerun()
+    if save_cfg_disabled:
+        st.caption("Audio Config kann gespeichert werden, sobald eine MAT-Datei ueber MAT Selection geladen ist.")
+    _cur_summary = st.session_state.get("mat_selected_summary") or {}
+    _automation_ready = bool(
+        _cur_summary.get("start_end_selected")
+        and _cur_summary.get("audio_config_done")
+    )
+    st.caption(
+        "Automatisierung bereit: Start/Ende und Audio Config vorhanden."
+        if _automation_ready
+        else "Automatisierung gesperrt: benoetigt mindestens Start/Ende und gespeicherte Audio Config."
+    )
+
     _live_log_ref = st.session_state.get("audio_bg_log_ref")
     if isinstance(_live_log_ref, list) and _live_log_ref:
         st.session_state.audio_debug_lines = list(_live_log_ref[-200:])
@@ -295,3 +349,100 @@ def render(ns):
         if save_mat_disabled:
             st.caption("Zum Speichern zuerst in MAT Selection eine MAT-Datei mit MAT + Video laden.")
 
+    st.divider()
+    st.subheader("RPM Validierung")
+
+    def _validation_table_from_upload(uploaded):
+        if uploaded is None:
+            return pd.DataFrame()
+        name = str(getattr(uploaded, "name", "") or "").lower()
+        raw = uploaded.getvalue()
+        if name.endswith(".csv"):
+            return pd.read_csv(io.BytesIO(raw))
+        if name.endswith((".xlsx", ".xls")):
+            return pd.read_excel(io.BytesIO(raw))
+        if name.endswith(".mat"):
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+            try:
+                tmp.write(raw)
+                tmp.close()
+                data = sio.loadmat(tmp.name, squeeze_me=True, struct_as_record=False, verify_compressed_data_integrity=False)
+                cols = {}
+                for key, value in data.items():
+                    if str(key).startswith("__"):
+                        continue
+                    try:
+                        arr = np.asarray(value, dtype=float).ravel()
+                    except Exception:
+                        continue
+                    if arr.size >= 2 and np.isfinite(arr).any():
+                        cols[str(key)] = arr
+                if not cols:
+                    return pd.DataFrame()
+                n = min(len(v) for v in cols.values())
+                return pd.DataFrame({k: np.asarray(v[:n], dtype=float) for k, v in cols.items()})
+            finally:
+                try:
+                    Path(tmp.name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return pd.DataFrame()
+
+    val_file = st.file_uploader(
+        "Referenzdatei laden",
+        type=["mat", "csv", "xlsx", "xls"],
+        key="aud_validation_file",
+        help="Laedt eine Referenz-Zeitreihe fuer den RPM-Abgleich.",
+    )
+    try:
+        val_df = _validation_table_from_upload(val_file)
+    except Exception as e:
+        val_df = pd.DataFrame()
+        st.warning(f"Referenzdatei konnte nicht gelesen werden: {e}")
+
+    if not val_df.empty:
+        numeric_cols = [c for c in val_df.columns if pd.api.types.is_numeric_dtype(val_df[c])]
+        if len(numeric_cols) >= 2:
+            vc = st.columns(4)
+            time_col = vc[0].selectbox("Zeitspalte", numeric_cols, key="aud_val_time_col")
+            rpm_col = vc[1].selectbox("Parameter/RPM", numeric_cols, index=1 if len(numeric_cols) > 1 else 0, key="aud_val_rpm_col")
+            metric_mode = vc[2].selectbox("Genauigkeit", ["Absolutwert", "Prozentual"], key="aud_val_metric_mode")
+            time_shift = float(vc[3].number_input("Zeitverschiebung [s]", -60.0, 60.0, 0.0, step=0.05, key="aud_val_shift_s"))
+
+            res_now = st.session_state.get("audio_analysis_result") or {}
+            has_rpm = isinstance(res_now, dict) and res_now.get("t") is not None and res_now.get("rpm") is not None
+            run_c1, run_c2 = st.columns(2)
+            if run_c1.button("Validierung berechnen", width="stretch", key="aud_val_calc", disabled=not has_rpm):
+                st.session_state.audio_validation_result = _audio_validation_metrics(
+                    res_now.get("t"), res_now.get("rpm"),
+                    val_df[time_col].to_numpy(), val_df[rpm_col].to_numpy(),
+                    time_shift, metric_mode,
+                )
+            if run_c2.button("Find best match", width="stretch", key="aud_val_find_best", disabled=not has_rpm):
+                prog = st.progress(0.0, text="Best Match startet ...")
+                best, dbg = _audio_find_best_validation_shift(
+                    res_now.get("t"), res_now.get("rpm"),
+                    val_df[time_col].to_numpy(), val_df[rpm_col].to_numpy(),
+                    metric_mode, -5.0, 5.0, 0.05,
+                    progress_cb=lambda frac, msg: prog.progress(float(frac), text=msg),
+                )
+                st.session_state.audio_validation_result = best
+                st.session_state.audio_validation_debug = dbg
+                prog.empty()
+            if not has_rpm:
+                st.caption("Bitte zuerst eine Audioanalyse starten, damit eine RPM-Zeitreihe fuer die Validierung vorhanden ist.")
+
+            vr = st.session_state.get("audio_validation_result")
+            if isinstance(vr, dict):
+                if vr.get("ok"):
+                    st.metric("Match Score", f"{vr.get('score', 0.0):.3f}", help=f"Modus: {vr.get('mode')}, Punkte: {vr.get('n')}")
+                    st.caption(f"MAE={vr.get('mae', 0.0):.2f} RPM · Median={vr.get('median_abs', 0.0):.2f} RPM · MAPE={vr.get('mape_pct', 0.0):.2f}% · Shift={vr.get('shift_s', 0.0):.3f}s")
+                elif vr.get("error"):
+                    st.warning(str(vr.get("error")))
+            if st.session_state.get("audio_validation_debug"):
+                with st.expander("Debug Logs Best Match", expanded=False):
+                    st.code("\n".join(str(x) for x in st.session_state.audio_validation_debug[-120:]), language="text")
+        else:
+            st.info("Die Referenzdatei braucht mindestens zwei numerische Spalten.")
+    else:
+        st.caption("Optional: MAT, Excel oder CSV laden, um die erkannte RPM-Kurve gegen eine Referenz zu validieren.")

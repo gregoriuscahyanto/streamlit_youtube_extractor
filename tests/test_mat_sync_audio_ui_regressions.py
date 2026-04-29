@@ -226,7 +226,6 @@ def test_tabs_are_split_into_renderer_modules():
         "mat_selection_tab.py",
         "audio_tab.py",
         "roi_setup_tab.py",
-        "track_analysis_tab.py",
     ]
     for name in modules:
         path = repo / "app_tabs" / name
@@ -238,9 +237,12 @@ def test_tabs_are_split_into_renderer_modules():
     assert "from app_tabs import" in app_source
     assert "_render_main_navigation(_tab_labels)" in app_source
     assert "st.tabs(" not in app_source
-    assert '"Track Analysis"' in app_source
-    for name in ("setup_tab", "sync_tab", "mat_selection_tab", "audio_tab", "roi_setup_tab", "track_analysis_tab"):
+    assert '"Track Analysis"' not in app_source
+    for name in ("setup_tab", "sync_tab", "mat_selection_tab", "audio_tab", "roi_setup_tab"):
         assert f"{name}.render(globals())" in app_source
+    roi_source = (repo / "app_tabs" / "roi_setup_tab.py").read_text(encoding="utf-8")
+    assert "def _render_track_analysis_section" in roi_source
+    assert "2 · Track Analysis" in roi_source
 
 
 def test_audio_result_can_be_saved_to_local_mat_copy():
