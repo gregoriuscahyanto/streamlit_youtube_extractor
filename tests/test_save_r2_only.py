@@ -9,6 +9,7 @@ import scipy.io as sio
 
 from save_helpers import (
     build_merged_mat_json,
+    build_merged_mat_json_fields,
     field_exists_in_rr,
     rr_from_mat_bytes,
 )
@@ -108,6 +109,29 @@ class TestBuildMergedMatJson(unittest.TestCase):
         _, json_bytes = build_merged_mat_json(raw, "audio_config", {"src": "test"})
         decoded = json_bytes.decode("utf-8")
         self.assertIn("recordResult", decoded)
+
+    def test_multi_field_update_preserves_unrelated_sections(self):
+        import json
+        raw = _simple_mat_bytes({
+            "ocr": {"params": {"start_s": 1.0}, "roi_table": ["old"]},
+            "audio_config": {"nfft": 4096.0},
+            "audio_rpm": {"processed": {"rpm": np.array([1000.0])}},
+            "validation": {"results": {"ok": True}},
+        })
+        _mat_bytes, json_bytes = build_merged_mat_json_fields(
+            raw,
+            {
+                "ocr": {"params": {"start_s": 2.0}, "roi_table": ["new"]},
+                "metadata": {"video_faulty": True},
+            },
+        )
+        rr = json.loads(json_bytes.decode("utf-8"))["recordResult"]
+        self.assertEqual(rr["ocr"]["params"]["start_s"], 2.0)
+        self.assertTrue(rr["metadata"]["video_faulty"])
+        self.assertEqual(rr["metadata"]["title"], "Test")
+        self.assertIn("audio_config", rr)
+        self.assertIn("audio_rpm", rr)
+        self.assertIn("validation", rr)
 
 
 if __name__ == "__main__":

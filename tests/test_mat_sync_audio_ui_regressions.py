@@ -60,6 +60,7 @@ def _load_audio_save_namespace():
         "_build_audio_rpm_struct_from_result",
         "_loadmat_audio_save_robust",
         "_audio_title_from_summary",
+        "_mat_export_to_jsonable",
         "_sanitize_mat_dict_keys",
         "_save_audio_result_to_selected_mat",
     }

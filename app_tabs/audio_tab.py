@@ -269,7 +269,14 @@ def render(ns):
 
     running_bg = st.session_state.get("audio_bg_future") is not None
     audio_started_this_run = False
-    if st.button("Audioanalyse starten", type="primary", width="stretch", key="aud_run_new", disabled=running_bg):
+    manual_start_clicked = st.button(
+        "Audioanalyse starten",
+        type="primary",
+        width="stretch",
+        key="aud_run_new",
+        disabled=running_bg,
+    )
+    if manual_start_clicked:
         ok,msg,fs,y,source=_audio_load_current_capture()
         if not ok:
             st.error(msg); set_status(msg,"warn")

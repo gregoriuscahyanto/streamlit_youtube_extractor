@@ -1,27 +1,21 @@
-"""
-save_helpers.py
-Streamlit-unabhängige Hilfsfunktionen für MAT/JSON-Speicheroperationen.
+"""Streamlit-independent helpers for MAT/JSON save operations.
 
-Jede Funktion nimmt raw bytes entgegen und gibt bytes zurück – kein
-Dateisystem, kein Streamlit, kein R2-Client. Testbar mit RTK/pytest.
+Each function accepts raw bytes and returns raw bytes. No filesystem, no
+Streamlit, no R2 client. This keeps the merge logic testable with RTK/pytest.
 """
 
 from __future__ import annotations
 
+import copy
 import io
 import json
-from pathlib import Path
 
 import numpy as np
 import scipy.io as sio
 
 
-# ---------------------------------------------------------------------------
-# Interne Helfer
-# ---------------------------------------------------------------------------
-
-def _mat_struct_to_plain_simple(obj) -> dict:
-    """Minimal recursive mat_struct → dict converter (no Streamlit dep)."""
+def _mat_struct_to_plain_simple(obj):
+    """Minimal recursive mat_struct-to-dict converter without Streamlit deps."""
     if hasattr(obj, "_fieldnames"):
         return {f: _mat_struct_to_plain_simple(getattr(obj, f, None)) for f in (obj._fieldnames or [])}
     if isinstance(obj, dict):
@@ -35,8 +29,8 @@ def _mat_struct_to_plain_simple(obj) -> dict:
     return obj
 
 
-def _to_jsonable(obj) -> object:
-    """Recursively convert numpy types and arrays to JSON-serializable types."""
+def _to_jsonable(obj):
+    """Recursively convert numpy values and arrays to JSON-serializable values."""
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     if isinstance(obj, np.integer):
@@ -47,11 +41,37 @@ def _to_jsonable(obj) -> object:
         return {k: _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="ignore")
     return obj
 
 
-def _sanitize_keys(obj, max_len: int = 31) -> object:
-    """Truncate all dict keys to max_len characters (MATLAB MAT-5 limit)."""
+def _deep_merge_missing(dst: dict, src: dict) -> dict:
+    """Merge src into dst without overwriting existing values."""
+    if not isinstance(dst, dict) or not isinstance(src, dict):
+        return dst
+    for k, v in src.items():
+        if k not in dst or dst[k] is None:
+            dst[k] = copy.deepcopy(v)
+        elif isinstance(dst.get(k), dict) and isinstance(v, dict):
+            _deep_merge_missing(dst[k], v)
+    return dst
+
+
+def _deep_merge_replace(dst: dict, src: dict) -> dict:
+    """Merge src into dst and overwrite only keys present in src."""
+    if not isinstance(dst, dict) or not isinstance(src, dict):
+        return dst
+    for k, v in src.items():
+        if isinstance(dst.get(k), dict) and isinstance(v, dict):
+            _deep_merge_replace(dst[k], v)
+        else:
+            dst[k] = copy.deepcopy(v)
+    return dst
+
+
+def _sanitize_keys(obj, max_len: int = 31):
+    """Truncate dict keys to the MATLAB MAT-5 field-name limit."""
     if isinstance(obj, dict):
         seen: dict[str, int] = {}
         out: dict = {}
@@ -62,8 +82,8 @@ def _sanitize_keys(obj, max_len: int = 31) -> object:
                 safe = base
             else:
                 seen[base] += 1
-                sfx = f"_{seen[base]}"
-                safe = base[: max_len - len(sfx)] + sfx
+                suffix = f"_{seen[base]}"
+                safe = base[: max_len - len(suffix)] + suffix
             out[safe] = _sanitize_keys(v, max_len)
         return out
     if isinstance(obj, list):
@@ -72,10 +92,7 @@ def _sanitize_keys(obj, max_len: int = 31) -> object:
 
 
 def _load_rr_from_bytes(raw: bytes) -> tuple[dict, dict]:
-    """Load a MAT bytes blob and return (recordResult_plain_dict, extra_top_level_dict).
-
-    Returns ({}, {}) on any error.
-    """
+    """Load MAT bytes and return (recordResult_dict, extra_top_level_dict)."""
     if not raw:
         return {}, {}
     try:
@@ -86,7 +103,6 @@ def _load_rr_from_bytes(raw: bytes) -> tuple[dict, dict]:
             verify_compressed_data_integrity=False,
         )
     except NotImplementedError:
-        # v7.3 HDF5 — no BytesIO support; return empty
         return {}, {}
     except Exception:
         return {}, {}
@@ -104,12 +120,8 @@ def _load_rr_from_bytes(raw: bytes) -> tuple[dict, dict]:
     return rr, extra
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def field_exists_in_rr(mat_bytes: bytes, field_name: str) -> bool:
-    """Return True if recordResult.<field_name> exists and is non-empty in mat_bytes."""
+    """Return True if recordResult.<field_name> exists and is non-empty."""
     rr, _ = _load_rr_from_bytes(mat_bytes)
     val = rr.get(field_name)
     if val is None:
@@ -129,38 +141,57 @@ def rr_from_mat_bytes(mat_bytes: bytes) -> tuple[dict, dict]:
 def build_merged_mat_json(
     existing_mat_bytes: bytes,
     field_name: str,
-    new_value: object,
+    new_value,
     extra_rr_fields: dict | None = None,
+    base_record_result: dict | None = None,
 ) -> tuple[bytes, bytes]:
-    """Merge *new_value* into recordResult.<field_name> and return (mat_bytes, json_bytes).
+    """Replace one recordResult field and preserve all other fields."""
+    return build_merged_mat_json_fields(
+        existing_mat_bytes,
+        {field_name: new_value},
+        extra_rr_fields=extra_rr_fields,
+        base_record_result=base_record_result,
+    )
 
-    *extra_rr_fields* are merged into recordResult for fields not already present
-    (e.g. {"metadata": {"title": "..."}}).  Does not overwrite existing rr keys.
 
-    If *existing_mat_bytes* is empty or unreadable, starts from a blank recordResult.
-    The output JSON and MAT always contain the same recordResult structure.
+def build_merged_mat_json_fields(
+    existing_mat_bytes: bytes,
+    replace_rr_fields: dict,
+    extra_rr_fields: dict | None = None,
+    base_record_result: dict | None = None,
+) -> tuple[bytes, bytes]:
+    """Replace selected recordResult fields and preserve all other fields.
+
+    Normal fields such as ``ocr``, ``audio_config``, ``audio_rpm`` and
+    ``audio_validation`` are replaced as complete sections. ``metadata`` is
+    merged key-by-key so status stamps can update their keys without erasing
+    title, link, or other unrelated metadata.
     """
     rr, extra = _load_rr_from_bytes(existing_mat_bytes)
+
+    if isinstance(base_record_result, dict) and base_record_result:
+        if not rr:
+            rr = copy.deepcopy(base_record_result)
+        else:
+            _deep_merge_missing(rr, base_record_result)
+
     if extra_rr_fields:
-        for k, v in extra_rr_fields.items():
-            if rr.get(k) is None:
-                rr[k] = v
+        _deep_merge_missing(rr, extra_rr_fields)
 
-    rr[field_name] = new_value
+    for field_name, new_value in dict(replace_rr_fields or {}).items():
+        if field_name == "metadata" and isinstance(new_value, dict) and isinstance(rr.get("metadata"), dict):
+            _deep_merge_replace(rr["metadata"], new_value)
+        else:
+            rr[field_name] = new_value
 
-    out_data: dict = dict(extra)
+    out_data = dict(extra)
     out_data["recordResult"] = rr
     out_data = _sanitize_keys(out_data)
 
-    # ── MAT ─────────────────────────────────────────────────────────────────
     mat_buf = io.BytesIO()
     sio.savemat(mat_buf, out_data, do_compression=True)
     mat_bytes = mat_buf.getvalue()
 
-    # ── JSON ─────────────────────────────────────────────────────────────────
     json_payload = _to_jsonable(out_data)
-    json_bytes = json.dumps(
-        json_payload, ensure_ascii=False, indent=2, default=str
-    ).encode("utf-8")
-
+    json_bytes = json.dumps(json_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
     return mat_bytes, json_bytes

@@ -1,4 +1,4 @@
-"""Renderer for the Streamlit tab extracted from app.py.
+﻿"""Renderer for the Streamlit tab extracted from app.py.
 
 The renderer receives app.py globals so existing helper functions and
 session-state conventions remain shared during the incremental split.
@@ -22,7 +22,7 @@ def render(ns):
             line-height: 1.45;
         ">
           <b>MAT -> JSON Auto-Cache aktiv:</b> Vorhandene JSON-Sidecars werden automatisch genutzt.
-          Fehlt die JSON, liest das Update die MAT-Datei und erzeugt bei vollstaendigen Daten automatisch
+          Fehlt die JSON, liest das Update die MAT-Datei und erzeugt automatisch
           eine gleichnamige JSON-Datei in R2/results.
         </div>
         """,
@@ -62,37 +62,24 @@ def render(ns):
         key="mat_load_all_tab",
         disabled=not can_load,
     )
-    title_export_clicked = c3.button(
+    excel_rows = list(st.session_state.get("mat_overview_rows") or [])
+    try:
+        title_excel_bytes = _build_youtube_title_excel_bytes(excel_rows) if excel_rows else b""
+    except Exception:
+        title_excel_bytes = b""
+    c3.download_button(
         "YouTube-Titel Excel",
+        data=title_excel_bytes,
+        file_name=f"youtube_titles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
         key="mat_youtube_title_excel_btn",
-        disabled=not bool(st.session_state.get("mat_overview_rows")),
-        help="Erstellt eine lokale Excel-Datei fuer den Match mit der Fahrzeugdatenbank. Es wird nichts in die Cloud gespeichert.",
+        disabled=not bool(title_excel_bytes),
+        help="Laedt direkt eine Excel-Datei fuer den Match mit der Fahrzeugdatenbank herunter. Es wird nichts in die Cloud gespeichert.",
     )
 
     progress_slot = st.empty()
     table_slot = st.empty()
-
-    if title_export_clicked:
-        try:
-            excel_rows = list(st.session_state.get("mat_overview_rows") or [])
-            st.session_state["mat_youtube_title_excel_bytes"] = _build_youtube_title_excel_bytes(excel_rows)
-            st.session_state["mat_youtube_title_excel_name"] = f"youtube_titles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            set_status(f"YouTube-Titel Excel erstellt ({len(excel_rows)} Zeilen).", "ok")
-        except Exception as e:
-            st.session_state["mat_youtube_title_excel_bytes"] = b""
-            set_status(f"YouTube-Titel Excel konnte nicht erstellt werden: {e}", "warn")
-
-    _title_xlsx = st.session_state.get("mat_youtube_title_excel_bytes") or b""
-    if _title_xlsx:
-        st.download_button(
-            "YouTube-Titel Excel herunterladen",
-            data=_title_xlsx,
-            file_name=st.session_state.get("mat_youtube_title_excel_name", "youtube_titles.xlsx"),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch",
-            key="mat_youtube_title_excel_download",
-        )
 
     if update_clicked:
         if running:
@@ -136,28 +123,6 @@ def render(ns):
 
     current_selected_key = str(st.session_state.get("mat_pending_selected_key", "") or "")
 
-    # Location field: Aufnahmeort / Strecke – saved in session state, used by automation logic.
-    _loc_col1, _loc_col2 = st.columns([2, 1])
-    _loc_val = _loc_col1.text_input(
-        "Aufnahmeort / Strecke",
-        value=str(st.session_state.get("audio_location", "") or ""),
-        key="audio_location_input",
-        placeholder="z.B. Nuerburgring, Spa, ...",
-        help="Wird beim Speichern als Metadaten-Feld 'location' in die Datei uebernommen.",
-    )
-    st.session_state["audio_location"] = str(_loc_val or "").strip()
-
-    # Automatisierungs-Status fuer die aktuell geladene Datei
-    _cur_summary = st.session_state.get("mat_selected_summary") or {}
-    _automation_ready = bool(
-        _cur_summary.get("start_end_selected") and _cur_summary.get("audio_config_done")
-    )
-    _loc_col2.markdown("<br>", unsafe_allow_html=True)
-    if _automation_ready:
-        _loc_col2.success("Automatisierung bereit")
-    else:
-        _loc_col2.info("Automatisierung gesperrt")
-
     if st.session_state.mat_overview_rows:
         df_overview = pd.DataFrame(st.session_state.mat_overview_rows)
         df_overview = _normalize_overview_lamps(df_overview)
@@ -187,13 +152,14 @@ def render(ns):
                 st.caption(f"{hidden_no_roi} als 'kein ROI vorhanden' markierte Fälle ausgeblendet.")
         is_running_now = bool(st.session_state.mat_update_running)
         styled_df = display_df
+        visible_df = styled_df.drop(columns=["remote_key"], errors="ignore")
         allow_select = not is_running_now and not load_running
         if display_df.empty:
             table_slot.empty()
             st.info("Keine Fälle passend zum aktuellen Filter.")
         elif allow_select:
             sel_event = table_slot.dataframe(
-                styled_df,
+                visible_df,
                 width="stretch",
                 hide_index=True,
                 height=MAT_TABLE_HEIGHT,
@@ -217,12 +183,12 @@ def render(ns):
             with table_slot.container():
                 st.markdown('<div class="mat-selection-disabled">MAT-Auswahl wird aktualisiert ...</div>', unsafe_allow_html=True)
                 try:
-                    disabled_view = styled_df.style.set_properties(**{
+                    disabled_view = visible_df.style.set_properties(**{
                         "background-color": "#20232b",
                         "color": "#7d8491",
                     })
                 except Exception:
-                    disabled_view = styled_df
+                    disabled_view = visible_df
                 st.dataframe(
                     disabled_view,
                     width="stretch",

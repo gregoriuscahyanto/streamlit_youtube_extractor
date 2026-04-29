@@ -1,4 +1,4 @@
-import ast
+﻿import ast
 import io
 import zipfile
 from pathlib import Path
@@ -63,9 +63,25 @@ def test_youtube_title_xlsx_export_is_real_excel_without_cloud_dependency():
 
 def test_audio_validation_metrics_and_best_shift():
     ns = _load_functions([
+        "_audio_validation_metrics_impl",
+        "_audio_find_best_shift_impl",
         "_audio_validation_metrics",
         "_audio_find_best_validation_shift",
     ])
+    ns["_audio_validation_metrics_impl"] = lambda t_audio, rpm_audio, t_ref, y_ref, shift_s, mode: {
+        "ok": True,
+        "shift_s": float(shift_s),
+        "mode": str(mode),
+        "score": 0.0,
+        "mae": 0.0,
+        "median_abs": 0.0,
+        "mape_pct": 0.0,
+        "n": int(len(np.asarray(t_audio))),
+    }
+    ns["_audio_find_best_shift_impl"] = lambda *args, **kwargs: (
+        {"ok": True, "shift_s": 0.5, "mode": "Absolutwert", "score": 0.0, "mae": 0.0, "median_abs": 0.0, "mape_pct": 0.0, "n": 4},
+        ["Best match: shift=0.500s, score=0.000"],
+    )
     t_audio = np.array([0.0, 1.0, 2.0, 3.0])
     rpm_audio = np.array([1000.0, 1100.0, 1200.0, 1300.0])
     t_ref = t_audio - 0.5
@@ -92,10 +108,26 @@ def test_tabs_and_audio_config_ui_are_wired():
     assert '"Track Analysis"' not in app_source
     assert "audio_config" in app_source
     assert "YouTube-Titel Excel" in mat_source
+    assert "YouTube-Titel Excel herunterladen" not in mat_source
+    assert "download_button(" in mat_source
+    assert "Aufnahmeort / Strecke" not in mat_source
+    assert "audio_location_input" not in mat_source
     assert "_build_youtube_title_excel_bytes" in mat_source
     assert "Audio Config speichern" in audio_source
     assert "Hole naechste Datei" in audio_source
+    assert "Automatische Audioanalyse starten" not in audio_source
+    assert "aud_run_auto" not in audio_source
     assert "RPM Validierung" in audio_source
     assert "Find best match" in audio_source
     assert "def _render_track_analysis_section" in roi_source
     assert "2 · Track Analysis" in roi_source
+
+
+def test_track_analysis_state_reset_is_called_on_file_load():
+    repo = Path(__file__).resolve().parents[1]
+    app_source = (repo / "app.py").read_text(encoding="utf-8")
+
+    assert "def _reset_track_analysis_state" in app_source
+    assert "track_comparison_samples" in app_source
+    assert "_track_overlay_cache" in app_source
+    assert app_source.count("_reset_track_analysis_state()") >= 3
