@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import scipy.io as sio
 
-from save_helpers import (
+from core.save_helpers import (
     build_merged_mat_json,
     build_merged_mat_json_fields,
     field_exists_in_rr,
@@ -105,7 +105,7 @@ class TestBuildMergedMatJson(unittest.TestCase):
         self.assertIsInstance(json_bytes, bytes)
 
     def test_json_is_valid_utf8(self):
-        raw = _simple_mat_bytes({"metadata": {"title": "Nürburgring Runde"}})
+        raw = _simple_mat_bytes({"metadata": {"title": "NÃ¼rburgring Runde"}})
         _, json_bytes = build_merged_mat_json(raw, "audio_config", {"src": "test"})
         decoded = json_bytes.decode("utf-8")
         self.assertIn("recordResult", decoded)
@@ -136,3 +136,4 @@ class TestBuildMergedMatJson(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

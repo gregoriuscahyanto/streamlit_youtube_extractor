@@ -1,4 +1,4 @@
-﻿import ast
+import ast
 import concurrent.futures as cf
 import io
 import json

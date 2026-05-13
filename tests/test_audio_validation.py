@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import scipy.io as sio
 
-from audio_validation import (
+from core.audio_validation import (
     build_validation_figure,
     dataframe_from_mat_bytes,
     dataframe_from_upload,
@@ -156,7 +156,7 @@ class TestValidationMetrics(unittest.TestCase):
         self.assertAlmostEqual(r["sum_abs_err"], 0.0, places=4)
 
     def test_known_offset_detected(self):
-        # reference is offset by +100 RPM – MAE should be ~100
+        # reference is offset by +100 RPM â€“ MAE should be ~100
         r = validation_metrics(self.t, self.rpm, self.t, self.rpm + 100.0)
         self.assertTrue(r["ok"])
         self.assertAlmostEqual(r["mae"], 100.0, delta=1.0)
@@ -191,7 +191,7 @@ class TestValidationMetrics(unittest.TestCase):
     def test_percentage_mode(self):
         r = validation_metrics(self.t, self.rpm, self.t, self.rpm * 1.1, mode="Prozentual")
         self.assertTrue(r["ok"])
-        # ~10 % offset → mape should be ~10
+        # ~10 % offset â†’ mape should be ~10
         self.assertAlmostEqual(r["mape_pct"], 10.0, delta=2.0)
 
 
@@ -209,7 +209,7 @@ class TestFindBestShift(unittest.TestCase):
 
     def test_finds_correct_shift(self):
         t, rpm = _make_sine_rpm(n=200, fs=5.0)
-        # ref is 1 s late → best shift should be −1 s (shift ref forward by 1 s)
+        # ref is 1 s late â†’ best shift should be âˆ’1 s (shift ref forward by 1 s)
         t_ref = t + 1.0
         best, log = find_best_shift(t, rpm, t_ref, rpm, min_s=-2.0, max_s=2.0, step_s=0.1)
         self.assertTrue(best["ok"])
@@ -218,7 +218,7 @@ class TestFindBestShift(unittest.TestCase):
     def test_minimises_sum_abs_err(self):
         t, rpm = _make_sine_rpm(n=100, fs=5.0)
         best, _ = find_best_shift(t, rpm, t, rpm + 200.0, min_s=-0.5, max_s=0.5, step_s=0.1)
-        # adding 200 RPM offset → sum_abs_err = mae * n
+        # adding 200 RPM offset â†’ sum_abs_err = mae * n
         self.assertTrue(best["ok"])
         self.assertIn("sum_abs_err", best)
 
@@ -298,3 +298,4 @@ class TestBuildValidationFigure(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

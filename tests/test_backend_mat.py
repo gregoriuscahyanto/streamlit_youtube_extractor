@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import scipy.io as sio
 
-from backend import (
+from core.backend import (
     _parse_roi_coords,
     _atleast_1d_cell,
     config_from_mat_file,
@@ -19,7 +19,7 @@ from backend import (
 )
 
 
-# ── _parse_roi_coords ──────────────────────────────────────────────────────────
+# â”€â”€ _parse_roi_coords â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestParseRoiCoords:
     def test_numeric_array(self):
@@ -65,7 +65,7 @@ class TestParseRoiCoords:
         assert _parse_roi_coords("-5 -10 200 100") == [-5.0, -10.0, 200.0, 100.0]
 
 
-# ── _atleast_1d_cell ───────────────────────────────────────────────────────────
+# â”€â”€ _atleast_1d_cell â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TestAtleast1dCell:
     def test_object_array_of_strings(self):
@@ -79,7 +79,7 @@ class TestAtleast1dCell:
         assert result == ["hello"]
 
     def test_single_numeric_roi_array_wrapped(self):
-        # 1D float array of size 4 → single ROI, must NOT be split into 4 scalars
+        # 1D float array of size 4 â†’ single ROI, must NOT be split into 4 scalars
         arr = np.array([41.0, 52.0, 105.0, 52.0])
         result = _atleast_1d_cell(arr)
         assert len(result) == 1
@@ -98,7 +98,7 @@ class TestAtleast1dCell:
         assert len(result) == 2
 
 
-# ── config_from_mat_file ───────────────────────────────────────────────────────
+# â”€â”€ config_from_mat_file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _write_mat(data: dict) -> str:
     """Save data to a temp MAT file and return the path."""
@@ -140,7 +140,7 @@ def _make_mat_data(roi_field, names=None, fmts=None, patterns=None, scales=None,
 
 class TestConfigFromMatFile:
     def test_string_roi_two_entries(self):
-        """roi stored as object array of strings — the MATLAB-table format."""
+        """roi stored as object array of strings â€” the MATLAB-table format."""
         roi_field = np.array(["41 52 105 52", "321 28 306 70"], dtype=object)
         path = _write_mat(_make_mat_data(
             roi_field,
@@ -187,7 +187,7 @@ class TestConfigFromMatFile:
         assert abs(cfg["rois"][1]["max_scale"] - 2.0) < 1e-9
 
     def test_numeric_roi_two_entries(self):
-        """roi stored as numeric matrix rows — the old struct format."""
+        """roi stored as numeric matrix rows â€” the old struct format."""
         # Each row is one ROI: shape (2, 4)
         roi_field = np.array([[41, 52, 105, 52], [321, 28, 306, 70]], dtype=float)
         path = _write_mat(_make_mat_data(
@@ -256,3 +256,4 @@ class TestConfigFromMatFile:
         cfg = config_from_mat_file("/nonexistent/path/file.mat")
         assert cfg["rois"] == []
         assert cfg["t_start"] == 0.0
+

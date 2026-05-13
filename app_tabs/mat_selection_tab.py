@@ -1,4 +1,4 @@
-﻿"""Renderer for the Streamlit tab extracted from app.py.
+"""Renderer for the Streamlit tab extracted from app.py.
 
 The renderer receives app.py globals so existing helper functions and
 session-state conventions remain shared during the incremental split.

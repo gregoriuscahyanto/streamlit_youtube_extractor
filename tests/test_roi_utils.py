@@ -1,6 +1,6 @@
 import unittest
 
-from roi_utils import (
+from core.roi_utils import (
     can_add_roi_from_drag,
     clamp_roi_to_video,
     normalize_time_range,
@@ -80,3 +80,4 @@ class TestRoiUtils(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

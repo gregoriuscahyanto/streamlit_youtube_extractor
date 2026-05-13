@@ -1,4 +1,4 @@
-﻿import ast
+import ast
 import io
 import zipfile
 from pathlib import Path

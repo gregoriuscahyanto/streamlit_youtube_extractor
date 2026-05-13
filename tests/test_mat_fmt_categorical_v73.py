@@ -5,7 +5,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from backend import _config_from_mat_file_v73
+from core.backend import _config_from_mat_file_v73
 
 
 LOG_PATH = Path("logs/mat_fmt_categorical_test.log")
@@ -159,3 +159,4 @@ def test_v73_roi_table_raw_fmt_categorical_2x1() -> None:
     finally:
         if mat_path.exists():
             mat_path.unlink()
+

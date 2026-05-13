@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from ocr_diagnostic import diagnose_roi_ocr, find_tesseract_cmd, get_charset_for_format, validate_formatted
+from core.ocr_diagnostic import diagnose_roi_ocr, find_tesseract_cmd, get_charset_for_format, validate_formatted
 
 
 LOG_PATH = Path("logs/ocr_diagnostic_test.log")
@@ -81,3 +81,4 @@ def test_python_ocr_rules_match_matlab_ocr_extractor() -> None:
     except Exception as exc:
         _write_log(f"ERROR: {exc.__class__.__name__}: {exc}")
         raise
+

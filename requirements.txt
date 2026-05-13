@@ -10,5 +10,10 @@ h5py>=3.10.0
 imageio-ffmpeg>=0.5.1
 streamlit-cropper-fix>=0.3.7
 streamlit-js-eval>=0.1.7
+pyautogui>=0.9.54
+sounddevice>=0.4.7
+soundfile>=0.12.1
+mss>=9.0.1
+requests>=2.32.0
 plotly
 openpyxl

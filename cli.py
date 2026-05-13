@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from backend import (
+from core.backend import (
     build_result_payload,
     collect_r2_listing_debug,
     config_from_json_payload,
@@ -14,7 +14,7 @@ from backend import (
     load_r2_credentials,
     mat_bytes_from_result,
 )
-from storage import StorageManager
+from core.storage import StorageManager
 
 
 def _resolve_credentials(args: argparse.Namespace) -> tuple[str, str, str, str]:
@@ -36,7 +36,7 @@ def _connect_or_exit(args: argparse.Namespace):
     return client
 
 
-# ── Commands ───────────────────────────────────────────────────────────────────
+# â”€â”€ Commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def cmd_connect(args: argparse.Namespace) -> int:
     acc, key, sec, bkt = _resolve_credentials(args)
@@ -214,7 +214,7 @@ def cmd_mat_to_json(args: argparse.Namespace) -> int:
         return 1
 
 
-# ── Parser ─────────────────────────────────────────────────────────────────────
+# â”€â”€ Parser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="OCR Extractor CLI (R2 backend)")
@@ -293,3 +293,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

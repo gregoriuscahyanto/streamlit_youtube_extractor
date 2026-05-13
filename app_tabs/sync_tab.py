@@ -78,6 +78,8 @@ def render(ns):
         st.caption("Hinweis: pyarrow nicht verfuegbar. Tabelle ist nur lesbar; Mehrfachauswahl per Checkbox in der Tabelle ist deaktiviert.")
 
     sync_running = bool(st.session_state.sync_running)
+    running = sync_running
+    update_label = "Stop" if running else "Update"
     sync_refresh_clicked = st.button(
         "Sync Uebersicht aktualisieren",
         width="stretch",

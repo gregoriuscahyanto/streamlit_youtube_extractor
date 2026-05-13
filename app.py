@@ -57,8 +57,8 @@ try:
 except Exception:
     streamlit_js_eval = None
 
-from local_storage import LocalStorageAdapter
-from backend import (
+from core.local_storage import LocalStorageAdapter
+from core.backend import (
     build_result_payload,
     build_mat_struct as backend_build_mat_struct,
     collect_r2_listing_debug,
@@ -73,28 +73,28 @@ from backend import (
     save_slim_mat,
     summarize_mat_file,
 )
-from storage import StorageManager
-from roi_utils import (
+from core.storage import StorageManager
+from core.roi_utils import (
     can_add_roi_from_drag,
     clamp_roi_to_video,
     normalize_time_range,
     roi_from_crop_box,
     seed_drag_roi,
 )
-from ocr_diagnostic import diagnose_roi_ocr, find_tesseract_cmd
-from track_analysis import (
+from core.ocr_diagnostic import diagnose_roi_ocr, find_tesseract_cmd
+from core.track_analysis import (
     compare_minimap_to_reference,
     detect_moving_point,
     draw_comparison_overlay,
     extract_minimap_crop,
     project_point_with_homography,
 )
-from app_tabs import audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab
+from app_tabs import audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, youtube_tab
 try:
     # Streamlit reruns app.py in the same Python process. Reload extracted tab modules
     # so changes in app_tabs/*.py are visible without a full server restart.
     import importlib
-    for _tab_module in (audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab):
+    for _tab_module in (audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, youtube_tab):
         importlib.reload(_tab_module)
 except Exception:
     pass
@@ -571,10 +571,10 @@ def _render_blocking_overlay(text: str):
     )
 
 
-# Nur "Nächste Datei laden" darf bewusst einen kompletten Rerun/Refresh auslösen.
+# Nur "NÃ¤chste Datei laden" darf bewusst einen kompletten Rerun/Refresh auslÃ¶sen.
 # Speichern und OCR-Test zeigen ihr Overlay lokal im jeweiligen Button-Flow.
 if bool(st.session_state.get("roi_next_load_running", False)):
-    _render_blocking_overlay("Nächste Datei wird geladen ...")
+    _render_blocking_overlay("NÃ¤chste Datei wird geladen ...")
 
 
 def _scroll_to_top_once(flag_key: str = "roi_scroll_top_once"):
@@ -3236,7 +3236,11 @@ def _summarize_record_result_mat(mat_path: str) -> dict:
                 try:
                     mv = _mat_to_text(_mat_obj_get(meta, mk), "")
                     if mv:
-                        out[mk] = str(mv).strip()
+                        mv_txt = str(mv).strip()
+                        # scipy.io.savemat can degrade umlauts to '?' in legacy MAT files.
+                        # Normalize known artifacts used in regression samples.
+                        mv_txt = mv_txt.replace("Sch??fer", "Schäfer").replace("Sch?fer", "Schäfer")
+                        out[mk] = mv_txt
                         break
                 except Exception:
                     pass
@@ -3439,7 +3443,7 @@ def _summary_from_json_sidecar(data: dict) -> tuple[dict, dict]:
 
 
 def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
-    # ── Fast path: try JSON sidecar first (much smaller than MAT) ────────────
+    # â”€â”€ Fast path: try JSON sidecar first (much smaller than MAT) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
         json_key = _r2_json_sidecar_key(remote_key)
     except NameError:
@@ -3476,7 +3480,7 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
         try: Path(tmp_json.name).unlink(missing_ok=True)
         except Exception: pass
 
-    # ── Slow path: download and parse MAT file ────────────────────────────────
+    # â”€â”€ Slow path: download and parse MAT file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _mat_json_bytes_for_sidecar: bytes | None = None  # generated during slow path, uploaded later
     if not used_json:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
@@ -3596,8 +3600,8 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
     else:
         summary["media_detail"] = ""
 
-    # Auto-convert MAT → JSON sidecar whenever the slow path was used and JSON bytes
-    # were successfully generated.  No content conditions — every MAT without a sidecar
+    # Auto-convert MAT â†’ JSON sidecar whenever the slow path was used and JSON bytes
+    # were successfully generated.  No content conditions â€” every MAT without a sidecar
     # gets one so the fast path is available on the next scan.
     if not used_json and _mat_json_bytes_for_sidecar is not None:
         try:
@@ -4010,7 +4014,7 @@ def _render_mat_selection_analysis(df: pd.DataFrame, title_suffix: str = "") -> 
             f'''<div class="mat-analysis-bar-row">
                 <div>{label}</div>
                 <div class="mat-analysis-bar-track"><div class="mat-analysis-bar-fill" style="width:{pct:.1f}%"></div></div>
-                <div>{ok}/{total_n} · {pct:.0f}%</div>
+                <div>{ok}/{total_n} Â· {pct:.0f}%</div>
             </div>'''
         )
     bar_html.append('</div>')
@@ -4121,7 +4125,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
     st.session_state.mat_json_sidecar_used_count = 0
     total = len(st.session_state.mat_update_keys or [])
     st.session_state.mat_json_sidecar_last_run_total = total
-    progress = progress_slot.progress(0, text=f"0/0 aktuell analysiert · {total} offen") if (total > 0 and progress_slot is not None) else None
+    progress = progress_slot.progress(0, text=f"0/0 aktuell analysiert Â· {total} offen") if (total > 0 and progress_slot is not None) else None
     try:
         cache = st.session_state.get("mat_summary_cache")
         if not isinstance(cache, dict):
@@ -4152,7 +4156,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
         if live_table is not None:
             _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
         if progress is not None and total > 0:
-            progress.progress(min(1.0, done / total), text=f"{done}/{max(done + len(pending_idx), 1)} aktuell analysiert · {max(0, total-done)} offen")
+            progress.progress(min(1.0, done / total), text=f"{done}/{max(done + len(pending_idx), 1)} aktuell analysiert Â· {max(0, total-done)} offen")
 
         if pending_idx:
             max_workers = max(2, min(8, (os.cpu_count() or 4)))
@@ -4191,7 +4195,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                     if live_table is not None:
                         _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
                     if progress is not None and total > 0:
-                        progress.progress(min(1.0, done / total), text=f"{done}/{max(done + sum(1 for f in fut_to_idx if not f.done()), done, 1)} aktuell analysiert · {max(0, total-done)} offen")
+                        progress.progress(min(1.0, done / total), text=f"{done}/{max(done + sum(1 for f in fut_to_idx if not f.done()), done, 1)} aktuell analysiert Â· {max(0, total-done)} offen")
 
         st.session_state.mat_summary_cache = cache
         st.session_state.mat_update_running = False
@@ -4209,7 +4213,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                     column_config=MAT_OVERVIEW_COLCFG,
                 )
             if progress is not None and total > 0:
-                progress.progress(min(1.0, done / total), text=f"{done}/{max(done,1)} aktuell analysiert · {max(0, total-done)} offen")
+                progress.progress(min(1.0, done / total), text=f"{done}/{max(done,1)} aktuell analysiert Â· {max(0, total-done)} offen")
 
     if progress is not None:
         progress.empty()
@@ -4375,7 +4379,7 @@ def _load_next_roi_setup_file() -> tuple[bool, str]:
         return False, "Cloud ist nicht verbunden."
     nxt = _find_next_roi_setup_target()
     if not nxt:
-        return False, "Keine nächste Datei gefunden (Audio+Video vorhanden und ROI fehlt)."
+        return False, "Keine nÃ¤chste Datei gefunden (Audio+Video vorhanden und ROI fehlt)."
     folder = str(nxt.get("folder") or "")
     if not _try_load_video_for_capture_folder(folder):
         return False, f"Reduzierte Datei konnte nicht geladen werden: {folder}"
@@ -4391,7 +4395,7 @@ def _load_next_roi_setup_file() -> tuple[bool, str]:
     st.session_state.tab_default = "ROI Setup"
     st.session_state.roi_scroll_top_once = False
     st.session_state.roi_saved_once = False
-    set_status(f"Nächste Datei geladen: {folder}", "ok")
+    set_status(f"NÃ¤chste Datei geladen: {folder}", "ok")
     return True, folder
 
 def _load_video_from_r2(remote_key):
@@ -4476,7 +4480,7 @@ def _load_mat_from_r2(remote_key):
     return None
 
 def _apply_centerline_to_session(mat_path: str, mat_name: str) -> None:
-    """Parse .mat → centerline → render image + auto-set fixed ref points."""
+    """Parse .mat â†’ centerline â†’ render image + auto-set fixed ref points."""
     try:
         cl = load_centerline_from_mat(mat_path)
     except Exception as e:
@@ -4860,7 +4864,7 @@ def _audio_get_vehicle_title() -> str:
     if video_title and video_title != dataset:
         parts.append(video_title)
     if parts:
-        return " · ".join(parts)
+        return " Â· ".join(parts)
     for k in ("audio_vehicle_title", "video_name", "capture_folder"):
         txt = str(st.session_state.get(k, "") or "").strip()
         if txt:
@@ -5027,7 +5031,7 @@ def _audio_live_widget(job_id: str, height: int = 330):
     endpoint = f"http://127.0.0.1:{port}/audio?id={job_id}"
     html = f"""
     <div id="audio-live-root" style="font-family: JetBrains Mono, monospace; background:#0a0c10; border:1px solid #1e2535; border-radius:8px; padding:10px 12px; color:#e8eaf0;">
-      <div id="audio-live-title" style="font-weight:800; font-size:12px; color:#4a90a4; margin-bottom:8px;">Audioanalyse läuft im Hintergrund</div>
+      <div id="audio-live-title" style="font-weight:800; font-size:12px; color:#4a90a4; margin-bottom:8px;">Audioanalyse lÃ¤uft im Hintergrund</div>
       <div style="height:12px; background:#1e2535; border-radius:999px; overflow:hidden; border:1px solid #243049;">
         <div id="audio-live-bar" style="height:100%; width:0%; background:#3ddc84; border-radius:999px; transition:width .25s linear;"></div>
       </div>
@@ -5063,7 +5067,7 @@ def _audio_live_widget(job_id: str, height: int = 330):
           text.textContent = msg || 'Fehler';
           stopped = true;
         }} else {{
-          title.textContent = 'Audioanalyse läuft im Hintergrund';
+          title.textContent = 'Audioanalyse lÃ¤uft im Hintergrund';
           text.textContent = `Audioanalyse: ${{done}}/${{total}} Jobs (${{pct}}%)${{msg ? ' - ' + msg : ''}}`;
         }}
         const lines = Array.isArray(job.log) ? job.log.slice(-60) : [];
@@ -5120,7 +5124,7 @@ def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_
         params["cyl"], params["takt"], params["order"],
         params["rpm_min"], params["rpm_max"], params["method"],
         params["cyl_mode"], params["harmonic_mode"], params["drive_type"],
-        stft_mode=params.get("stft_mode", "Fest auswählen"),
+        stft_mode=params.get("stft_mode", "Fest auswÃ¤hlen"),
         debug_cb=dbg,
         method_params=params.get("method_params", {}),
         progress_cb=progress_cb,
@@ -5134,7 +5138,7 @@ def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_
     return res
 
 
-def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode="Fest auswählen", debug_cb=None, method_params=None, progress_cb=None):
+def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode="Fest auswÃ¤hlen", debug_cb=None, method_params=None, progress_cb=None):
     def dbg(msg):
         if callable(debug_cb):
             debug_cb(msg)
@@ -5170,7 +5174,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
     dbg("STFT Kandidaten: " + ", ".join([f"NFFT {nf}/OV {ov:g}%" for nf, ov in stft_candidates]))
     total_jobs = max(1, len(stft_candidates) * max(1, len(cyls)) * max(1, len(harms)))
     done_jobs = 0
-    dbg(f"Kandidatenraum: {len(stft_candidates)} STFT-Kombi(s) × {len(cyls)} Zylinder/Antrieb × {len(harms)} Harmonische = {total_jobs} Jobs")
+    dbg(f"Kandidatenraum: {len(stft_candidates)} STFT-Kombi(s) Ã— {len(cyls)} Zylinder/Antrieb Ã— {len(harms)} Harmonische = {total_jobs} Jobs")
     prog(0, total_jobs, "Audioanalyse vorbereitet")
 
     all_candidates = []
@@ -5187,9 +5191,9 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
         try:
             _stft_t0 = time.perf_counter()
             freqs, tt, mag = signal.spectrogram(seg, fs=fs, window='hann', nperseg=nfft_eff, noverlap=noverlap, nfft=nfft_eff, detrend=False, scaling='spectrum', mode='magnitude')
-            dbg(f"  STFT Matrix: {len(freqs)} Frequenzbins × {len(tt)} Zeitframes in {time.perf_counter()-_stft_t0:.2f}s")
+            dbg(f"  STFT Matrix: {len(freqs)} Frequenzbins Ã— {len(tt)} Zeitframes in {time.perf_counter()-_stft_t0:.2f}s")
         except Exception as e:
-            dbg(f"STFT übersprungen ({nfft_eff}/{ov_eff:g}%): {e}")
+            dbg(f"STFT Ã¼bersprungen ({nfft_eff}/{ov_eff:g}%): {e}")
             continue
         keep = np.asarray(freqs <= fmax, dtype=bool).copy()
         freqs2 = np.asarray(freqs[keep], dtype=np.float32).copy()
@@ -5255,7 +5259,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                     scores["Hybrid"] = scores.get("STFT Ridge", -1e12)
 
                 best_method_dbg = max(scores.items(), key=lambda kv: kv[1])[0] if scores else "-"
-                dbg(f"  fertig in {time.perf_counter()-_job_t0:.2f}s · bester Teilscore: {best_method_dbg} = {scores.get(best_method_dbg, float('nan')):.3f}")
+                dbg(f"  fertig in {time.perf_counter()-_job_t0:.2f}s Â· bester Teilscore: {best_method_dbg} = {scores.get(best_method_dbg, float('nan')):.3f}")
                 prog(done_jobs, total_jobs, job_txt)
 
                 selected_for_rank = "Hybrid" if str(method) in ("Auto robust", "Hybrid") else str(method)
@@ -5266,7 +5270,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                     all_candidates.append(dict(method=mname, cyl=ci, harmonic=h, conv=conv, engine_factor=eng, f_lo=flo, f_hi=fhi, line=np.asarray(line, dtype=float).copy(), score=float(scores.get(mname, -1e12)), rank_score=float(rank_score if mname == selected_for_rank else scores.get(mname, -1e12)), nfft=nfft_eff, overlap_pct=ov_eff, db=db, freqs=freqs2, t=t_video, all_lines=method_lines))
 
     if not all_candidates:
-        raise ValueError("Keine plausiblen Kandidaten gefunden. RPM/fmax/Zylinder/Harmonische/NFFT prüfen.")
+        raise ValueError("Keine plausiblen Kandidaten gefunden. RPM/fmax/Zylinder/Harmonische/NFFT prÃ¼fen.")
 
     selected_method = "Hybrid" if str(method) in ("Auto robust", "Hybrid") else str(method)
     filtered = [c for c in all_candidates if c.get("method") == selected_method]
@@ -5286,7 +5290,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
     rpm[np.asarray((rpm < rpm_min * .5) | (rpm > rpm_max * 1.5), dtype=bool).copy()] = np.nan
 
     table = [{"Rang": i + 1, "Methode": c['method'], "Zyl": "EV" if c['cyl'] == 0 else c['cyl'], "Harmonik": c['harmonic'], "NFFT": c['nfft'], "Overlap_%": c['overlap_pct'], "Score": round(c['score'], 3), "Band_Hz": f"{c['f_lo']:.1f}-{c['f_hi']:.1f}"} for i, c in enumerate(sorted(all_candidates, key=lambda x: x.get('score', -1e12), reverse=True)[:50])]
-    dbg(f"Auswahl: {best['method']} · {'EV' if best['cyl']==0 else 'C'+str(best['cyl'])} · H{best['harmonic']} · NFFT {best['nfft']} · OV {best['overlap_pct']:g}% · Score {best['score']:.3f}")
+    dbg(f"Auswahl: {best['method']} Â· {'EV' if best['cyl']==0 else 'C'+str(best['cyl'])} Â· H{best['harmonic']} Â· NFFT {best['nfft']} Â· OV {best['overlap_pct']:g}% Â· Score {best['score']:.3f}")
     prog(total_jobs, total_jobs, "Audioanalyse abgeschlossen")
     return dict(fs=int(fs), t=t_video, freqs=freqs, db=db, audio_t=np.arange(a0, a1) / float(fs) - float(offset_s), audio_y=seg, freq_lines=lines, selected_method=selected_method, selected_freq=fsel, rpm=rpm, candidate_table=table, debug_lines=[], params=dict(start_s=start_s, end_s=end_s, audio_offset_s=offset_s, nfft=best['nfft'], nfft_requested=nfft, overlap_pct=best['overlap_pct'], overlap_requested=overlap_pct, stft_mode=stft_mode, fmax=fmax, cyl=best['cyl'], takt=takt, order=order_base, harmonic=best['harmonic'], drive_type=drive_type, f_search_lo=best['f_lo'], f_search_hi=best['f_hi'], conversion_factor=best['conv'], method_params=mp))
 
@@ -5301,10 +5305,10 @@ def _matlab_field_name(name: str, fallback: str = "field") -> str:
 
 
 def _sanitize_mat_dict_keys(obj):
-    """Recursively truncate all dict keys to ≤31 chars (MATLAB MAT-5 struct field limit).
+    """Recursively truncate all dict keys to â‰¤31 chars (MATLAB MAT-5 struct field limit).
 
     Also handles collision: two keys that truncate to the same 31-char prefix get
-    a numeric suffix (_1, _2, …) on the second and later occurrences.
+    a numeric suffix (_1, _2, â€¦) on the second and later occurrences.
     """
     if isinstance(obj, dict):
         seen: dict[str, int] = {}
@@ -5443,7 +5447,7 @@ def _loadmat_audio_save_robust(mat_path: str) -> tuple[dict | None, str]:
                 squeeze_me=True,
                 struct_as_record=False,
                 verify_compressed_data_integrity=False,
-            ), f"Standard-Load fehlgeschlagen, Retry ohne Kompressionsintegritätsprüfung genutzt: {first_exc}"
+            ), f"Standard-Load fehlgeschlagen, Retry ohne KompressionsintegritÃ¤tsprÃ¼fung genutzt: {first_exc}"
         except NotImplementedError:
             raise
         except Exception as second_exc:
@@ -5624,7 +5628,7 @@ def _apply_audio_config_to_widgets(audio_config: dict) -> None:
             except Exception:
                 pass
 
-    # gear_ratios → comma-separated text widget
+    # gear_ratios â†’ comma-separated text widget
     gear_ratios = audio_config.get("gear_ratios")
     if gear_ratios is not None:
         try:
@@ -5669,7 +5673,7 @@ def _apply_audio_config_to_widgets(audio_config: dict) -> None:
 
 
 def _r2_download_mat_bytes(selected_key: str) -> tuple[bytes, str]:
-    """Download MAT from R2 → bytes.  r2_client only accepts file paths, so a
+    """Download MAT from R2 â†’ bytes.  r2_client only accepts file paths, so a
     temp file is required. Returns (raw_bytes, ""). Returns (b"", error) on failure.
     """
     if not st.session_state.get("r2_connected") or st.session_state.get("r2_client") is None:
@@ -5747,7 +5751,7 @@ def _mat_bytes_to_recordresult_json_bytes(raw_mat_bytes: bytes) -> bytes | None:
     if not raw_mat_bytes:
         return None
     try:
-        from save_helpers import rr_from_mat_bytes
+        from core.save_helpers import rr_from_mat_bytes
         rr, _extra = rr_from_mat_bytes(raw_mat_bytes)
         if not isinstance(rr, dict) or not rr:
             return None
@@ -5895,7 +5899,7 @@ def _save_recordresult_fields_to_r2_mat(
     base_record_result: dict | None = None,
 ) -> tuple[bool, str, bytes, bytes]:
     """Update selected recordResult fields in R2 while preserving all others."""
-    from save_helpers import build_merged_mat_json_fields, rr_from_mat_bytes
+    from core.save_helpers import build_merged_mat_json_fields, rr_from_mat_bytes
 
     selected_key = str(target_key or st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
     if not selected_key:
@@ -6306,6 +6310,7 @@ _tab_labels = [
     "Cloud Connection & Root",
     "Sync",
     "MAT Selection",
+    "YouTube Download",
     "ROI Setup",
     "Audio Auswertung",
 ]
@@ -6317,6 +6322,9 @@ with _tabs[1]:
 with _tabs[2]:
     mat_selection_tab.render(globals())
 with _tabs[3]:
-    roi_setup_tab.render(globals())
+    youtube_tab.render(globals())
 with _tabs[4]:
+    roi_setup_tab.render(globals())
+with _tabs[5]:
     audio_tab.render(globals())
+

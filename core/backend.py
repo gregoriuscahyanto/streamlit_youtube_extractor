@@ -17,7 +17,7 @@ try:
 except Exception:  # pragma: no cover
     h5py = None
 
-from r2_client import R2Client
+from core.r2_client import R2Client
 
 
 def load_r2_credentials(
@@ -76,7 +76,7 @@ def connect_r2_client(
     account_id: str, access_key_id: str, secret_access_key: str, bucket: str
 ) -> tuple[bool, str, R2Client | None]:
     if not all([account_id, access_key_id, secret_access_key, bucket]):
-        return False, "Bitte alle Felder ausfüllen.", None
+        return False, "Bitte alle Felder ausfÃ¼llen.", None
     client = R2Client(account_id, access_key_id, secret_access_key, bucket)
     ok, msg = client.test_connection()
     return ok, msg, client if ok else None
@@ -241,7 +241,7 @@ def _parse_roi_coords(r) -> list[float] | None:
 def _atleast_1d_cell(val) -> list:
     """Convert a squeezed MATLAB cell-array value to a Python list, handling scalar strings."""
     arr = np.atleast_1d(val)
-    # A 1-D numeric array of exactly 4 elements is a single ROI stored flat — wrap it.
+    # A 1-D numeric array of exactly 4 elements is a single ROI stored flat â€” wrap it.
     if arr.ndim == 1 and arr.dtype.kind in ("i", "u", "f") and arr.size == 4:
         return [arr]
     return list(arr)
@@ -837,7 +837,7 @@ def summarize_mat_file(mat_path: str) -> dict:
         if h5py is None:
             out["error"] = (
                 f"{e.__class__.__name__}: {e}. "
-                "Für MATLAB v7.3 bitte h5py installieren."
+                "FÃ¼r MATLAB v7.3 bitte h5py installieren."
             )
             return out
         try:
@@ -856,7 +856,7 @@ def _summarize_mat_file_v73(mat_path: str, out: dict) -> dict:
     This extracts robust status signals from dataset/group names.
     """
     if h5py is None:
-        raise RuntimeError("h5py ist nicht verfügbar")
+        raise RuntimeError("h5py ist nicht verfÃ¼gbar")
 
     names: list[str] = []
     with h5py.File(mat_path, "r") as h5f:
@@ -906,39 +906,39 @@ def summarize_mat_status_rows(summary: dict) -> list[dict]:
             "detail": f"video='{summary.get('video_ref', '')}', audio='{summary.get('audio_ref', '')}'",
         },
         {
-            "check": "ROI ausgewählt",
+            "check": "ROI ausgewÃ¤hlt",
             "status": "Ja" if summary.get("roi_selected") else "Nein",
             "detail": f"ROI-Anzahl: {summary.get('roi_count', 0)}",
         },
         {
-            "check": "Track ausgewählt",
+            "check": "Track ausgewÃ¤hlt",
             "status": "Ja" if summary.get("track_selected") else "Nein",
             "detail": f"ref_pts={summary.get('track_points_ref', 0)}, minimap_pts={summary.get('track_points_minimap', 0)}",
         },
         {
-            "check": "Anfang/Ende ausgewählt",
+            "check": "Anfang/Ende ausgewÃ¤hlt",
             "status": "Ja" if summary.get("start_end_selected") else "Nein",
             "detail": start_end_detail,
         },
         {
-            "check": "OCR durchgeführt",
+            "check": "OCR durchgefÃ¼hrt",
             "status": "Ja" if summary.get("ocr_done") else "Nein",
-            "detail": "vollständig" if summary.get("ocr_complete") else "unvollständig/keine Daten",
+            "detail": "vollstÃ¤ndig" if summary.get("ocr_complete") else "unvollstÃ¤ndig/keine Daten",
         },
         {
-            "check": "Audioanalyse/Spektrogramm durchgeführt",
+            "check": "Audioanalyse/Spektrogramm durchgefÃ¼hrt",
             "status": "Ja" if summary.get("audio_spectrogram_done") else "Nein",
             "detail": "",
         },
         {
-            "check": "Validierung durchgeführt",
+            "check": "Validierung durchgefÃ¼hrt",
             "status": "Ja" if summary.get("validation_done") else "Nein",
             "detail": "",
         },
     ]
 
 
-# ─── Reference-Track / Centerline ────────────────────────────────────────────
+# â”€â”€â”€ Reference-Track / Centerline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # Hardcoded 8 reference points on the Nordschleife centerline [m], matching
 # getFixedPointsForTrack() in OCRExtractor.m.
@@ -957,7 +957,7 @@ FIXED_POINTS_BY_TRACK: dict[str, list[list[float]]] = {
 
 
 def _extract_centerline_v5(mat_path: str) -> np.ndarray:
-    """Parse Bnd.L2R_xyz__m from a scipy-readable .mat → Nx2 XY [m]."""
+    """Parse Bnd.L2R_xyz__m from a scipy-readable .mat â†’ Nx2 XY [m]."""
     mat = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
     bnd = mat.get("Bnd")
     if bnd is None:
@@ -974,14 +974,14 @@ def _extract_centerline_v5(mat_path: str) -> np.ndarray:
             left_pts.append(arr[0, :2])
             right_pts.append(arr[-1, :2])
     if not left_pts:
-        raise ValueError("Bnd.L2R_xyz__m: keine verwertbaren Einträge")
+        raise ValueError("Bnd.L2R_xyz__m: keine verwertbaren EintrÃ¤ge")
     return (np.array(left_pts) + np.array(right_pts)) / 2.0
 
 
 def _extract_centerline_v73(mat_path: str) -> np.ndarray:
-    """Parse Bnd.L2R_xyz__m from a MATLAB v7.3 (HDF5) .mat → Nx2 XY [m]."""
+    """Parse Bnd.L2R_xyz__m from a MATLAB v7.3 (HDF5) .mat â†’ Nx2 XY [m]."""
     if h5py is None:
-        raise RuntimeError("h5py nicht verfügbar (benötigt für MATLAB v7.3)")
+        raise RuntimeError("h5py nicht verfÃ¼gbar (benÃ¶tigt fÃ¼r MATLAB v7.3)")
     with h5py.File(mat_path, "r") as h5f:
         if "Bnd" not in h5f:
             raise ValueError("Kein Feld 'Bnd'")
@@ -993,21 +993,21 @@ def _extract_centerline_v73(mat_path: str) -> np.ndarray:
         right_pts: list[np.ndarray] = []
         for ref in refs:
             cell = np.array(h5f[ref][()], dtype=float)
-            # MATLAB column-major → h5py transposes: shape is (n_cols, n_rows).
-            # A(1,   1:2) in MATLAB → cell[0:2, 0]  in h5py (first col = first row)
-            # A(end, 1:2) in MATLAB → cell[0:2, -1] in h5py (last col  = last row)
+            # MATLAB column-major â†’ h5py transposes: shape is (n_cols, n_rows).
+            # A(1,   1:2) in MATLAB â†’ cell[0:2, 0]  in h5py (first col = first row)
+            # A(end, 1:2) in MATLAB â†’ cell[0:2, -1] in h5py (last col  = last row)
             if cell.ndim == 1:
                 cell = cell.reshape(-1, 1)
             if cell.shape[0] >= 2 and cell.shape[1] >= 1:
                 left_pts.append(cell[0:2, 0])
                 right_pts.append(cell[0:2, -1])
         if not left_pts:
-            raise ValueError("Bnd.L2R_xyz__m: keine HDF5-Einträge gefunden")
+            raise ValueError("Bnd.L2R_xyz__m: keine HDF5-EintrÃ¤ge gefunden")
         return (np.array(left_pts) + np.array(right_pts)) / 2.0
 
 
 def load_centerline_from_mat(mat_path: str) -> np.ndarray:
-    """Load centerline from .mat — supports slim format (centerline field) and full (Bnd.L2R_xyz__m)."""
+    """Load centerline from .mat â€” supports slim format (centerline field) and full (Bnd.L2R_xyz__m)."""
     try:
         mat = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
         if "centerline" in mat:
@@ -1025,7 +1025,7 @@ def save_slim_mat(centerline: np.ndarray, save_path: str) -> None:
 def guess_fixed_points(mat_name: str) -> list[list[float]] | None:
     """Return the 8 hardcoded reference points [m] for a known track, or None."""
     n = mat_name.lower()
-    if any(k in n for k in ("nordschleife", "nuerburgring", "nürburgring")):
+    if any(k in n for k in ("nordschleife", "nuerburgring", "nÃ¼rburgring")):
         return [row[:] for row in FIXED_POINTS_BY_TRACK["nordschleife"]]
     return None
 
@@ -1067,7 +1067,7 @@ def render_centerline_image(
 
     def to_px(xy: np.ndarray) -> np.ndarray:
         xi = (np.asarray(xy)[:, 0] - xl) / span_x * (w_px - 1)
-        # Y is flipped: larger Y → lower pixel row
+        # Y is flipped: larger Y â†’ lower pixel row
         yi = (yr_ - np.asarray(xy)[:, 1]) / span_y * (h_px - 1)
         return np.clip(
             np.column_stack([xi, yi]).astype(int),
@@ -1099,5 +1099,6 @@ def render_centerline_image(
                              _cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1)
         fixed_pts_px = fp_px.astype(float).tolist()
 
-    img = img[:, :, ::-1]  # BGR → RGB
+    img = img[:, :, ::-1]  # BGR â†’ RGB
     return img, fixed_pts_px, pts_cl.tolist()
+
