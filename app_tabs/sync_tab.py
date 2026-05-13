@@ -6,6 +6,7 @@ session-state conventions remain shared during the incremental split.
 
 def render(ns):
     globals().update(ns)
+    has_pyarrow = bool(globals().get("HAS_PYARROW", False))
     st.markdown('<div class="section-title">Sync Uebersicht (Lokal vs. Cloud)</div>', unsafe_allow_html=True)
 
     can_sync_compare = bool(st.session_state.r2_connected and st.session_state.local_connected)
@@ -14,9 +15,25 @@ def render(ns):
     sync_stop_clicked = False
     edited = None
 
-    def _render_sync_table(df_table: pd.DataFrame):
+    def _render_sync_table(df_table: pd.DataFrame, *, disable_edit: bool):
+        view = df_table[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]]
+        if has_pyarrow:
+            return table_slot.data_editor(
+                view,
+                width="stretch",
+                hide_index=True,
+                height=340,
+                disabled=disable_edit,
+                column_config={
+                    "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
+                    "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
+                    "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
+                    "status": st.column_config.TextColumn("Status", width="medium"),
+                },
+                key="sync_single_table",
+            )
         table_slot.dataframe(
-            df_table[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
+            view,
             width="stretch",
             hide_index=True,
             height=340,
@@ -27,6 +44,7 @@ def render(ns):
                 "status": st.column_config.TextColumn("Status", width="medium"),
             },
         )
+        return view
 
     def _sync_dataframe_from_state() -> pd.DataFrame:
         cached_df = st.session_state.get("sync_editor_value")
@@ -56,6 +74,8 @@ def render(ns):
         st.caption("Cloud DB und lokale DB muessen beide verbunden sein.")
     else:
         st.caption("Vergleich: lokale Full-FPS Videos vs. Cloud Frame-Packs (1 fps). Sync extrahiert lokal und laedt Frames hoch. Die erwartete Frame-Anzahl wird aus der Dauer des lokalen Originalvideos berechnet.")
+    if not has_pyarrow:
+        st.caption("Hinweis: pyarrow nicht verfuegbar. Tabelle ist nur lesbar; Mehrfachauswahl per Checkbox in der Tabelle ist deaktiviert.")
 
     sync_running = bool(st.session_state.sync_running)
     sync_refresh_clicked = st.button(
@@ -86,35 +106,18 @@ def render(ns):
         help="Markiert alle Zeilen, deren Status mit 'Nein' beginnt.",
     )
 
-    overall_progress_slot = st.empty()
-    stage_slot = st.empty()
-    table_slot = st.empty()
+    overall_progress_slot = st.container()
+    stage_slot = st.container()
+    table_slot = st.container()
 
     df_sync_editor = _sync_dataframe_from_state()
     if select_missing_cloud and not sync_running:
         df_sync_editor = _select_missing_cloud_rows(df_sync_editor)
         st.session_state.sync_editor_value = df_sync_editor.copy()
 
-    if sync_running:
-        _render_sync_table(df_sync_editor)
-        edited = df_sync_editor
-    else:
-        edited = table_slot.data_editor(
-            df_sync_editor[["auswaehlen", "capture_folder", "reduziert_in_cloud", "status"]],
-            width="stretch",
-            hide_index=True,
-            height=340,
-            disabled=False,
-            column_config={
-                "auswaehlen": st.column_config.CheckboxColumn("Auswaehlen", default=False),
-                "capture_folder": st.column_config.TextColumn("MAT/Folder", width="large"),
-                "reduziert_in_cloud": st.column_config.TextColumn("Reduzierte Version in Cloud", width="large"),
-                "status": st.column_config.TextColumn("Status", width="medium"),
-            },
-            key="sync_single_table",
-        )
-        if isinstance(edited, pd.DataFrame):
-            st.session_state.sync_editor_value = edited.copy()
+    edited = _render_sync_table(df_sync_editor, disable_edit=sync_running)
+    if (not sync_running) and isinstance(edited, pd.DataFrame):
+        st.session_state.sync_editor_value = edited.copy()
 
     if sync_refresh_clicked:
         try:
@@ -214,7 +217,7 @@ def render(ns):
             _set_sync_row_status(folder, f"{int(pct * 100)}%")
             df_live_cb = st.session_state.get("sync_editor_value")
             if isinstance(df_live_cb, pd.DataFrame) and not df_live_cb.empty:
-                _render_sync_table(df_live_cb)
+                _render_sync_table(df_live_cb, disable_edit=True)
             overall_pct = (idx + (pct * 0.8)) / max(1, total)
             done = int(overall_pct * 100)
             elapsed_l = max(0.0, time.time() - float(st.session_state.sync_run_started_ts or time.time()))

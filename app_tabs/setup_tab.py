@@ -6,6 +6,8 @@ session-state conventions remain shared during the incremental split.
 
 def render(ns):
     globals().update(ns)
+    cloud_root_slot = st.empty()
+    local_path_slot = st.empty()
     with st.expander("Debug-Logs", expanded=False):
         st.caption(f"Crash-Log Datei: {LOG_FILE}")
         if LOG_FILE.exists():
@@ -92,8 +94,15 @@ def render(ns):
 
             if r2_connect_clicked:
                 if r2_account and r2_key and r2_secret and r2_bucket:
-                    with st.spinner("Verbinde Cloud DB ..."):
-                        _ok, _msg, _client = connect_r2_client(r2_account, r2_key, r2_secret, r2_bucket)
+                    with st.spinner("Verbinde Cloud DB ... (max. 3 Versuche)"):
+                        _ok, _msg, _client = _connect_r2_with_retry(
+                            r2_account,
+                            r2_key,
+                            r2_secret,
+                            r2_bucket,
+                            max_attempts=3,
+                            delay_s=1.2,
+                        )
                     if _ok:
                         st.session_state.r2_connected = True
                         st.session_state.r2_client = _client
@@ -115,27 +124,38 @@ def render(ns):
                 "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Cloud Root</div>",
                 unsafe_allow_html=True,
             )
-            if st.session_state.r2_connected:
-                opts = st.session_state.r2_prefix_options or [""]
-                cur = st.session_state.r2_prefix
-                idx = opts.index(cur) if cur in opts else 0
-                chosen = st.selectbox(
-                    "Cloud Prefix",
-                    opts,
-                    index=idx,
-                    format_func=lambda x: x or "(Bucket-Root)",
-                    label_visibility="collapsed",
-                    key="root_dd",
-                )
-                if chosen != st.session_state.r2_prefix:
-                    st.session_state.r2_prefix = chosen
-                    st.session_state.mat_scan_prefix = None
-                    set_status(f"Cloud Root: {chosen or '(root)'}", "ok")
-                if st.button("Cloud Liste aktualisieren", width="stretch", key="refresh_root"):
-                    st.session_state.r2_prefix_options = get_root_prefixes()
-                    st.rerun()
-            else:
-                st.caption("Erst Cloud DB verbinden.")
+            with cloud_root_slot.container():
+                if st.session_state.r2_connected:
+                    opts = st.session_state.r2_prefix_options or [""]
+                    cur = st.session_state.r2_prefix
+                    idx = opts.index(cur) if cur in opts else 0
+                    chosen = st.selectbox(
+                        "Cloud Prefix",
+                        opts,
+                        index=idx,
+                        format_func=lambda x: x or "(Bucket-Root)",
+                        label_visibility="collapsed",
+                        key="root_dd",
+                    )
+                    if chosen != st.session_state.r2_prefix:
+                        st.session_state.r2_prefix = chosen
+                        st.session_state.mat_scan_prefix = None
+                        set_status(f"Cloud Root: {chosen or '(root)'}", "ok")
+                    if st.button("Cloud Liste aktualisieren", width="stretch", key="refresh_root"):
+                        st.session_state.r2_prefix_options = get_root_prefixes()
+                        st.rerun()
+                else:
+                    st.selectbox(
+                        "Cloud Prefix",
+                        [""],
+                        index=0,
+                        format_func=lambda _x: "(Bucket-Root)",
+                        label_visibility="collapsed",
+                        key="root_dd_placeholder",
+                        disabled=True,
+                    )
+                    st.button("Cloud Liste aktualisieren", width="stretch", key="refresh_root_placeholder", disabled=True)
+                    st.caption("Erst Cloud DB verbinden.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col_local:
@@ -201,10 +221,11 @@ def render(ns):
                         set_status(f"Ordnerdialog nicht verfuegbar: {picked}", "warn")
                 except Exception as e:
                     set_status(f"Lokale DB Verbindung fehlgeschlagen: {e}", "warn")
-            st.markdown(
-                f'<div class="breadcrumb">Lokaler Basispfad: {st.session_state.local_base_path if st.session_state.local_connected else "(noch nicht gesetzt)"}</div>',
-                unsafe_allow_html=True,
-            )
+            with local_path_slot.container():
+                st.markdown(
+                    f'<div class="breadcrumb">Lokaler Basispfad: {st.session_state.local_base_path if st.session_state.local_connected else "(noch nicht gesetzt)"}</div>',
+                    unsafe_allow_html=True,
+                )
 
 
         st.markdown('</div>', unsafe_allow_html=True)

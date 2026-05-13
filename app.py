@@ -18,7 +18,12 @@ import tempfile
 import io
 import zipfile
 import time
+import queue
 import os
+# Workaround for Windows access violations in pandas<->pyarrow string backend on Python 3.13.
+# Keep pandas on the Python string storage backend for Streamlit runtime stability.
+os.environ.setdefault("PANDAS_USE_PYARROW", "0")
+import importlib.util
 import subprocess
 import shutil
 import sys
@@ -93,6 +98,54 @@ try:
         importlib.reload(_tab_module)
 except Exception:
     pass
+
+HAS_PYARROW = importlib.util.find_spec("pyarrow") is not None
+
+if (not HAS_PYARROW) and DeltaGenerator is not None and not getattr(st, "_no_pyarrow_dataframe_patch", False):
+    _ORIG_DELTA_DATAFRAME = DeltaGenerator.dataframe
+    _ORIG_ST_DATAFRAME = st.dataframe
+
+    def _render_html_table(container, data, *, hide_index=None):
+        try:
+            if isinstance(data, pd.io.formats.style.Styler):
+                df = data.data.copy()
+            elif isinstance(data, pd.DataFrame):
+                df = data.copy()
+            else:
+                df = pd.DataFrame(data)
+        except Exception:
+            try:
+                container.write(data)
+            except Exception:
+                pass
+            return
+        if len(df) > 600:
+            df = df.head(600)
+        show_index = not bool(hide_index)
+        html = df.to_html(index=show_index, escape=False)
+        container.markdown(html, unsafe_allow_html=True)
+
+    def _delta_dataframe_no_pyarrow(self, data=None, width=None, height=None, **kwargs):
+        try:
+            return _ORIG_DELTA_DATAFRAME(self, data=data, width=width, height=height, **kwargs)
+        except ModuleNotFoundError as e:
+            if "pyarrow" not in str(e).lower():
+                raise
+            _render_html_table(self, data, hide_index=kwargs.get("hide_index"))
+            return self
+
+    def _st_dataframe_no_pyarrow(data=None, width=None, height=None, **kwargs):
+        try:
+            return _ORIG_ST_DATAFRAME(data=data, width=width, height=height, **kwargs)
+        except ModuleNotFoundError as e:
+            if "pyarrow" not in str(e).lower():
+                raise
+            _render_html_table(st, data, hide_index=kwargs.get("hide_index"))
+            return st
+
+    DeltaGenerator.dataframe = _delta_dataframe_no_pyarrow
+    st.dataframe = _st_dataframe_no_pyarrow
+    st._no_pyarrow_dataframe_patch = True
 
 if DeltaGenerator is not None and not getattr(st.button, "_ocr_form_fallback", False):
     _ORIG_DELTA_BUTTON = DeltaGenerator.button
@@ -175,67 +228,6 @@ sys.excepthook = _handle_unhandled_exception
 if hasattr(threading, "excepthook"):
     threading.excepthook = _handle_thread_exception
 
-
-def _render_main_navigation(labels: list[str]) -> str:
-    """Render only the selected app area.
-
-    Streamlit's native st.tabs renders every tab body on each rerun. ROI editing
-    is latency-sensitive, so the app uses a single active area and renders only
-    that module.
-    """
-    labels = list(labels or [])
-    if not labels:
-        return ""
-    state_key = "active_main_tab"
-    widget_key = "main_tab_selector"
-    requested = st.session_state.get("tab_default")
-    if isinstance(requested, str) and requested in labels:
-        st.session_state[state_key] = requested
-    current = st.session_state.get(state_key)
-    if current not in labels:
-        current = labels[0]
-        st.session_state[state_key] = current
-    # If the widget session-state value is stale after navigation changes,
-    # clear it so the widget re-renders with the correct default instead of breaking.
-    if st.session_state.get(widget_key) not in labels:
-        st.session_state.pop(widget_key, None)
-
-    selected = current
-    try:
-        segmented_kwargs = {
-            "selection_mode": "single",
-            "key": widget_key,
-            "label_visibility": "collapsed",
-        }
-        if widget_key not in st.session_state:
-            segmented_kwargs["default"] = current
-        selected = st.segmented_control(
-            "Bereich",
-            labels,
-            **segmented_kwargs,
-        ) or current
-    except Exception:
-        radio_key = "main_tab_selector_radio"
-        if isinstance(requested, str) and requested in labels:
-            st.session_state[radio_key] = requested
-        radio_kwargs = {
-            "horizontal": True,
-            "key": radio_key,
-            "label_visibility": "collapsed",
-        }
-        if radio_key not in st.session_state:
-            radio_kwargs["index"] = labels.index(current) if current in labels else 0
-        selected = st.radio(
-            "Bereich",
-            labels,
-            **radio_kwargs,
-        )
-    if selected not in labels:
-        selected = current if current in labels else labels[0]
-    st.session_state[state_key] = selected
-    if isinstance(requested, str) and requested in labels:
-        st.session_state.tab_default = None
-    return str(selected)
 
 st.set_page_config(
     page_title="OCR Extractor",
@@ -475,6 +467,10 @@ def init_state():
         mat_update_total=0,
         mat_update_keys=[],
         mat_run_state="idle",
+        mat_update_stop_requested=False,
+        mat_update_future=None,
+        mat_update_event_queue=None,
+        mat_update_stop_event=None,
         mat_load_requested=False,
         mat_load_running=False,
         roi_save_running=False,
@@ -1253,7 +1249,7 @@ def _try_auto_connect_once():
     if not all([acc, key, sec, bkt]):
         return
 
-    ok, msg, client = connect_r2_client(acc, key, sec, bkt)
+    ok, msg, client = _connect_r2_with_retry(acc, key, sec, bkt, max_attempts=3, delay_s=1.2)
     if not ok or client is None:
         set_status(f"Auto-Connect fehlgeschlagen: {msg}", "warn")
         return
@@ -1272,6 +1268,21 @@ def _try_auto_connect_once():
         st.session_state.fb_items = r2_list("")
     st.session_state.auto_connect_used = True
     set_status("Auto-Connect erfolgreich.", "ok")
+
+
+def _connect_r2_with_retry(acc: str, key: str, sec: str, bkt: str, *, max_attempts: int = 3, delay_s: float = 1.2):
+    last_msg = ""
+    attempts = max(1, int(max_attempts))
+    for i in range(attempts):
+        ok, msg, client = connect_r2_client(acc, key, sec, bkt)
+        if ok and client is not None:
+            if i == 0:
+                return True, str(msg or "ok"), client
+            return True, f"{str(msg or 'ok')} (verbunden nach {i+1}/{attempts} Versuchen)", client
+        last_msg = str(msg or "unbekannter Fehler")
+        if i < attempts - 1:
+            time.sleep(max(0.0, float(delay_s)))
+    return False, f"{last_msg} (nach {attempts} Versuchen)", None
 
 def _try_auto_connect_local_once():
     if st.session_state.local_connected or st.session_state.get("local_auto_connect_attempted"):
@@ -3797,7 +3808,39 @@ def _start_mat_update(remote_keys: list[str]):
     st.session_state.mat_update_idx = 0
     st.session_state.mat_update_running = len(targets) > 0
     st.session_state.mat_run_state = "running" if len(targets) > 0 else "idle"
+    st.session_state.mat_update_stop_requested = False
     st.session_state.mat_overview_rows = [_placeholder_overview_row(t) for t in targets]
+
+@st.cache_resource(show_spinner=False)
+def _mat_update_executor():
+    return cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="mat_update")
+
+
+def _mat_update_worker(targets, client, prefix: str, stop_event, out_queue):
+    """Background MAT analyzer that streams row results through a queue."""
+    try:
+        for idx, target in enumerate(list(targets or [])):
+            if stop_event is not None and stop_event.is_set():
+                out_queue.put({"type": "stopped", "idx": idx})
+                return
+            folder = str(target.get("folder", "") or "") if isinstance(target, dict) else ""
+            key = str(target.get("mat_key", "") or "") if isinstance(target, dict) else str(target)
+            if key:
+                summary = _compute_mat_summary_remote(key, client, prefix)
+            else:
+                summary = _compute_folder_only_summary(folder=folder, client=client, prefix=prefix)
+            out_queue.put(
+                {
+                    "type": "row",
+                    "idx": int(idx),
+                    "folder": folder,
+                    "mat_key": key,
+                    "summary": summary,
+                }
+            )
+        out_queue.put({"type": "done", "total": len(list(targets or []))})
+    except Exception as exc:
+        out_queue.put({"type": "error", "error": f"{exc.__class__.__name__}: {exc}"})
 
 
 def _step_mat_update_once():
@@ -3834,22 +3877,13 @@ def _step_mat_update_once():
 
 def _render_disabled_mat_overview_table(slot, rows_or_df):
     df = rows_or_df if isinstance(rows_or_df, pd.DataFrame) else pd.DataFrame(rows_or_df)
-    with slot.container():
-        st.markdown('<div class="mat-selection-disabled">MAT-Auswahl wird aktualisiert ...</div>', unsafe_allow_html=True)
-        try:
-            view = df.style.set_properties(**{
-                "background-color": "#20232b",
-                "color": "#7d8491",
-            })
-        except Exception:
-            view = df
-        st.dataframe(
-            view,
-            width="stretch",
-            hide_index=True,
-            height=MAT_TABLE_HEIGHT,
-            column_config=MAT_OVERVIEW_COLCFG,
-        )
+    slot.dataframe(
+        df.drop(columns=["remote_key"], errors="ignore"),
+        width="stretch",
+        hide_index=True,
+        height=MAT_TABLE_HEIGHT,
+        column_config=MAT_OVERVIEW_COLCFG,
+    )
 
 def _status_cell_style(value):
     txt = str(value)
@@ -4154,7 +4188,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                     st.session_state.mat_overview_rows[i] = _summary_to_overview_row(summary, display_folder=folder)
                     done += 1
                     st.session_state.mat_update_idx = done
-                    if live_table is not None and (done == total or done % 3 == 0 or done <= 2):
+                    if live_table is not None:
                         _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
                     if progress is not None and total > 0:
                         progress.progress(min(1.0, done / total), text=f"{done}/{max(done + sum(1 for f in fut_to_idx if not f.done()), done, 1)} aktuell analysiert · {max(0, total-done)} offen")
@@ -4166,7 +4200,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
         while st.session_state.mat_update_running:
             _step_mat_update_once()
             done = int(st.session_state.mat_update_idx or 0)
-            if live_table is not None and (done == total or done % 3 == 0 or done <= 2):
+            if live_table is not None:
                 live_table.dataframe(
                     pd.DataFrame(st.session_state.mat_overview_rows),
                     width="stretch",
@@ -6266,8 +6300,8 @@ st.markdown(
     f'<span class="status-badge status-{stype}">{st.session_state.status_msg}</span>' + _pfx_badge,
     unsafe_allow_html=True)
 
-# Main areas. Only one renderer is executed per Streamlit rerun; this keeps ROI
-# editing responsive even when Track/Audio/MAT pages contain expensive widgets.
+# Main areas. Native tabs render every tab body on each rerun so all
+# components are initialized and visible from app startup.
 _tab_labels = [
     "Cloud Connection & Root",
     "Sync",
@@ -6275,15 +6309,14 @@ _tab_labels = [
     "ROI Setup",
     "Audio Auswertung",
 ]
-_active_tab = _render_main_navigation(_tab_labels)
-
-if _active_tab == "Cloud Connection & Root":
+_tabs = st.tabs(_tab_labels)
+with _tabs[0]:
     setup_tab.render(globals())
-elif _active_tab == "Sync":
+with _tabs[1]:
     sync_tab.render(globals())
-elif _active_tab == "MAT Selection":
+with _tabs[2]:
     mat_selection_tab.render(globals())
-elif _active_tab == "ROI Setup":
+with _tabs[3]:
     roi_setup_tab.render(globals())
-elif _active_tab == "Audio Auswertung":
+with _tabs[4]:
     audio_tab.render(globals())

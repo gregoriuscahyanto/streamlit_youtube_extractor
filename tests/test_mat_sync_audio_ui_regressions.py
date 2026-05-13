@@ -236,8 +236,8 @@ def test_tabs_are_split_into_renderer_modules():
 
     app_source = (repo / "app.py").read_text(encoding="utf-8")
     assert "from app_tabs import" in app_source
-    assert "_render_main_navigation(_tab_labels)" in app_source
-    assert "st.tabs(" not in app_source
+    assert "_render_main_navigation(_tab_labels)" not in app_source
+    assert "_tabs = st.tabs(_tab_labels)" in app_source
     assert '"Track Analysis"' not in app_source
     for name in ("setup_tab", "sync_tab", "mat_selection_tab", "audio_tab", "roi_setup_tab"):
         assert f"{name}.render(globals())" in app_source

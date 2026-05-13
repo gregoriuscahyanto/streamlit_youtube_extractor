@@ -6,17 +6,58 @@ session-state conventions remain shared during the incremental split.
 
 def render(ns):
     globals().update(ns)
+    has_pyarrow = bool(globals().get("HAS_PYARROW", False))
     _scroll_to_top_once()
     if not _has_media_source():
-        st.markdown("""
-        <div style="text-align:center;padding:3rem 2rem;color:#4a5060;">
-          <div style="font-size:2.5rem;margin-bottom:.8rem">VIDEO</div>
-          <div style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:600">
-            Kein Video geladen</div>
-          <div style="font-family:'JetBrains Mono',monospace;font-size:.72rem;
-               margin-top:.4rem;color:#2e3545">
-            -> Tab CLOUD oeffnen -> Video laden oder von R2 laden</div>
-        </div>""", unsafe_allow_html=True)
+        st.subheader("1 · ROI Setup")
+        st.caption("Kein Video geladen. Alle Komponenten sind vorbereitet und werden nach Medien-Laden befuellt.")
+        col_v, col_r = st.columns([1, 1], gap="medium")
+        with col_v:
+            st.markdown('<div class="section-card">', unsafe_allow_html=True)
+            st.slider("Start [s]", 0.0, 1.0, 0.0, step=1.0, key="roi_ph_start", disabled=True)
+            st.slider("Ende [s]", 0.0, 1.0, 1.0, step=1.0, key="roi_ph_end", disabled=True)
+            st.slider("Position [s]", 0.0, 1.0, 0.0, step=1.0, key="roi_ph_pos", disabled=True)
+            st.caption("Video-Frame Platzhalter")
+            st.image(np.zeros((180, 320, 3), dtype=np.uint8), width="stretch")
+            st.markdown('</div>', unsafe_allow_html=True)
+        with col_r:
+            st.markdown('<div class="section-card">', unsafe_allow_html=True)
+            st.dataframe(
+                pd.DataFrame(columns=["name", "x", "y", "w", "h", "fmt", "max_scale"]),
+                width="stretch",
+                hide_index=True,
+                height=260,
+            )
+            c1, c2 = st.columns(2)
+            c1.button("ROI hinzufuegen", width="stretch", key="roi_ph_add", disabled=True)
+            c2.button("Ausgewaehlte ROI loeschen", width="stretch", key="roi_ph_del", disabled=True)
+            st.button("Speichern", type="primary", width="stretch", key="roi_ph_save", disabled=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">2 · Track Analysis</div>', unsafe_allow_html=True)
+        st.caption("Referenz-Track / Minimap-Kalibrierung wird angezeigt, sobald Video und track_minimap ROI verfuegbar sind.")
+        c2a, c2b = st.columns(2)
+        c2a.caption("Referenztrack Platzhalter")
+        c2a.image(np.zeros((120, 220, 3), dtype=np.uint8), width="stretch")
+        c2b.caption("Minimap Platzhalter")
+        c2b.image(np.zeros((120, 220, 3), dtype=np.uint8), width="stretch")
+        st.slider("Track Position [s]", 0.0, 1.0, 0.0, step=1.0, key="roi_ph_track_t", disabled=True)
+        t2b1, t2b2, t2b3 = st.columns(3)
+        t2b1.button("Aus Cloud laden", width="stretch", key="roi_ph_track_load", disabled=True)
+        t2b2.button("Zuruecksetzen", width="stretch", key="roi_ph_track_reset", disabled=True)
+        t2b3.button("Letzten entfernen", width="stretch", key="roi_ph_track_undo", disabled=True)
+        st.button("Vergleich 5 Zeiten", width="stretch", key="roi_ph_cmp", disabled=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">3 · Vergleich / Ergebnisse</div>', unsafe_allow_html=True)
+        st.caption("Noch kein Vergleich durchgefuehrt. Ergebnisse werden hier nach der Analyse angezeigt.")
+        c3 = st.columns(5)
+        for i, col in enumerate(c3):
+            col.caption(f"Bild {i+1}")
+            col.image(np.zeros((90, 120, 3), dtype=np.uint8), width="stretch")
+        st.dataframe(pd.DataFrame(columns=["Zeit [s]", "Fortschritt [%]", "Hinweis"]), width="stretch", hide_index=True, height=140)
+        st.button("Verlauf leeren", width="stretch", key="roi_ph_hist_clear", disabled=True)
+        st.markdown('</div>', unsafe_allow_html=True)
     else:
         st.markdown(
             """
@@ -245,7 +286,8 @@ def render(ns):
                         "Fuer ROI-Drag bitte installieren: pip install streamlit-cropper-fix"
                     )
             else:
-                st.warning("Frame nicht verfuegbar.")
+                st.caption("Frame aktuell nicht verfuegbar. Platzhalter wird angezeigt, bis das Medium lesbar ist.")
+                st.image(np.zeros((180, 320, 3), dtype=np.uint8), width="stretch")
 
             drag_state = st.session_state.get("drag_roi", {})
             if not isinstance(drag_state, dict):
@@ -382,24 +424,34 @@ def render(ns):
                 columns=_roi_cols,
             )
 
-            edited_df = st.data_editor(
-                df_edit,
-                column_config={
-                    _sel_col: st.column_config.CheckboxColumn("", width=42),
-                    "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width=150),
-                    "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width=170),
-                    "Pattern": st.column_config.TextColumn("Pat.", width=56, disabled=True),
-                    "Scale": st.column_config.NumberColumn("Sc.", width=52, disabled=True),
-                    "OCR OK": st.column_config.CheckboxColumn("OCR OK", width=70, disabled=True),
-                    "OCR Wert": st.column_config.TextColumn("OCR Wert", width=110, disabled=True, help="OCR-Testwert; Details stehen in der Spalte OCR Details."),
-                    "OCR Details": st.column_config.TextColumn("OCR Details", width=210, disabled=True, help="raw, conf, scale und frUp aus dem letzten OCR-Test."),
-                },
-                num_rows="fixed",
-                width="stretch",
-                hide_index=True,
-                height=_tbl_h,
-                key=str(st.session_state.get("roi_editor_widget_key", "roi_data_editor_v3")),
-            )
+            if has_pyarrow:
+                edited_df = st.data_editor(
+                    df_edit,
+                    column_config={
+                        _sel_col: st.column_config.CheckboxColumn("", width=42),
+                        "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width=150),
+                        "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width=170),
+                        "Pattern": st.column_config.TextColumn("Pat.", width=56, disabled=True),
+                        "Scale": st.column_config.NumberColumn("Sc.", width=52, disabled=True),
+                        "OCR OK": st.column_config.CheckboxColumn("OCR OK", width=70, disabled=True),
+                        "OCR Wert": st.column_config.TextColumn("OCR Wert", width=110, disabled=True, help="OCR-Testwert; Details stehen in der Spalte OCR Details."),
+                        "OCR Details": st.column_config.TextColumn("OCR Details", width=210, disabled=True, help="raw, conf, scale und frUp aus dem letzten OCR-Test."),
+                    },
+                    num_rows="fixed",
+                    width="stretch",
+                    hide_index=True,
+                    height=_tbl_h,
+                    key=str(st.session_state.get("roi_editor_widget_key", "roi_data_editor_v3")),
+                )
+            else:
+                st.caption("Hinweis: pyarrow nicht verfuegbar. ROI-Tabelle ist nur lesbar.")
+                st.dataframe(
+                    df_edit,
+                    width="stretch",
+                    hide_index=True,
+                    height=_tbl_h,
+                )
+                edited_df = df_edit
 
             if edited_df is not None and len(edited_df) == len(_rois):
                 if _sel_col in edited_df.columns:

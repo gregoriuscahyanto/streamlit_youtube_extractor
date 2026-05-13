@@ -12,6 +12,23 @@ def render(ns):
     if title_txt:
         st.info(f"Datensatz / Fahrzeug aus Metadata: {title_txt}")
     st.caption("Mehrere echte RPM-Methoden direkt aus der Video-/Audiospur: STFT/Ridge, Viterbi, Peak, Autokorrelation/YIN, Cepstrum, Harmonic Comb/HPS, CWT/Wavelet und Hybrid. Cloud audio_proxy_1k.wav wird bevorzugt; lokale Videos werden bei Bedarf per ffmpeg gelesen.")
+    if not _has_media_source():
+        st.caption("Kein Video/Audio geladen. Alle Audio-Komponenten sind als Platzhalter vorbereitet.")
+        with st.expander("Signal / STFT", expanded=True):
+            c0 = st.columns(4)
+            c0[0].selectbox("NFFT/Overlap", ["Fest auswaehlen"], index=0, key="aud_ph_stft_mode", disabled=True)
+            c0[1].number_input("NFFT", 64, 65536, 4096, step=64, key="aud_ph_nfft", disabled=True)
+            c0[2].number_input("Overlap [%]", 0.0, 98.0, 75.0, step=1.0, key="aud_ph_ov", disabled=True)
+            c0[3].number_input("f max [Hz]", 20.0, 5000.0, 1000.0, step=25.0, key="aud_ph_fmax", disabled=True)
+            st.selectbox("Drehzahl Methode", ["Hybrid"], index=0, key="aud_ph_method", disabled=True)
+        with st.expander("Motor / Kandidaten", expanded=True):
+            c1 = st.columns(3)
+            c1[0].selectbox("Antrieb", ["Verbrenner/Hybrid"], key="aud_ph_drive", disabled=True)
+            c1[1].selectbox("Zylinder", ["Auto variieren"], key="aud_ph_cyl_mode", disabled=True)
+            c1[2].selectbox("Harmonische/Ordnung", ["Auto variieren"], key="aud_ph_harm_mode", disabled=True)
+            st.button("Audioanalyse starten", type="primary", width="stretch", key="aud_ph_start", disabled=True)
+        st.info("Lade zuerst eine MAT+Video-Datei im Tab 'MAT-Auswahl und Analyse'.")
+        return
 
     with st.expander("Signal / STFT", expanded=True):
         c0 = st.columns(4)
@@ -325,13 +342,21 @@ def render(ns):
     def _audio_native_live_refresh_panel():
         _render_audio_live_panel(expanded=True)
 
+    _audio_live_run_every = 1.0 if (st.session_state.get("audio_bg_future") is not None) else None
     try:
-        _audio_native_live_refresh_panel = st.fragment(run_every=1.0)(_audio_native_live_refresh_panel)
+        _audio_native_live_refresh_panel = st.fragment(run_every=_audio_live_run_every)(_audio_native_live_refresh_panel)
     except Exception:
         pass
     _audio_native_live_refresh_panel()
 
     res=st.session_state.get("audio_analysis_result")
+    if not (isinstance(res, dict) and res.get("t") is not None):
+        st.markdown("**Analyse-Ergebnis (Platzhalter)**")
+        st.caption("Noch kein Ergebnis vorhanden. Nach 'Audioanalyse starten' werden Spektrogramm, RPM-Plot und Exportoptionen hier befuellt.")
+        st.dataframe(pd.DataFrame(columns=["Methode", "Score", "Hinweis"]), width="stretch", hide_index=True, height=120)
+        st.button("Debug ZIP herunterladen", width="stretch", key="aud_debug_zip_ph", disabled=True)
+        st.button("Audioanalyse in MAT + JSON speichern", type="primary", width="stretch", key="aud_save_to_mat_ph", disabled=True)
+
     if isinstance(res,dict) and res.get("t") is not None:
         p=res.get('params',{})
         zyl_txt = "EV" if p.get('cyl') == 0 else p.get('cyl')
