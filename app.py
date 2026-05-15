@@ -1622,6 +1622,58 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
         nm = str(st.session_state.rois[_idx].get("name", f"roi_{_idx}") or f"roi_{_idx}")
         roi_stats[nm] = {"ok": 0, "seen": 0}
 
+    track_roi = next(
+        (
+            r for r in list(st.session_state.get("rois") or [])
+            if str(r.get("name", "")).strip().lower() == "track_minimap"
+            and float(r.get("w", 0.0) or 0.0) > 0.0
+            and float(r.get("h", 0.0) or 0.0) > 0.0
+        ),
+        None,
+    )
+    has_track_cal = bool(
+        track_roi is not None
+        and st.session_state.get("ref_track_img") is not None
+        and isinstance(st.session_state.get("minimap_pts"), list)
+        and isinstance(st.session_state.get("ref_track_pts"), list)
+        and len(st.session_state.get("minimap_pts") or []) >= 4
+        and len(st.session_state.get("ref_track_pts") or []) >= 4
+    )
+
+    def _centerline_progress_percent(ref_pt, centerline_px) -> float | None:
+        if ref_pt is None:
+            return None
+        try:
+            cl = np.asarray(centerline_px, dtype=float)
+            if cl.ndim != 2 or cl.shape[0] < 2 or cl.shape[1] < 2:
+                return None
+            p = np.asarray(ref_pt, dtype=float).ravel()
+            if p.size < 2 or not np.all(np.isfinite(p[:2])):
+                return None
+            p = p[:2]
+            d = np.diff(cl[:, :2], axis=0)
+            seg_len = np.sqrt(np.sum(d * d, axis=1))
+            cum = np.concatenate(([0.0], np.cumsum(seg_len)))
+            total = float(cum[-1])
+            if total <= 1e-9:
+                return None
+            best_d2 = float("inf")
+            best_s = 0.0
+            for i in range(len(seg_len)):
+                v = cl[i + 1, :2] - cl[i, :2]
+                l2 = float(np.dot(v, v))
+                if l2 <= 0:
+                    continue
+                u = float(np.clip(np.dot(p - cl[i, :2], v) / l2, 0.0, 1.0))
+                q = cl[i, :2] + u * v
+                d2 = float(np.sum((p - q) ** 2))
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_s = float(cum[i] + u * seg_len[i])
+            return float(np.clip(100.0 * best_s / total, 0.0, 100.0))
+        except Exception:
+            return None
+
     processed = 0
     cancelled = False
     try:
@@ -1641,6 +1693,7 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
             fh, fw = frame.shape[:2]
             raw_row = {"time_s": float(t_s), "frame_idx": int(processed)}
             clean_row = {"time_s": float(t_s), "frame_idx": int(processed)}
+            live_snapshot = {"time_s": float(t_s), "frame_idx": int(processed)}
             for _idx in indices:
                 roi_cfg = {
                     **st.session_state.rois[_idx],
@@ -1650,14 +1703,52 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
                 probe = diagnose_roi_ocr(frame, roi_cfg, (int(fw), int(fh)), tmp_root=LOG_DIR / "ocr_tmp")
                 raw_row[nm] = str(probe.get("raw", "") or "")
                 clean_row[nm] = str(probe.get("value", "") or "") if bool(probe.get("ok")) else ""
+                live_snapshot[nm] = clean_row[nm]
                 roi_stats[nm]["seen"] += 1
                 if bool(probe.get("ok")):
                     roi_stats[nm]["ok"] += 1
+
+            if track_roi is not None:
+                try:
+                    crop = extract_minimap_crop(frame, track_roi, fw, fh)
+                except Exception:
+                    crop = None
+                if crop is not None:
+                    mp = detect_moving_point(crop, st.session_state.get("moving_pt_color_range") or {})
+                    if isinstance(mp, dict):
+                        x_mp = float(mp.get("x", 0.0) or 0.0)
+                        y_mp = float(mp.get("y", 0.0) or 0.0)
+                        clean_row["track_minimap_x"] = x_mp
+                        clean_row["track_minimap_y"] = y_mp
+                        live_snapshot["track_minimap_x"] = x_mp
+                        live_snapshot["track_minimap_y"] = y_mp
+                        if has_track_cal:
+                            cmp = compare_minimap_to_reference(
+                                crop,
+                                st.session_state.get("ref_track_img"),
+                                st.session_state.get("minimap_pts"),
+                                st.session_state.get("ref_track_pts"),
+                            )
+                            if isinstance(cmp, dict) and not cmp.get("error"):
+                                ref_pt = project_point_with_homography((x_mp, y_mp), cmp.get("H"))
+                                if isinstance(ref_pt, (list, tuple, np.ndarray)) and len(ref_pt) >= 2:
+                                    rx = float(ref_pt[0])
+                                    ry = float(ref_pt[1])
+                                    clean_row["track_xy_x"] = rx
+                                    clean_row["track_xy_y"] = ry
+                                    live_snapshot["track_xy_x"] = rx
+                                    live_snapshot["track_xy_y"] = ry
+                                    pct = _centerline_progress_percent(ref_pt, st.session_state.get("centerline_px"))
+                                    if pct is not None:
+                                        clean_row["track_pct"] = float(pct)
+                                        live_snapshot["track_pct"] = float(pct)
             raw_rows.append(raw_row)
             clean_rows.append(clean_row)
             processed += 1
-            if callable(progress_cb) and (processed % 20 == 0 or processed == frame_count):
+            if callable(progress_cb) and (processed % 10 == 0 or processed == frame_count):
                 try:
+                    progress_cb(processed, frame_count, t_s, dict(live_snapshot))
+                except TypeError:
                     progress_cb(processed, frame_count, t_s)
                 except Exception:
                     pass
@@ -5784,6 +5875,10 @@ def _audio_executor():
     return cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="audio_rpm")
 
 
+def _video_ocr_executor():
+    return cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="video_ocr_full")
+
+
 @st.cache_resource(show_spinner=False)
 def _audio_live_server():
     """Small localhost JSON endpoint for live audio status without Streamlit reruns."""
@@ -6582,25 +6677,135 @@ def _load_json_doc_from_bytes(raw: bytes) -> dict:
     except Exception:
         return {}
 
-def _mat_bytes_to_recordresult_json_bytes(raw_mat_bytes: bytes) -> bytes | None:
-    """Build canonical sidecar bytes from MAT bytes.
+def _rr_from_mat_bytes_matio(raw_mat_bytes: bytes) -> dict | None:
+    """Load recordResult from MAT bytes using matio.
 
-    Sidecars are recordResult-centric and should not expose raw MATLAB MCOS
-    internal wrappers such as s0/s1/s2/arr blobs.
+    matio handles MCOS-encoded MATLAB tables (v5 and v7.3) that scipy cannot
+    parse. Returns a plain-Python recordResult dict, or None on failure.
+    matio requires a file path so bytes are written to a temp file.
     """
     if not raw_mat_bytes:
         return None
     try:
-        from core.save_helpers import rr_from_mat_bytes
-        rr, _extra = rr_from_mat_bytes(raw_mat_bytes)
-        if not isinstance(rr, dict) or not rr:
+        import matio as _matio
+        import pandas as _pd
+    except ImportError:
+        return None
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+    try:
+        tmp.write(raw_mat_bytes)
+        tmp.close()
+        data = _matio.load_from_mat(tmp.name)
+    except Exception:
+        return None
+    finally:
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not isinstance(data, dict) or "recordResult" not in data:
+        return None
+
+    def _conv(obj, depth=0):
+        if depth > 12:
             return None
-        _fix_mcos = globals().get("_fix_mcos_roi_table_v5")
-        if callable(_fix_mcos):
-            _fix_mcos(rr, raw_mat_bytes)
-        _fix_roi = globals().get("_fix_roi_table_in_rr")
-        if callable(_fix_roi):
-            _fix_roi(rr)
+        if isinstance(obj, _pd.DataFrame):
+            return [
+                {col: _conv(row[col], depth + 1) for col in obj.columns}
+                for _, row in obj.iterrows()
+            ]
+        if isinstance(obj, np.ndarray):
+            if obj.dtype.names:
+                if obj.size == 0:
+                    return {}
+                val = obj.flat[0]
+                return {f: _conv(val[i], depth + 1) for i, f in enumerate(obj.dtype.names)}
+            if obj.size == 1:
+                return _conv(obj.flat[0], depth + 1)
+            if obj.dtype.kind in ("U", "S"):
+                return str(obj.flat[0]) if obj.size > 0 else ""
+            return obj.tolist()
+        if isinstance(obj, tuple):
+            if len(obj) == 1:
+                return _conv(obj[0], depth + 1)
+            return [_conv(v, depth + 1) for v in obj]
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            v = float(obj)
+            return None if (v != v or v == float("inf") or v == float("-inf")) else v
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="ignore")
+        return obj
+
+    def _fix_roi_rows(rows: list) -> list:
+        """Normalise roi_table rows from matio: parse roi string, unwrap tuples."""
+        fixed = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            name = r.get("name_roi", "")
+            if isinstance(name, (list, tuple)):
+                name = name[0] if name else ""
+            name = str(name).strip()
+
+            roi = r.get("roi", [])
+            if isinstance(roi, str):
+                try:
+                    roi = [float(x) for x in roi.split()]
+                except Exception:
+                    roi = []
+            elif not isinstance(roi, list):
+                roi = []
+
+            fmt = r.get("fmt", "any")
+            if isinstance(fmt, (list, tuple)):
+                fmt = fmt[0] if fmt else "any"
+            fmt = str(fmt).strip() or "any"
+
+            try:
+                max_scale = float(r.get("max_scale", 1.2))
+            except Exception:
+                max_scale = 1.2
+
+            fixed.append({"name_roi": name, "roi": roi, "fmt": fmt, "max_scale": max_scale})
+        return fixed
+
+    try:
+        rr = _conv(data["recordResult"])
+        if not isinstance(rr, dict):
+            return None
+        ocr = rr.get("ocr")
+        if isinstance(ocr, dict):
+            for field in ("roi_table", "roi_table_raw"):
+                rows = ocr.get(field)
+                if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                    ocr[field] = _fix_roi_rows(rows)
+        return rr
+    except Exception:
+        return None
+
+
+def _mat_bytes_to_recordresult_json_bytes(raw_mat_bytes: bytes) -> bytes | None:
+    """Build canonical sidecar bytes from MAT bytes.
+
+    Tries matio first (handles MCOS MATLAB tables), falls back to scipy.
+    """
+    if not raw_mat_bytes:
+        return None
+    try:
+        rr = _rr_from_mat_bytes_matio(raw_mat_bytes)
+        if not isinstance(rr, dict) or not rr:
+            from core.save_helpers import rr_from_mat_bytes
+            rr, _extra = rr_from_mat_bytes(raw_mat_bytes)
+            if not isinstance(rr, dict) or not rr:
+                return None
+            _fix_mcos_roi_table_v5(rr, raw_mat_bytes)
+            _fix_roi_table_in_rr(rr)
+        else:
+            _fill_roi_from_trkCalSlim(rr.get("ocr") or {})
         payload = {"recordResult": _mat_export_to_jsonable(rr)}
         payload = _normalize_sidecar_json_payload(payload)
         return json.dumps(

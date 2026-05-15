@@ -24,12 +24,16 @@ def render(ns):
             norm = globals().get("_normalize_sidecar_json_payload")
 
             data = None
+            _load_err = ""
             robust_loader = globals().get("_loadmat_audio_save_robust")
             if callable(robust_loader):
                 try:
                     data, _load_note = robust_loader(tmp.name)
-                except Exception:
+                    if data is None:
+                        _load_err = str(_load_note or "")
+                except Exception as _e_rob:
                     data = None
+                    _load_err = str(_e_rob)
             if isinstance(data, dict) and data:
                 rr_obj = data.get("recordResult")
                 if rr_obj is None:
@@ -46,26 +50,28 @@ def render(ns):
                         out = json.dumps(payload, ensure_ascii=False, indent=2, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
                         return True, out, ""
 
-            try:
-                import h5py
-                h5_decode = globals().get("_h5_decode_value")
-                h5_get_ci = globals().get("_h5_get_path_ci")
-                with h5py.File(tmp.name, "r") as f:
-                    rr_node = h5_get_ci(f, ["recordResult"]) if callable(h5_get_ci) else (f["recordResult"] if "recordResult" in f else None)
-                    if rr_node is not None:
-                        rr_val = h5_decode(rr_node, f) if callable(h5_decode) else None
-                        rr_plain = mat_to_plain(rr_val) if callable(mat_to_plain) else rr_val
-                        if isinstance(rr_plain, dict) and rr_plain:
-                            fix_roi = globals().get("_fix_roi_table_in_rr")
-                            if callable(fix_roi):
-                                fix_roi(rr_plain, tmp.name)
-                            payload = {"recordResult": _mat_export_to_jsonable(rr_plain)}
-                            if callable(norm):
-                                payload = norm(payload)
-                            out = json.dumps(payload, ensure_ascii=False, indent=2, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
-                            return True, out, ""
-            except Exception as e_h5:
-                return False, b"", str(e_h5)
+            _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+            if raw[:8] == _HDF5_MAGIC:
+                try:
+                    import h5py
+                    h5_decode = globals().get("_h5_decode_value")
+                    h5_get_ci = globals().get("_h5_get_path_ci")
+                    with h5py.File(tmp.name, "r") as f:
+                        rr_node = h5_get_ci(f, ["recordResult"]) if callable(h5_get_ci) else (f["recordResult"] if "recordResult" in f else None)
+                        if rr_node is not None:
+                            rr_val = h5_decode(rr_node, f) if callable(h5_decode) else None
+                            rr_plain = mat_to_plain(rr_val) if callable(mat_to_plain) else rr_val
+                            if isinstance(rr_plain, dict) and rr_plain:
+                                fix_roi = globals().get("_fix_roi_table_in_rr")
+                                if callable(fix_roi):
+                                    fix_roi(rr_plain, tmp.name)
+                                payload = {"recordResult": _mat_export_to_jsonable(rr_plain)}
+                                if callable(norm):
+                                    payload = norm(payload)
+                                out = json.dumps(payload, ensure_ascii=False, indent=2, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
+                                return True, out, ""
+                except Exception as e_h5:
+                    return False, b"", str(e_h5)
         except Exception as e:
             return False, b"", str(e)
         finally:
@@ -73,6 +79,8 @@ def render(ns):
                 Path(tmp.name).unlink(missing_ok=True)
             except Exception:
                 pass
+        if _load_err:
+            return False, b"", _load_err
         return False, b"", "recordResult nicht lesbar"
 
     def _json_recordresult_ocr_lengths(json_bytes: bytes) -> dict:
@@ -534,7 +542,11 @@ end
 
                 rows_live, _pending_live = _scan_results_rows(results_dir, status_map_local)
                 _render_rows_table(rows_live)
-                current_slot.caption(f"Aktuell fertig: {json_name} ({done_n}/{max(1,total_n)})")
+                next_name = pending_paths[0].name if pending_paths else "–"
+                current_slot.caption(
+                    f"Zuletzt: {json_name} ({done_n}/{max(1,total_n)}) | "
+                    f"Nächste: {next_name}"
+                )
                 remain = max(0, total_n - done_n)
                 progress_slot.progress(
                     done_n / max(1, total_n),
