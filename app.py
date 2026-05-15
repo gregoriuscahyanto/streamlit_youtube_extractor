@@ -89,12 +89,12 @@ from core.track_analysis import (
     extract_minimap_crop,
     project_point_with_homography,
 )
-from app_tabs import audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, youtube_tab
+from app_tabs import audio_tab, mat_selection_tab, mat_to_json_tab, roi_setup_tab, setup_tab, sync_tab, youtube_tab
 try:
     # Streamlit reruns app.py in the same Python process. Reload extracted tab modules
     # so changes in app_tabs/*.py are visible without a full server restart.
     import importlib
-    for _tab_module in (audio_tab, mat_selection_tab, roi_setup_tab, setup_tab, sync_tab, youtube_tab):
+    for _tab_module in (audio_tab, mat_selection_tab, mat_to_json_tab, roi_setup_tab, setup_tab, sync_tab, youtube_tab):
         importlib.reload(_tab_module)
 except Exception:
     pass
@@ -571,10 +571,10 @@ def _render_blocking_overlay(text: str):
     )
 
 
-# Nur "NÃ¤chste Datei laden" darf bewusst einen kompletten Rerun/Refresh auslÃ¶sen.
+# Nur "Nächste Datei laden" darf bewusst einen kompletten Rerun/Refresh auslösen.
 # Speichern und OCR-Test zeigen ihr Overlay lokal im jeweiligen Button-Flow.
 if bool(st.session_state.get("roi_next_load_running", False)):
-    _render_blocking_overlay("NÃ¤chste Datei wird geladen ...")
+    _render_blocking_overlay("Nächste Datei wird geladen ...")
 
 
 def _scroll_to_top_once(flag_key: str = "roi_scroll_top_once"):
@@ -2771,6 +2771,344 @@ def _extract_rois_from_recordresult_mat(mat_path: str) -> list[dict]:
         return h5_rois or []
 
 
+def _decode_roi_table_from_v5_workspace(fw_bytes: bytes, roi_names_cat: list, fmt_options: list) -> list[dict]:
+    """Decode roi_table rows from the __function_workspace__ binary of a v5 MCOS MAT file.
+
+    The MCOS binary stores:
+    - max_scale: type-9 element of n_rows × float64(1.2)
+    - name_roi categorical codes: type-2 element of n_rows uint8 values (1-indexed)
+    - fmt categorical codes: second type-2 element of n_rows uint8 values (1-indexed)
+    - roi coordinates: uint64 header [n_rows, 1, len0, ..., len(n-1)] followed by
+      concatenated uint16 char strings (each row = "x y w h" padded to len_i chars)
+
+    Returns a list of n_rows row-dicts with name_roi, roi, fmt, max_scale.
+    """
+    import struct as _struct
+
+    if not fw_bytes or not roi_names_cat or not fmt_options:
+        return []
+
+    n_cat = len(roi_names_cat)
+    n_fmt = len(fmt_options)
+    val_12 = _struct.pack("<d", 1.2)
+
+    # Step 1: determine n_rows from the first max_scale float64 run of n × 1.2
+    n_rows = 0
+    i = 0
+    while i <= len(fw_bytes) - 8:
+        if fw_bytes[i : i + 4] == b"\x09\x00\x00\x00":
+            size = _struct.unpack("<I", fw_bytes[i + 4 : i + 8])[0]
+            if size >= 8 and size % 8 == 0:
+                n = size // 8
+                end = i + 8 + size
+                if 2 <= n <= 200 and end <= len(fw_bytes):
+                    chunk = fw_bytes[i + 8 : end]
+                    if all(chunk[j : j + 8] == val_12 for j in range(0, size, 8)):
+                        n_rows = n
+                        break
+        i += 1
+
+    if n_rows == 0:
+        return []
+
+    # Step 2: collect all full-element uint8[n_rows] arrays
+    candidates = []
+    i = 0
+    while i <= len(fw_bytes) - 8 - n_rows:
+        if fw_bytes[i : i + 4] == b"\x02\x00\x00\x00":
+            size = _struct.unpack("<I", fw_bytes[i + 4 : i + 8])[0]
+            if size == n_rows:
+                codes = list(fw_bytes[i + 8 : i + 8 + n_rows])
+                candidates.append((i, codes))
+        i += 1
+
+    # Step 3: identify name_roi and fmt code arrays
+    name_codes: list | None = None
+    fmt_codes: list | None = None
+
+    for _offset, codes in candidates:
+        if name_codes is None and all(1 <= c <= n_cat for c in codes):
+            names_decoded = [roi_names_cat[c - 1] for c in codes]
+            if any(n != "_" for n in names_decoded):
+                name_codes = codes
+                continue
+        if fmt_codes is None and codes is not name_codes and all(1 <= c <= n_fmt for c in codes):
+            fmt_codes = codes
+
+        if name_codes is not None and fmt_codes is not None:
+            break
+
+    if name_codes is None:
+        return []
+
+    # Step 4: decode roi coordinates from uint64-header + concatenated uint16 char data
+    # Header pattern: uint64(n_rows), uint64(1), n_rows × uint64(row_len_i)
+    # Followed immediately by total_chars × uint16 of char data
+    roi_coords: list | None = None
+    step8 = 8
+    header_size = (n_rows + 2) * step8
+    for i in range(0, len(fw_bytes) - header_size - 10, step8):
+        v0 = _struct.unpack("<Q", fw_bytes[i : i + 8])[0]
+        if v0 != n_rows:
+            continue
+        v1 = _struct.unpack("<Q", fw_bytes[i + 8 : i + 16])[0]
+        if v1 != 1:
+            continue
+        lengths = []
+        for j in range(n_rows):
+            vl = _struct.unpack("<Q", fw_bytes[i + 16 + j * 8 : i + 24 + j * 8])[0]
+            if not (5 <= vl <= 50):
+                break
+            lengths.append(int(vl))
+        if len(lengths) != n_rows:
+            continue
+        data_start = i + 16 + n_rows * 8
+        total_chars = sum(lengths)
+        chars = []
+        valid = True
+        for k in range(total_chars):
+            pos = data_start + k * 2
+            if pos + 2 > len(fw_bytes):
+                valid = False
+                break
+            val = _struct.unpack("<H", fw_bytes[pos : pos + 2])[0]
+            if not (32 <= val < 128):
+                valid = False
+                break
+            chars.append(chr(val))
+        if not valid:
+            continue
+        parsed = []
+        offset = 0
+        ok = True
+        for r in range(n_rows):
+            row_str = "".join(chars[offset : offset + lengths[r]]).strip()
+            parts = row_str.split()
+            if len(parts) == 4:
+                try:
+                    parsed.append([float(p) for p in parts])
+                except Exception:
+                    ok = False
+                    break
+            else:
+                ok = False
+                break
+            offset += lengths[r]
+        if ok and len(parsed) == n_rows:
+            roi_coords = parsed
+            break
+
+    rows = []
+    for idx in range(n_rows):
+        nm = roi_names_cat[name_codes[idx] - 1] if 1 <= name_codes[idx] <= n_cat else ""
+        fm = fmt_options[fmt_codes[idx] - 1] if (fmt_codes and 1 <= fmt_codes[idx] <= n_fmt) else "any"
+        roi = roi_coords[idx] if roi_coords else []
+        rows.append({"name_roi": nm, "roi": roi, "fmt": fm, "max_scale": 1.2})
+    return rows
+
+
+def _fix_mcos_roi_table_v5(rr: dict, raw_bytes: bytes) -> None:
+    """Attempt to decode roi_table from a v5 MAT __function_workspace__ binary.
+
+    Called in _mat_bytes_to_recordresult_json_bytes after scipy loads the file,
+    before _mat_export_to_jsonable runs.  Updates rr['ocr']['roi_table'] and
+    rr['ocr']['roi_table_raw'] in-place when the MatlabOpaque MCOS wrapper is
+    detected and the workspace binary can be decoded.
+    """
+    ocr = rr.get("ocr")
+    if not isinstance(ocr, dict):
+        return
+
+    def _is_mcos_table(tbl) -> bool:
+        if not isinstance(tbl, dict):
+            return False
+        s1 = tbl.get("s1", "")
+        s1_str = s1.decode("ascii", errors="ignore") if isinstance(s1, bytes) else str(s1)
+        return s1_str.upper() == "MCOS"
+
+    if not (_is_mcos_table(ocr.get("roi_table")) or _is_mcos_table(ocr.get("roi_table_raw"))):
+        return
+
+    # Extract roi_catalog from the already-decoded rr dict
+    roi_cat = ocr.get("roi_catalog")
+    if not isinstance(roi_cat, dict):
+        return
+    try:
+        roi_names_cat = list(np.asarray(roi_cat.get("roiNames", [])).ravel().tolist())
+        fmt_options = list(np.asarray(roi_cat.get("fmtOptions", [])).ravel().tolist())
+    except Exception:
+        return
+    if not roi_names_cat or not fmt_options:
+        return
+    # Ensure plain strings (scipy may return bytes)
+    roi_names_cat = [x.decode("utf-8", errors="ignore") if isinstance(x, bytes) else str(x) for x in roi_names_cat]
+    fmt_options = [x.decode("utf-8", errors="ignore") if isinstance(x, bytes) else str(x) for x in fmt_options]
+
+    # Load workspace bytes from the raw MAT bytes
+    try:
+        import scipy.io as _sio, io as _io
+        _raw = _sio.loadmat(
+            _io.BytesIO(raw_bytes),
+            squeeze_me=False,
+            struct_as_record=True,
+            verify_compressed_data_integrity=False,
+        )
+        fw_bytes = bytes(_raw.get("__function_workspace__", np.array([], dtype=np.uint8)).ravel())
+    except Exception:
+        return
+
+    rows = _decode_roi_table_from_v5_workspace(fw_bytes, roi_names_cat, fmt_options)
+    if not rows:
+        return
+    for field in ("roi_table", "roi_table_raw"):
+        tbl = ocr.get(field)
+        if isinstance(tbl, (dict, np.ndarray)):
+            ocr[field] = rows
+    _fill_roi_from_trkCalSlim(ocr)
+
+
+def _fill_roi_from_trkCalSlim(ocr: dict) -> None:
+    """Populate roi=[] entries in roi_table/roi_table_raw from trkCalSlim.roi.
+
+    In old MCOS v5/v7.3 Table files the roi coordinate column is stored in
+    an inaccessible MCOS cell-array format.  The track_minimap ROI is the
+    exception: it is also stored in the plain trkCalSlim.roi field, so we
+    can back-fill it.  Other ROI names (t_s, v_Fzg_mph, …) remain roi=[]
+    because no accessible coordinate data exists for them.
+    """
+    trk = ocr.get("trkCalSlim")
+    if not isinstance(trk, dict):
+        return
+    trk_roi_raw = trk.get("roi")
+    if trk_roi_raw is None:
+        return
+    try:
+        coords = [float(v) for v in np.asarray(trk_roi_raw).ravel().tolist()[:4]]
+    except Exception:
+        return
+    if len(coords) < 4 or any(c < 0 for c in coords):
+        return
+
+    for field in ("roi_table", "roi_table_raw"):
+        rows = ocr.get(field)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("name_roi", "")).lower() == "track_minimap" and not row.get("roi"):
+                row["roi"] = coords
+
+
+def _roi_extractor_rows_to_table(rois: list[dict]) -> list[dict]:
+    """Convert {name/name_roi, x, y, w, h, fmt, max_scale} → {name_roi, roi, fmt, max_scale}."""
+    out = []
+    for r in (rois or []):
+        name = r.get("name_roi") or r.get("name") or "_"
+        out.append({
+            "name_roi": str(name),
+            "roi": [float(r.get("x", 0.0)), float(r.get("y", 0.0)),
+                    float(r.get("w", 0.0)), float(r.get("h", 0.0))],
+            "fmt": r.get("fmt", "any"),
+            "max_scale": float(r.get("max_scale", 1.2)),
+        })
+    return out
+
+
+def _fix_roi_table_in_rr(rr: dict, mat_path: str = "") -> None:
+    """Repair roi_table/roi_table_raw when they decoded as raw MCOS reference numbers.
+
+    Three recovery strategies are tried in order:
+    1. _extract_rois_from_recordresult_hdf5 — works when the roi column is
+       stored as an accessible HDF5 group with named sub-datasets.
+    2. _h5_mcos_table_categorical_columns fallback (HDF5) — recovers name_roi
+       and fmt from the MCOS categorical encoding; roi is set to [].
+    3. MCOS wrapper dict / raw ndarray (v5 MAT) — extracts the row count from
+       the MCOS header and generates placeholder rows with roi=[].
+    """
+    ocr = rr.get("ocr")
+    if not isinstance(ocr, dict):
+        return
+
+    def _malformed(tbl) -> bool:
+        if isinstance(tbl, (np.ndarray, dict)):
+            return True
+        if not isinstance(tbl, list) or not tbl:
+            return True
+        return not isinstance(tbl[0], dict)
+
+    if not _malformed(ocr.get("roi_table")):
+        return
+
+    # Strategy 1: full extraction with coordinates (HDF5)
+    if mat_path:
+        rois = _extract_rois_from_recordresult_hdf5(mat_path)
+        if rois:
+            rows = _roi_extractor_rows_to_table(rois)
+            ocr["roi_table"] = rows
+            if _malformed(ocr.get("roi_table_raw")):
+                ocr["roi_table_raw"] = rows
+            _fill_roi_from_trkCalSlim(ocr)
+            return
+
+        # Strategy 2: MCOS categorical fallback (HDF5 only)
+        try:
+            import h5py as _h5
+            with _h5.File(mat_path, "r") as _f:
+                recovered = _h5_mcos_table_categorical_columns(_f)
+            names = recovered.get("names") or []
+            fmts = recovered.get("fmts") or []
+            if names:
+                rows = [
+                    {
+                        "name_roi": str(names[i]),
+                        "roi": [],
+                        "fmt": str(fmts[i]) if i < len(fmts) else "any",
+                        "max_scale": 1.2,
+                    }
+                    for i in range(len(names))
+                ]
+                ocr["roi_table"] = rows
+                if _malformed(ocr.get("roi_table_raw")):
+                    ocr["roi_table_raw"] = rows
+                _fill_roi_from_trkCalSlim(ocr)
+                return
+        except Exception:
+            pass
+
+    # Strategy 3: MCOS wrapper dict or raw reference array (v5 MAT or pre-normalized)
+    # Extract row count from the MCOS header and generate placeholder rows.
+    def _n_rows_from_mcos(tbl) -> int:
+        try:
+            if isinstance(tbl, dict):
+                s1 = tbl.get("s1", "")
+                s1_str = s1.decode("ascii", errors="ignore") if isinstance(s1, bytes) else str(s1)
+                s2 = tbl.get("s2", "")
+                s2_str = s2.decode("ascii", errors="ignore") if isinstance(s2, bytes) else str(s2)
+                if s1_str.upper() != "MCOS" or s2_str.lower() != "table":
+                    return 0
+                arr = tbl.get("arr")
+                if arr is None:
+                    return 0
+                flat = list(np.asarray(arr).ravel())
+                return int(flat[-1]) if flat else 0
+            if isinstance(tbl, np.ndarray):
+                flat = list(tbl.ravel())
+                return int(flat[-1]) if len(flat) >= 6 else 0
+        except Exception:
+            pass
+        return 0
+
+    for field in ("roi_table", "roi_table_raw"):
+        tbl = ocr.get(field)
+        if not _malformed(tbl):
+            continue
+        n = _n_rows_from_mcos(tbl)
+        if n > 0:
+            rows = [{"name_roi": "", "roi": [], "fmt": "any", "max_scale": 1.2} for _ in range(n)]
+            ocr[field] = rows
+    _fill_roi_from_trkCalSlim(ocr)
+
 
 def _pts_from_mat_value(v) -> list[list[float]]:
     try:
@@ -4014,7 +4352,7 @@ def _render_mat_selection_analysis(df: pd.DataFrame, title_suffix: str = "") -> 
             f'''<div class="mat-analysis-bar-row">
                 <div>{label}</div>
                 <div class="mat-analysis-bar-track"><div class="mat-analysis-bar-fill" style="width:{pct:.1f}%"></div></div>
-                <div>{ok}/{total_n} Â· {pct:.0f}%</div>
+                <div>{ok}/{total_n} · {pct:.0f}%</div>
             </div>'''
         )
     bar_html.append('</div>')
@@ -4125,7 +4463,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
     st.session_state.mat_json_sidecar_used_count = 0
     total = len(st.session_state.mat_update_keys or [])
     st.session_state.mat_json_sidecar_last_run_total = total
-    progress = progress_slot.progress(0, text=f"0/0 aktuell analysiert Â· {total} offen") if (total > 0 and progress_slot is not None) else None
+    progress = progress_slot.progress(0, text=f"0/0 aktuell analysiert · {total} offen") if (total > 0 and progress_slot is not None) else None
     try:
         cache = st.session_state.get("mat_summary_cache")
         if not isinstance(cache, dict):
@@ -4156,7 +4494,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
         if live_table is not None:
             _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
         if progress is not None and total > 0:
-            progress.progress(min(1.0, done / total), text=f"{done}/{max(done + len(pending_idx), 1)} aktuell analysiert Â· {max(0, total-done)} offen")
+            progress.progress(min(1.0, done / total), text=f"{done}/{max(done + len(pending_idx), 1)} aktuell analysiert · {max(0, total-done)} offen")
 
         if pending_idx:
             max_workers = max(2, min(8, (os.cpu_count() or 4)))
@@ -4195,7 +4533,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                     if live_table is not None:
                         _render_disabled_mat_overview_table(live_table, st.session_state.mat_overview_rows)
                     if progress is not None and total > 0:
-                        progress.progress(min(1.0, done / total), text=f"{done}/{max(done + sum(1 for f in fut_to_idx if not f.done()), done, 1)} aktuell analysiert Â· {max(0, total-done)} offen")
+                        progress.progress(min(1.0, done / total), text=f"{done}/{max(done + sum(1 for f in fut_to_idx if not f.done()), done, 1)} aktuell analysiert · {max(0, total-done)} offen")
 
         st.session_state.mat_summary_cache = cache
         st.session_state.mat_update_running = False
@@ -4213,7 +4551,7 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
                     column_config=MAT_OVERVIEW_COLCFG,
                 )
             if progress is not None and total > 0:
-                progress.progress(min(1.0, done / total), text=f"{done}/{max(done,1)} aktuell analysiert Â· {max(0, total-done)} offen")
+                progress.progress(min(1.0, done / total), text=f"{done}/{max(done,1)} aktuell analysiert · {max(0, total-done)} offen")
 
     if progress is not None:
         progress.empty()
@@ -4379,7 +4717,7 @@ def _load_next_roi_setup_file() -> tuple[bool, str]:
         return False, "Cloud ist nicht verbunden."
     nxt = _find_next_roi_setup_target()
     if not nxt:
-        return False, "Keine nÃ¤chste Datei gefunden (Audio+Video vorhanden und ROI fehlt)."
+        return False, "Keine nächste Datei gefunden (Audio+Video vorhanden und ROI fehlt)."
     folder = str(nxt.get("folder") or "")
     if not _try_load_video_for_capture_folder(folder):
         return False, f"Reduzierte Datei konnte nicht geladen werden: {folder}"
@@ -4395,7 +4733,7 @@ def _load_next_roi_setup_file() -> tuple[bool, str]:
     st.session_state.tab_default = "ROI Setup"
     st.session_state.roi_scroll_top_once = False
     st.session_state.roi_saved_once = False
-    set_status(f"NÃ¤chste Datei geladen: {folder}", "ok")
+    set_status(f"Nächste Datei geladen: {folder}", "ok")
     return True, folder
 
 def _load_video_from_r2(remote_key):
@@ -4864,7 +5202,7 @@ def _audio_get_vehicle_title() -> str:
     if video_title and video_title != dataset:
         parts.append(video_title)
     if parts:
-        return " Â· ".join(parts)
+        return " · ".join(parts)
     for k in ("audio_vehicle_title", "video_name", "capture_folder"):
         txt = str(st.session_state.get(k, "") or "").strip()
         if txt:
@@ -5031,7 +5369,7 @@ def _audio_live_widget(job_id: str, height: int = 330):
     endpoint = f"http://127.0.0.1:{port}/audio?id={job_id}"
     html = f"""
     <div id="audio-live-root" style="font-family: JetBrains Mono, monospace; background:#0a0c10; border:1px solid #1e2535; border-radius:8px; padding:10px 12px; color:#e8eaf0;">
-      <div id="audio-live-title" style="font-weight:800; font-size:12px; color:#4a90a4; margin-bottom:8px;">Audioanalyse lÃ¤uft im Hintergrund</div>
+      <div id="audio-live-title" style="font-weight:800; font-size:12px; color:#4a90a4; margin-bottom:8px;">Audioanalyse läuft im Hintergrund</div>
       <div style="height:12px; background:#1e2535; border-radius:999px; overflow:hidden; border:1px solid #243049;">
         <div id="audio-live-bar" style="height:100%; width:0%; background:#3ddc84; border-radius:999px; transition:width .25s linear;"></div>
       </div>
@@ -5067,7 +5405,7 @@ def _audio_live_widget(job_id: str, height: int = 330):
           text.textContent = msg || 'Fehler';
           stopped = true;
         }} else {{
-          title.textContent = 'Audioanalyse lÃ¤uft im Hintergrund';
+          title.textContent = 'Audioanalyse läuft im Hintergrund';
           text.textContent = `Audioanalyse: ${{done}}/${{total}} Jobs (${{pct}}%)${{msg ? ' - ' + msg : ''}}`;
         }}
         const lines = Array.isArray(job.log) ? job.log.slice(-60) : [];
@@ -5124,7 +5462,7 @@ def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_
         params["cyl"], params["takt"], params["order"],
         params["rpm_min"], params["rpm_max"], params["method"],
         params["cyl_mode"], params["harmonic_mode"], params["drive_type"],
-        stft_mode=params.get("stft_mode", "Fest auswÃ¤hlen"),
+        stft_mode=params.get("stft_mode", "Fest auswählen"),
         debug_cb=dbg,
         method_params=params.get("method_params", {}),
         progress_cb=progress_cb,
@@ -5138,7 +5476,7 @@ def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_
     return res
 
 
-def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode="Fest auswÃ¤hlen", debug_cb=None, method_params=None, progress_cb=None):
+def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode="Fest auswählen", debug_cb=None, method_params=None, progress_cb=None):
     def dbg(msg):
         if callable(debug_cb):
             debug_cb(msg)
@@ -5193,7 +5531,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
             freqs, tt, mag = signal.spectrogram(seg, fs=fs, window='hann', nperseg=nfft_eff, noverlap=noverlap, nfft=nfft_eff, detrend=False, scaling='spectrum', mode='magnitude')
             dbg(f"  STFT Matrix: {len(freqs)} Frequenzbins Ã— {len(tt)} Zeitframes in {time.perf_counter()-_stft_t0:.2f}s")
         except Exception as e:
-            dbg(f"STFT Ã¼bersprungen ({nfft_eff}/{ov_eff:g}%): {e}")
+            dbg(f"STFT übersprungen ({nfft_eff}/{ov_eff:g}%): {e}")
             continue
         keep = np.asarray(freqs <= fmax, dtype=bool).copy()
         freqs2 = np.asarray(freqs[keep], dtype=np.float32).copy()
@@ -5259,7 +5597,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                     scores["Hybrid"] = scores.get("STFT Ridge", -1e12)
 
                 best_method_dbg = max(scores.items(), key=lambda kv: kv[1])[0] if scores else "-"
-                dbg(f"  fertig in {time.perf_counter()-_job_t0:.2f}s Â· bester Teilscore: {best_method_dbg} = {scores.get(best_method_dbg, float('nan')):.3f}")
+                dbg(f"  fertig in {time.perf_counter()-_job_t0:.2f}s · bester Teilscore: {best_method_dbg} = {scores.get(best_method_dbg, float('nan')):.3f}")
                 prog(done_jobs, total_jobs, job_txt)
 
                 selected_for_rank = "Hybrid" if str(method) in ("Auto robust", "Hybrid") else str(method)
@@ -5270,7 +5608,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                     all_candidates.append(dict(method=mname, cyl=ci, harmonic=h, conv=conv, engine_factor=eng, f_lo=flo, f_hi=fhi, line=np.asarray(line, dtype=float).copy(), score=float(scores.get(mname, -1e12)), rank_score=float(rank_score if mname == selected_for_rank else scores.get(mname, -1e12)), nfft=nfft_eff, overlap_pct=ov_eff, db=db, freqs=freqs2, t=t_video, all_lines=method_lines))
 
     if not all_candidates:
-        raise ValueError("Keine plausiblen Kandidaten gefunden. RPM/fmax/Zylinder/Harmonische/NFFT prÃ¼fen.")
+        raise ValueError("Keine plausiblen Kandidaten gefunden. RPM/fmax/Zylinder/Harmonische/NFFT prüfen.")
 
     selected_method = "Hybrid" if str(method) in ("Auto robust", "Hybrid") else str(method)
     filtered = [c for c in all_candidates if c.get("method") == selected_method]
@@ -5290,7 +5628,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
     rpm[np.asarray((rpm < rpm_min * .5) | (rpm > rpm_max * 1.5), dtype=bool).copy()] = np.nan
 
     table = [{"Rang": i + 1, "Methode": c['method'], "Zyl": "EV" if c['cyl'] == 0 else c['cyl'], "Harmonik": c['harmonic'], "NFFT": c['nfft'], "Overlap_%": c['overlap_pct'], "Score": round(c['score'], 3), "Band_Hz": f"{c['f_lo']:.1f}-{c['f_hi']:.1f}"} for i, c in enumerate(sorted(all_candidates, key=lambda x: x.get('score', -1e12), reverse=True)[:50])]
-    dbg(f"Auswahl: {best['method']} Â· {'EV' if best['cyl']==0 else 'C'+str(best['cyl'])} Â· H{best['harmonic']} Â· NFFT {best['nfft']} Â· OV {best['overlap_pct']:g}% Â· Score {best['score']:.3f}")
+    dbg(f"Auswahl: {best['method']} · {'EV' if best['cyl']==0 else 'C'+str(best['cyl'])} · H{best['harmonic']} · NFFT {best['nfft']} · OV {best['overlap_pct']:g}% · Score {best['score']:.3f}")
     prog(total_jobs, total_jobs, "Audioanalyse abgeschlossen")
     return dict(fs=int(fs), t=t_video, freqs=freqs, db=db, audio_t=np.arange(a0, a1) / float(fs) - float(offset_s), audio_y=seg, freq_lines=lines, selected_method=selected_method, selected_freq=fsel, rpm=rpm, candidate_table=table, debug_lines=[], params=dict(start_s=start_s, end_s=end_s, audio_offset_s=offset_s, nfft=best['nfft'], nfft_requested=nfft, overlap_pct=best['overlap_pct'], overlap_requested=overlap_pct, stft_mode=stft_mode, fmax=fmax, cyl=best['cyl'], takt=takt, order=order_base, harmonic=best['harmonic'], drive_type=drive_type, f_search_lo=best['f_lo'], f_search_hi=best['f_hi'], conversion_factor=best['conv'], method_params=mp))
 
@@ -5447,7 +5785,7 @@ def _loadmat_audio_save_robust(mat_path: str) -> tuple[dict | None, str]:
                 squeeze_me=True,
                 struct_as_record=False,
                 verify_compressed_data_integrity=False,
-            ), f"Standard-Load fehlgeschlagen, Retry ohne KompressionsintegritÃ¤tsprÃ¼fung genutzt: {first_exc}"
+            ), f"Standard-Load fehlgeschlagen, Retry ohne Kompressionsintegritätsprüfung genutzt: {first_exc}"
         except NotImplementedError:
             raise
         except Exception as second_exc:
@@ -5755,6 +6093,8 @@ def _mat_bytes_to_recordresult_json_bytes(raw_mat_bytes: bytes) -> bytes | None:
         rr, _extra = rr_from_mat_bytes(raw_mat_bytes)
         if not isinstance(rr, dict) or not rr:
             return None
+        _fix_mcos_roi_table_v5(rr, raw_mat_bytes)
+        _fix_roi_table_in_rr(rr)
         payload = {"recordResult": _mat_export_to_jsonable(rr)}
         payload = _normalize_sidecar_json_payload(payload)
         return json.dumps(
@@ -6310,6 +6650,7 @@ _tab_labels = [
     "Cloud Connection & Root",
     "Sync",
     "MAT Selection",
+    "MAT to JSON",
     "YouTube Download",
     "ROI Setup",
     "Audio Auswertung",
@@ -6322,9 +6663,11 @@ with _tabs[1]:
 with _tabs[2]:
     mat_selection_tab.render(globals())
 with _tabs[3]:
-    youtube_tab.render(globals())
+    mat_to_json_tab.render(globals())
 with _tabs[4]:
-    roi_setup_tab.render(globals())
+    youtube_tab.render(globals())
 with _tabs[5]:
+    roi_setup_tab.render(globals())
+with _tabs[6]:
     audio_tab.render(globals())
 

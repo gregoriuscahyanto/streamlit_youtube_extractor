@@ -22,8 +22,9 @@ def _download_one(url: str, out_base: Path, rec_script: Path, force: bool) -> tu
     folder = f"yt_{abs(hash(url)) % 10_000_000:07d}"
     cap = out_base / "captures" / folder
     cap.mkdir(parents=True, exist_ok=True)
-    out_v = cap / "video.avi"
-    out_a = cap / "audio.wav"
+    stem = f"screen_{folder}_audio"
+    out_v = cap / f"{stem}.avi"
+    out_a = cap / f"{stem}.wav"
     if (not force) and out_v.exists() and out_a.exists() and out_v.stat().st_size > 0 and out_a.stat().st_size > 0:
         return True, f"skip existing: {folder}"
 
@@ -35,7 +36,7 @@ def _download_one(url: str, out_base: Path, rec_script: Path, force: bool) -> tu
         "--duration",
         "86400",
         "--out",
-        "capture",
+        stem,
         "--outdir",
         str(cap),
     ]
@@ -49,12 +50,14 @@ def _download_one(url: str, out_base: Path, rec_script: Path, force: bool) -> tu
     src_a = Path(str(meta.get("RESULT_AUDIO") or ""))
     if src_v.exists():
         try:
-            src_v.replace(out_v)
+            if src_v.resolve() != out_v.resolve():
+                src_v.replace(out_v)
         except Exception:
             pass
     if src_a.exists():
         try:
-            src_a.replace(out_a)
+            if src_a.resolve() != out_a.resolve():
+                src_a.replace(out_a)
         except Exception:
             pass
     if not out_v.exists() or not out_a.exists():

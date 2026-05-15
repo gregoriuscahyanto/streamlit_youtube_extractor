@@ -1,4 +1,4 @@
-import argparse, time, threading, queue, subprocess, shutil, platform, sys, os, json
+import argparse, time, threading, queue, subprocess, shutil, platform, sys, os
 import numpy as np
 import pyautogui
 import webbrowser
@@ -89,27 +89,6 @@ def find_stereo_mix_device():
     print("[AUDIO] StereoMix not found.")
     return None
 
-
-def find_default_output_device():
-    try:
-        devs = sd.query_devices()
-        _default_in, default_out = sd.default.device
-        if isinstance(default_out, int) and 0 <= default_out < len(devs):
-            d = devs[default_out]
-            print(f"[AUDIO] Default output device: index={default_out}, name={d.get('name','?')}")
-            return int(default_out)
-    except Exception:
-        pass
-    try:
-        devs = sd.query_devices()
-        for i, d in enumerate(devs):
-            if int(d.get("max_output_channels", 0) or 0) > 0:
-                print(f"[AUDIO] Fallback output device: index={i}, name={d.get('name','?')}")
-                return int(i)
-    except Exception:
-        pass
-    return None
-
 # ===================== NEW: Active window -> Monitor detection (Windows) =====================
 def get_active_window_rect():
     """
@@ -180,14 +159,13 @@ class AudioRecorder:
     #     self._stream = sd.InputStream(samplerate=self.sr, channels=self.ch, dtype=self.dtype, callback=self._cb)
     #     self._stream.start()
 
-    def start(self, device=None, extra_settings=None):
+    def start(self, device=None):
         self._stream = sd.InputStream(
             samplerate=self.sr,
             channels=self.ch,
             dtype=self.dtype,
             callback=self._cb,
-            device=device,
-            extra_settings=extra_settings,
+            device=device
         )
         self._stream.start()
 
@@ -207,39 +185,6 @@ class AudioRecorder:
         with sf.SoundFile(path, mode='w', samplerate=self.sr, channels=self.ch, subtype=AUDIO_FMT) as f:
             while not self._queue.empty():
                 f.write(self._queue.get())
-
-
-def _device_sample_rates(device_index: int) -> list[int]:
-    out = []
-    try:
-        d = sd.query_devices(int(device_index))
-        dsr = int(float(d.get("default_samplerate") or 0))
-        if dsr > 0:
-            out.append(dsr)
-    except Exception:
-        pass
-    for sr in (AUDIO_SR, 48000, 44100):
-        s = int(sr)
-        if s > 0 and s not in out:
-            out.append(s)
-    return out
-
-
-def _try_start_audio(device_index: int, use_loopback: bool) -> tuple[AudioRecorder | None, str]:
-    last_err = ""
-    for sr in _device_sample_rates(int(device_index)):
-        for ch in (2, 1):
-            try:
-                rec = AudioRecorder(sr=int(sr), ch=int(ch), dtype='int16')
-                extra = sd.WasapiSettings(loopback=True) if use_loopback else None
-                rec.start(device=int(device_index), extra_settings=extra)
-                mode = "WASAPI loopback" if use_loopback else "input capture"
-                print(f"[AUDIO] {mode} aktiv: dev={device_index}, sr={sr}, ch={ch}")
-                return rec, ""
-            except Exception as e:
-                last_err = str(e)
-                print(f"[AUDIO] Start fehlgeschlagen: dev={device_index}, sr={sr}, ch={ch}, loopback={use_loopback}: {e}")
-    return None, last_err or "unbekannter audio-startfehler"
 
 # ===================== Video: CFR Grabber + Writer =====================
 class CFRVideoRecorder:
@@ -340,17 +285,9 @@ class CFRVideoRecorder:
         self._writer_thread.join()
 
 # ===================== Browser/YT Steuerung =====================
-def open_youtube_and_prepare(url, new_window=True, move_to_other_display=False):
-    # new=2 opens a new browser window (instead of a tab in current window)
-    webbrowser.open(url, new=(2 if new_window else 1))
+def open_youtube_and_prepare(url):
+    webbrowser.open(url, new=1)
     safe_sleep(5.0)
-
-    if move_to_other_display:
-        try:
-            key(['win', 'shift', 'right'])
-            safe_sleep(0.25)
-        except Exception:
-            pass
 
     key(['ctrl', 'l'])
     pyautogui.typewrite(url)
@@ -386,25 +323,18 @@ def click_active_window_center():
         print("⚠️ Could not click active window center:", e)
         return False
 
-def sync_countdown():
+def sync_start_and_play():
     print("⏱️  Sync in 3…"); safe_sleep(1.0)
     print("⏱️  2…");       safe_sleep(1.0)
     print("⏱️  1…");       safe_sleep(1.0)
+
+    ok = ensure_playing(max_tries=4, motion_timeout=5.0)
+    print(f"[INFO] Playback started: {ok}")
 
 def press_play_toggle():
     # KEIN klicken im Vollbild, das kann Vollbild/Focus kaputt machen
     # Stattdessen nur Tastatur. Space ist oft robuster als 'k'
     key('space')
-    safe_sleep(0.12)
-
-
-def _press_play_toggle_robust(attempt_idx=1):
-    """One toggle per attempt (no immediate double-toggle)."""
-    # Odd attempts: space (globally robust). Even attempts: k (YouTube-native).
-    if int(attempt_idx) % 2 == 0:
-        key('k')
-    else:
-        key('space')
     safe_sleep(0.12)
 
 def ensure_playing(max_tries=3, motion_timeout=4.0):
@@ -414,199 +344,70 @@ def ensure_playing(max_tries=3, motion_timeout=4.0):
     """
     for i in range(1, max_tries + 1):
         print(f"[SYNC] Try {i}/{max_tries}: toggling play…")
-        _press_play_toggle_robust(i)
+        press_play_toggle()
 
         ok = wait_for_playback_motion(timeout=motion_timeout)
-        if not ok:
-            ok = wait_for_playback_motion_fullframe(timeout=max(2.0, motion_timeout))
-            print(f"[SYNC] Motion (fullframe fallback): {ok}")
-        else:
-            print(f"[SYNC] Motion after toggle: {ok}")
+        print(f"[SYNC] Motion after toggle: {ok}")
 
         if ok:
             return True
 
         # Falls Overlay/Spinner/Focus: nochmal klicken bevor nächster Versuch
         # click_active_window_center()
-        safe_sleep(0.25)
+        safe_sleep(0.2)
 
     return False
 
-def _clamp_roi_to_rect(rect, left, top, width, height):
-    rw = int(max(1, rect.get("width", 1)))
-    rh = int(max(1, rect.get("height", 1)))
-    rx = int(rect.get("left", 0))
-    ry = int(rect.get("top", 0))
-    width = int(max(24, min(width, rw)))
-    height = int(max(24, min(height, rh)))
-    left = int(max(rx, min(left, rx + rw - width)))
-    top = int(max(ry, min(top, ry + rh - height)))
-    return {"left": left, "top": top, "width": width, "height": height}
-
-
-def _build_motion_rois(rect):
+def wait_for_playback_motion(timeout=10.0, box_w=240, box_h=140, thresh=3.0, stable_hits=3):
     """
-    Mehrere größere ROIs erhöhen die Robustheit:
-    - center: allgemeine Bewegung im Hauptbild
-    - lower_left: HUD/Tacho-Bereich (häufig dynamisch)
-    - upper_center: Overlays/Timer/Texts (falls Video dort Bewegung zeigt)
-    """
-    rw = int(max(1, rect.get("width", 1)))
-    rh = int(max(1, rect.get("height", 1)))
-    rx = int(rect.get("left", 0))
-    ry = int(rect.get("top", 0))
-
-    center_w = int(max(260, rw * 0.40))
-    center_h = int(max(160, rh * 0.32))
-    center_l = rx + (rw - center_w) // 2
-    center_t = ry + (rh - center_h) // 2
-
-    hud_w = int(max(220, rw * 0.34))
-    hud_h = int(max(130, rh * 0.24))
-    hud_l = rx + int(rw * 0.16) - hud_w // 2
-    hud_t = ry + int(rh * 0.73) - hud_h // 2
-
-    top_w = int(max(220, rw * 0.30))
-    top_h = int(max(100, rh * 0.18))
-    top_l = rx + (rw - top_w) // 2
-    top_t = ry + int(rh * 0.22) - top_h // 2
-
-    return [
-        _clamp_roi_to_rect(rect, center_l, center_t, center_w, center_h),
-        _clamp_roi_to_rect(rect, hud_l, hud_t, hud_w, hud_h),
-        _clamp_roi_to_rect(rect, top_l, top_t, top_w, top_h),
-    ]
-
-
-def wait_for_playback_motion(timeout=10.0, thresh=3.0, stable_hits=3):
-    """
-    Wartet auf echte Wiedergabe-Bewegung mit mehreren ROIs + adaptiver Schwelle.
-    Die Erkennung gilt als stabil, wenn in >=2 ROIs gleichzeitig Bewegung erkannt wird.
+    Wartet bis im Zentrum des aktiven Fensters Bildbewegung erkannt wird.
+    - thresh: mittlere Pixeländerung (0..255) über ROI
+    - stable_hits: wie viele "bewegte" Messungen hintereinander nötig sind
     """
     rect = get_active_window_rect()
     if not rect:
         return False
 
-    rois = _build_motion_rois(rect)
-    sct = mss.mss()
-    prev = [None for _ in rois]
-    noise_floor = [0.0 for _ in rois]
-    warm = [0 for _ in rois]
-    hits = 0
-    t0 = time.perf_counter()
+    # ---- ROI NICHT MEHR IN DER MITTE ----
 
-    while (time.perf_counter() - t0) < timeout:
-        moving_rois = 0
-        for i, roi in enumerate(rois):
-            img = np.array(sct.grab(roi))[:, :, :3]
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            if prev[i] is None:
-                prev[i] = gray
-                continue
-            diff = cv2.absdiff(gray, prev[i])
-            mad = float(np.mean(diff))
-            if warm[i] < 8:
-                warm[i] += 1
-                noise_floor[i] = mad if warm[i] == 1 else ((noise_floor[i] * 0.85) + (mad * 0.15))
-            dyn_thresh = max(float(thresh), (noise_floor[i] * 2.4) + 1.2)
-            if mad >= dyn_thresh:
-                moving_rois += 1
-            prev[i] = gray
+    # 70% der Höhe = unteres Drittel
+    cy = rect["top"] + int(rect["height"] * 0.70)
 
-        if moving_rois >= 2:
-            hits += 1
-            if hits >= stable_hits:
-                return True
-        else:
-            hits = 0
-        safe_sleep(0.10)
+    # 35% der Breite = leicht links von Mitte
+    cx = rect["left"] + int(rect["width"] * 0.35)
 
-    return False
+    left = max(rect["left"], cx - box_w // 2)
+    top  = max(rect["top"],  cy - box_h // 2)
 
+    roi = {
+        "left": left,
+        "top": top,
+        "width": box_w,
+        "height": box_h
+    }
 
-def wait_for_playback_motion_fullframe(timeout=10.0, min_delta=1.8, stable_hits=4):
-    """
-    Fallback detector: compare downscaled full active window over time.
-    This is robust when a small ROI misses motion (HUD hidden/static scenes).
-    """
-    rect = get_active_window_rect()
-    if not rect:
-        return False
-    roi = _clamp_roi_to_rect(
-        rect,
-        int(rect["left"]),
-        int(rect["top"]),
-        int(rect["width"]),
-        int(rect["height"]),
-    )
     sct = mss.mss()
     prev = None
     hits = 0
     t0 = time.perf_counter()
+
     while (time.perf_counter() - t0) < timeout:
-        img = np.array(sct.grab(roi))[:, :, :3]
+        img = np.array(sct.grab(roi))[:, :, :3]  # BGR/RGB egal, wir machen gray
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, (320, 180), interpolation=cv2.INTER_AREA)
+
         if prev is not None:
             diff = cv2.absdiff(gray, prev)
-            # robust against tiny UI flicker: use both mean and p90
             mad = float(np.mean(diff))
-            p90 = float(np.percentile(diff, 90))
-            if mad >= float(min_delta) and p90 >= float(min_delta * 2.5):
+            if mad >= thresh:
                 hits += 1
                 if hits >= stable_hits:
                     return True
             else:
                 hits = 0
         prev = gray
-        safe_sleep(0.09)
+        safe_sleep(0.12)
+
     return False
-
-
-def estimate_motion_start_s(video_path, max_scan_s=8.0, min_delta=1.8, stable_hits=3):
-    """
-    Estimate first real playback motion in recorded video.
-    Returns offset seconds from start (>=0).
-    """
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return 0.0
-    try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        if fps <= 0:
-            fps = 30.0
-        max_frames = int(max(1, min(max_scan_s, 30.0) * fps))
-        prev = None
-        noise = 0.0
-        warm = 0
-        hits = 0
-        for i in range(max_frames):
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                break
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.resize(gray, (320, 180), interpolation=cv2.INTER_AREA)
-            if prev is None:
-                prev = gray
-                continue
-            diff = cv2.absdiff(gray, prev)
-            mad = float(np.mean(diff))
-            if warm < 10:
-                warm += 1
-                noise = mad if warm == 1 else (noise * 0.85 + mad * 0.15)
-            dyn = max(float(min_delta), noise * 2.2 + 1.0)
-            if mad >= dyn:
-                hits += 1
-                if hits >= stable_hits:
-                    # i is current frame index; start at first hit frame
-                    start_idx = max(0, i - stable_hits + 1)
-                    return float(start_idx / fps)
-            else:
-                hits = 0
-            prev = gray
-        return 0.0
-    finally:
-        cap.release()
 
 
 # ===================== Mux mit ffmpeg (optional) =====================
@@ -659,37 +460,14 @@ def get_youtube_title(url):
 
 def get_youtube_duration(url):
     try:
-        html_txt = fetch_html(url)
-        candidates = []
-
-        for s in re.findall(r'"lengthSeconds"\s*:\s*"(\d+)"', html_txt):
-            try:
-                candidates.append(float(int(s)))
-            except Exception:
-                pass
-        for s in re.findall(r'"lengthSeconds"\s*:\s*(\d+)', html_txt):
-            try:
-                candidates.append(float(int(s)))
-            except Exception:
-                pass
-
-        for ms in re.findall(r'"approxDurationMs"\s*:\s*"(\d+)"', html_txt):
-            try:
-                candidates.append(float(int(ms)) / 1000.0)
-            except Exception:
-                pass
-        for ms in re.findall(r'"approxDurationMs"\s*:\s*(\d+)', html_txt):
-            try:
-                candidates.append(float(int(ms)) / 1000.0)
-            except Exception:
-                pass
-
-        plausible = [v for v in candidates if 1.0 <= float(v) <= 43200.0]
-        if plausible:
-            return float(max(plausible))
+        with urllib.request.urlopen(url) as resp:
+            html_txt = resp.read().decode("utf-8")
+        match = re.search(r'"approxDurationMs":"(\d+)"', html_txt)
+        if match:
+            return int(match.group(1)) / 1000.0
     except Exception as e:
         print("⚠️ Could not get duration:", e)
-    return None
+    return 60.0  # fallback
 
 def get_youtube_publish_date(url):
     try:
@@ -813,41 +591,6 @@ def get_youtube_channel_name(url):
     return "(unbekannter Kanal)"
 
 
-def _single_line_text(v):
-    return str(v or "").replace("\r", " ").replace("\n", " ").strip()
-
-
-def emit_result_metadata(url, title, pubDate, desc, chanName):
-    payload = {
-        "title": str(title or ""),
-        "pubDate": str(pubDate or ""),
-        "desc": str(desc or ""),
-        "chanName": str(chanName or ""),
-        "url": str(url or ""),
-    }
-    print(f"RESULT_TITLE: {_single_line_text(payload['title'])}", flush=True)
-    print(f"RESULT_URL: {_single_line_text(payload['url'])}", flush=True)
-    print(f"RESULT_PUBDATE: {_single_line_text(payload['pubDate'])}", flush=True)
-    print(f"RESULT_DESC: {_single_line_text(payload['desc'])}", flush=True)
-    print(f"RESULT_CHANNAME: {_single_line_text(payload['chanName'])}", flush=True)
-    print(f"RESULT_META_JSON: {json.dumps(payload, ensure_ascii=False)}", flush=True)
-
-
-def build_output_paths(outdir: str, base: str) -> tuple[str, str, str]:
-    b = str(base or "capture").strip() or "capture"
-    if b.endswith("_audio"):
-        # Keep requested final names exactly:
-        #   <base>.avi and <base>.wav, while using a dedicated temp video file.
-        video_tmp = os.path.join(outdir, f"{b}_video_tmp.avi")
-        audio_wav = os.path.join(outdir, f"{b}.wav")
-        out_mux = os.path.join(outdir, f"{b}.avi")
-        return video_tmp, audio_wav, out_mux
-    video_tmp = os.path.join(outdir, f"{b}_video.avi")
-    audio_wav = os.path.join(outdir, f"{b}_audio.wav")
-    out_mux = os.path.join(outdir, f"{b}.avi")
-    return video_tmp, audio_wav, out_mux
-
-
 # ===================== Main =====================
 def main():
     parser = argparse.ArgumentParser()
@@ -860,9 +603,6 @@ def main():
     parser.add_argument("--outdir", default=".", help="Ausgabe-Ordner")
     parser.add_argument("--audio-device", type=int, default=None, help="sounddevice device index (Output-Device für Loopback)")
     parser.add_argument("--no-loopback", action="store_true", help="deaktiviert WASAPI loopback")
-    parser.add_argument("--new-window", action="store_true", help="Open YouTube in a new browser window")
-    parser.add_argument("--other-display", action="store_true", help="Move browser window to next display (Win+Shift+Right)")
-    parser.add_argument("--metadata-only", action="store_true", help="Only fetch and print metadata from URL")
 
     args = parser.parse_args()
 
@@ -871,19 +611,18 @@ def main():
     base = args.out
     fps = args.fps
 
-    title = get_youtube_title(url)
-    desc = get_youtube_description(url)
-    pubDate = get_youtube_publish_date(url)
-    chanName = get_youtube_channel_name(url)
-    emit_result_metadata(url, title, pubDate, desc, chanName)
+    desc = get_youtube_description(url);
+    pubDate = get_youtube_publish_date(url);
+    chanName = get_youtube_channel_name(url);
 
-    if bool(args.metadata_only):
-        return
+    print(f"RESULT_DESC: {desc}", flush=True)
+    print(f"RESULT_PUBDATE: {pubDate}", flush=True)
+    print(f"RESULT_CHANNAME: {chanName}", flush=True)
 
     # Videolänge bestimmen (falls möglich)
     vid_len = get_youtube_duration(url)
 
-    if vid_len is not None and vid_len > 0:
+    if vid_len is not None:
         # Effektive Aufnahmedauer = min(Mindestdauer, echte Videolänge)
         record_duration = min(record_duration, vid_len)
         print(f"[INFO] Video-Länge erkannt: {vid_len:.2f} s  |  Aufnahme: {record_duration:.2f} s (min)")
@@ -907,15 +646,13 @@ def main():
 
     base = args.out  # bleibt nur der Basisname, ohne Pfad
 
-    video_tmp, audio_wav, out_mux = build_output_paths(outdir, base)
+    video_tmp = os.path.join(outdir, f"{base}_video.avi")
+    audio_wav = os.path.join(outdir, f"{base}_audio.wav")
+    out_mux   = os.path.join(outdir, f"{base}.avi")
 
     # 1) YT öffnen & vorbereiten
     print("🌐 Öffne YouTube und bereite Vollbild/0:00 vor…")
-    open_youtube_and_prepare(
-        url,
-        new_window=bool(args.new_window),
-        move_to_other_display=bool(args.other_display),
-    )
+    open_youtube_and_prepare(url)
 
     # NEW: log which window is active right now (should be browser)
     wr = get_active_window_rect()
@@ -923,53 +660,23 @@ def main():
 
     # 2) Recorder initialisieren
     print("🎤 Initialisiere Audio…")
-    audio = None
+    audio = AudioRecorder(sr=AUDIO_SR, ch=AUDIO_CH, dtype='int16')
+
     device_index = args.audio_device
-    audio_errors = []
-
-    # Preferred path on Windows: WASAPI loopback from output device (real speaker output).
-    if (not args.no_loopback) and platform.system().lower() == "windows":
-        out_dev = device_index if device_index is not None else find_default_output_device()
-        if out_dev is not None:
-            audio, err = _try_start_audio(int(out_dev), use_loopback=True)
-            if audio is None:
-                audio_errors.append(f"WASAPI dev {out_dev}: {err}")
-
-    # Fallback: classic Stereo Mix input device.
-    if audio is None:
-        sm_dev = find_stereo_mix_device() if device_index is None else device_index
-        if sm_dev is not None:
-            audio, err = _try_start_audio(int(sm_dev), use_loopback=False)
-            if audio is None:
-                audio_errors.append(f"StereoMix dev {sm_dev}: {err}")
-
-    if audio is None:
-        raise RuntimeError(
-            "Kein echtes Audio-Capture verfuegbar. Details: " + "; ".join([e for e in audio_errors if e])
-        )
+    if device_index is None:
+        device_index = find_stereo_mix_device()
+    if device_index is None:
+        raise RuntimeError("No StereoMix device found. Please enable it in Windows.")
+    audio.start(device=device_index)
 
     print(f"🎥 Initialisiere Video @ {fps:.2f} fps…")
     video = CFRVideoRecorder(filename=video_tmp, fps=fps, region=region)
     video.start()
 
     # 3) Sync & Start
-    sync_countdown()
-    # Always reset to beginning right before arming capture to avoid start offset.
-    key('0')
-    safe_sleep(0.12)
-    # Arm audio first, then start video capture immediately.
+    sync_start_and_play()
+    # HIER: Start-Events setzen (Audio & Video praktisch gleichzeitig)
     audio.trigger()
-
-    # Start playback asynchronously so capture begins at t=0 even if YouTube needs
-    # a short moment for focus/overlay handling.
-    def _start_playback_worker():
-        safe_sleep(0.12)
-        # Avoid accidental re-toggle pauses: start once, then wait longer for motion.
-        ok = ensure_playing(max_tries=1, motion_timeout=8.0)
-        print(f"[INFO] Playback started: {ok}")
-
-    play_thread = threading.Thread(target=_start_playback_worker, daemon=True)
-    play_thread.start()
     video.trigger(record_duration)
 
     # 4) Stop & Dateien schreiben
@@ -977,10 +684,6 @@ def main():
     video.stop()
     audio.stop()
     audio.dump_to_wav(audio_wav)
-    audio_size = os.path.getsize(audio_wav) if os.path.exists(audio_wav) else 0
-    print(f"[AUDIO] frames={audio.frames}, file_bytes={audio_size}, sr={audio.sr}, ch={audio.ch}")
-    if audio.frames <= 0 or audio_size <= 128:
-        raise RuntimeError("Audioaufnahme leer oder ungueltig (keine Samples erfasst).")
     print(f"📦 Video: {video_tmp}  |  Audio: {audio_wav}")
     print(f"📊 Captured {video.nframes} Frames @ target {fps:.2f} fps (CFR)")
 
@@ -994,11 +697,16 @@ def main():
     print(f"📦 Video: {video_tmp}  |  Audio: {audio_wav}")
     print(f"📊 Captured {video.nframes} Frames @ target {fps:.2f} fps (CFR)")
 
+    title = get_youtube_title(url)
     final_video_path = out_mux if has_ffmpeg() else video_tmp
 
     print(f"RESULT_VIDEO: {os.path.abspath(final_video_path)}", flush=True)
     print(f"RESULT_AUDIO: {os.path.abspath(audio_wav)}", flush=True)
-    emit_result_metadata(url, title, pubDate, desc, chanName)
+    print(f"RESULT_TITLE: {title}", flush=True)
+    print(f"RESULT_URL: {url}", flush=True)
+    print(f"RESULT_DESC: {desc}", flush=True)
+    print(f"RESULT_PUBDATE: {pubDate}", flush=True)
+    print(f"RESULT_CHANNAME: {chanName}", flush=True)
 
     # 6) Vollbild verlassen
     key('f')

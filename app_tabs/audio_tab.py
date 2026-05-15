@@ -8,7 +8,7 @@ def render(ns):
     globals().update(ns)
     _legacy_status_token = "Start bestätigt: Audioanalyse läuft im Hintergrund"
     st.divider()
-    st.subheader("Audio Auswertung Â· robuste RPM-Extraktion")
+    st.subheader("Audio Auswertung · robuste RPM-Extraktion")
     title_txt = _audio_get_vehicle_title()
     if title_txt:
         st.info(f"Datensatz / Fahrzeug aus Metadata: {title_txt}")
@@ -33,7 +33,7 @@ def render(ns):
 
     with st.expander("Signal / STFT", expanded=True):
         c0 = st.columns(4)
-        aud_stft_mode = c0[0].selectbox("NFFT/Overlap", ["Fest auswÃ¤hlen", "Auto Schnell", "Auto Breit"], key="aud_stft_mode_new")
+        aud_stft_mode = c0[0].selectbox("NFFT/Overlap", ["Fest auswählen", "Auto Schnell", "Auto Breit"], key="aud_stft_mode_new")
         stft_auto = str(aud_stft_mode).startswith("Auto")
         aud_nfft = int(c0[1].number_input("NFFT", 64, 65536, 4096, step=64, key="aud_nfft_new", disabled=stft_auto))
         aud_ov = float(c0[2].number_input("Overlap [%]", 0.0, 98.0, 75.0, step=1.0, key="aud_ov_new", disabled=stft_auto))
@@ -45,14 +45,14 @@ def render(ns):
     with st.expander("Methoden-Parameter", expanded=False):
         st.caption("Diese Parameter wirken nur auf die passenden Methoden; Hybrid nutzt sie beim Fusionieren der Teilmethoden.")
         m0 = st.columns(4)
-        ridge_smooth = int(m0[0].number_input("Ridge GlÃ¤ttung", 3, 51, 7, step=2, key="aud_ridge_smooth"))
+        ridge_smooth = int(m0[0].number_input("Ridge Glättung", 3, 51, 7, step=2, key="aud_ridge_smooth"))
         ridge_jump_frac = float(m0[1].number_input("Ridge max Sprung [% Band]", 1.0, 50.0, 8.0, step=1.0, key="aud_ridge_jump_pct")) / 100.0
         viterbi_jump_hz = float(m0[2].number_input("Viterbi max Sprung [Hz/Frame]", 1.0, 300.0, 25.0, step=1.0, key="aud_viterbi_jump_hz"))
         viterbi_penalty = float(m0[3].number_input("Viterbi Sprung-Strafe", 0.0, 10.0, 1.2, step=0.1, key="aud_viterbi_penalty"))
         m1 = st.columns(4)
-        viterbi_smooth = int(m1[0].number_input("Viterbi GlÃ¤ttung", 3, 51, 5, step=2, key="aud_viterbi_smooth"))
+        viterbi_smooth = int(m1[0].number_input("Viterbi Glättung", 3, 51, 5, step=2, key="aud_viterbi_smooth"))
         comb_harmonics = int(m1[1].number_input("Comb/HPS Anzahl Harmonische", 1, 10, 4, step=1, key="aud_comb_harmonics"))
-        hybrid_smooth = int(m1[2].number_input("Hybrid GlÃ¤ttung", 3, 51, 9, step=2, key="aud_hybrid_smooth"))
+        hybrid_smooth = int(m1[2].number_input("Hybrid Glättung", 3, 51, 9, step=2, key="aud_hybrid_smooth"))
         always_run_cwt = bool(m1[3].checkbox("CWT auch in Kandidatenliste berechnen", value=False, key="aud_run_cwt_all"))
         fast_mode = bool(st.checkbox("Schnellmodus: teure Methoden nur bei expliziter Auswahl berechnen", value=True, key="aud_fast_mode"))
         method_params = dict(ridge_smooth=ridge_smooth, ridge_jump_frac=ridge_jump_frac, viterbi_jump_hz=viterbi_jump_hz, viterbi_penalty=viterbi_penalty, viterbi_smooth=viterbi_smooth, comb_harmonics=comb_harmonics, hybrid_smooth=hybrid_smooth, always_run_cwt=always_run_cwt, fast_mode=fast_mode)
@@ -60,8 +60,8 @@ def render(ns):
     with st.expander("Motor / Kandidaten", expanded=True):
         c0 = st.columns(3)
         drive_type = c0[0].selectbox("Antrieb", ["Verbrenner/Hybrid", "Hybrid elektrisch dominant", "Elektro"], key="aud_drive_type")
-        cyl_mode = c0[1].selectbox("Zylinder", ["Auto variieren", "Fest auswÃ¤hlen"], key="aud_cyl_mode")
-        harm_mode = c0[2].selectbox("Harmonische/Ordnung", ["Auto variieren", "Fest auswÃ¤hlen"], key="aud_harm_mode")
+        cyl_mode = c0[1].selectbox("Zylinder", ["Auto variieren", "Fest auswählen"], key="aud_cyl_mode")
+        harm_mode = c0[2].selectbox("Harmonische/Ordnung", ["Auto variieren", "Fest auswählen"], key="aud_harm_mode")
         cyl_disabled = str(cyl_mode).startswith("Auto") or ("elekt" in str(drive_type).lower())
         harm_disabled = str(harm_mode).startswith("Auto")
         c1 = st.columns(5)
@@ -79,8 +79,8 @@ def render(ns):
         r_dyn = float(c[2].number_input("r dyn [m]", 0.05, 2.0, 0.35, step=0.01, key="aud_rdyn_new"))
         tol_pct = float(c[3].number_input("Toleranz [%]", 0.0, 100.0, 6.0, step=0.5, key="aud_tol_new"))
         c2 = st.columns(3)
-        axle_ratio = float(c2[0].number_input("AchsÃ¼bersetzung i", 0.1, 20.0, 3.15, step=0.01, key="aud_axle_ratio"))
-        gear_text = c2[1].text_input("GÃ¤nge i (Komma-getrennt)", value="5.25, 3.36, 2.17, 1.72, 1.32, 1.00, 0.82, 0.64", key="aud_gears_text")
+        axle_ratio = float(c2[0].number_input("Achsübersetzung i", 0.1, 20.0, 3.15, step=0.01, key="aud_axle_ratio"))
+        gear_text = c2[1].text_input("Gänge i (Komma-getrennt)", value="5.25, 3.36, 2.17, 1.72, 1.32, 1.00, 0.82, 0.64", key="aud_gears_text")
         prefer_low = bool(c2[2].checkbox("niedrigster Gang bevorzugt", value=False, key="aud_prefer_low"))
         try:
             gear_ratios = [float(x.strip()) for x in str(gear_text).replace(";", ",").split(",") if x.strip()]
@@ -206,7 +206,7 @@ def render(ns):
         with st.expander("Live-Debug Audioanalyse", expanded=expanded):
             st.caption("Quelle, Segment, STFT-Kandidaten, Job-Fortschritt, Laufzeit und finale Auswahl. Dieser Log bleibt sichtbar, auch wenn das HTML-Live-Widget nicht pollt.")
             if fut_live is not None:
-                st.info("Audioanalyse wurde gestartet und lÃ¤uft im Hintergrund.")
+                st.info("Audioanalyse wurde gestartet und läuft im Hintergrund.")
 
             if isinstance(prog_state, dict) and prog_state:
                 done = int(prog_state.get("done", 0) or 0)
@@ -261,7 +261,7 @@ def render(ns):
                 st.session_state.audio_bg_progress_ref = None
                 _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.get("audio_bg_progress") or {}, status="done")
                 set_status("Audioanalyse abgeschlossen.", "ok")
-                # Ergebnis wird unten angezeigt; keine zusÃ¤tzliche permanente Meldung.
+                # Ergebnis wird unten angezeigt; keine zusätzliche permanente Meldung.
             except Exception as e:
                 st.session_state.audio_analysis_result = None
                 live_err = st.session_state.get("audio_bg_log_ref")
@@ -283,7 +283,7 @@ def render(ns):
             if isinstance(live_prog_run, dict) and live_prog_run:
                 st.session_state.audio_bg_progress = dict(live_prog_run)
             elapsed = time.perf_counter() - float(st.session_state.get("audio_bg_started", time.perf_counter()) or time.perf_counter())
-            st.caption(f"Audioanalyse lÃ¤uft seit {elapsed:.1f}s. Live-Status ist im Expander sichtbar.")
+            st.caption(f"Audioanalyse läuft seit {elapsed:.1f}s. Live-Status ist im Expander sichtbar.")
 
     running_bg = st.session_state.get("audio_bg_future") is not None
     audio_started_this_run = False
@@ -335,7 +335,7 @@ def render(ns):
             st.session_state.audio_bg_future = _audio_executor().submit(_audio_background_worker, y, fs, source, params_bg, ui_bg, live_log, live_progress, live_job_id)
             audio_started_this_run = True
             set_status("Audioanalyse im Hintergrund gestartet.", "info")
-            st.success("Start bestÃ¤tigt: Audioanalyse lÃ¤uft im Hintergrund. Live-Debug und Progressbar erscheinen direkt darunter.")
+            st.success("Start bestätigt: Audioanalyse läuft im Hintergrund. Live-Debug und Progressbar erscheinen direkt darunter.")
             st.toast("Audioanalyse gestartet. Live-Debug aktiv.")
 
     # Wichtig: erst nach dem Start-Button rendern. So gibt es genau einen
@@ -361,7 +361,7 @@ def render(ns):
     if isinstance(res,dict) and res.get("t") is not None:
         p=res.get('params',{})
         zyl_txt = "EV" if p.get('cyl') == 0 else p.get('cyl')
-        st.caption(f"Quelle: {res.get('source','')} Â· Methode: {res.get('selected_method','')} Â· Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} Â· Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz Â· NFFT: {p.get('nfft')} Â· Overlap: {p.get('overlap_pct')}%")
+        st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} · Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz · NFFT: {p.get('nfft')} · Overlap: {p.get('overlap_pct')}%")
         if res.get('candidate_table'):
             with st.expander("Kandidatenbewertung", expanded=False):
                 st.dataframe(pd.DataFrame(res['candidate_table']), width="stretch", hide_index=True)
@@ -374,7 +374,7 @@ def render(ns):
             for nm in show:
                 a=np.asarray(res.get('freq_lines',{}).get(nm,[]),dtype=float)
                 if a.size==t.size: fig.add_trace(go.Scatter(x=t,y=a,mode="lines",name=nm,line=dict(width=2)))
-            fig.update_layout(title="Spektrogramm f [Hz] Ã¼ber t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
+            fig.update_layout(title="Spektrogramm f [Hz] über t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
             st.plotly_chart(fig, width="stretch")
             fig2=go.Figure(); fig2.add_trace(go.Scatter(x=t,y=np.asarray(res['rpm'],dtype=float),mode="lines",name="RPM")); fig2.update_layout(title="RPM", xaxis_title="t [s]", yaxis_title="1/min", height=330, template="plotly_dark"); st.plotly_chart(fig2,width="stretch")
         except Exception as e:
@@ -525,9 +525,9 @@ def render(ns):
                     st.success(f"{tol_ratio:.1f}% sind im zulaessigen Bereich.")
                     st.caption(f"Toleranz-Logik: {vr.get('tolerance_logic', 'AUS')}")
                     st.caption(
-                        f"Summe |Fehler|={vr.get('sum_abs_err', 0.0):.1f} RPMÂ·n  Â·  "
-                        f"Median={vr.get('median_abs', 0.0):.1f} RPM  Â·  "
-                        f"n={vr.get('n', 0)}  Â·  Modus={vr.get('mode', '')}"
+                        f"Summe |Fehler|={vr.get('sum_abs_err', 0.0):.1f} RPM·n  ·  "
+                        f"Median={vr.get('median_abs', 0.0):.1f} RPM  ·  "
+                        f"n={vr.get('n', 0)}  ·  Modus={vr.get('mode', '')}"
                     )
                     # Validation plot: both curves + error panel
                     from core.audio_validation import build_validation_figure
