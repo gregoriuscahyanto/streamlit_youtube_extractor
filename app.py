@@ -1,4 +1,4 @@
-"""
+﻿"""
 OCR Extractor - Streamlit App v4
 Tab 1: Cloudflare R2-Verbindung, Prefix waehlen, Datei-Browser
 Tab 2: Video laden, Start/Ende, ROI-Auswahl
