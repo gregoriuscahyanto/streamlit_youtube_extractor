@@ -515,6 +515,7 @@ def render(ns):
             _ocr_probe_indices = _roi_ocr_probe_indices()
             _can_ocr_probe = frame is not None and bool(_ocr_probe_indices)
             _all_ocr_probe_ok = _roi_ocr_all_ok()
+            _ocr_full_busy = bool(st.session_state.get("roi_ocr_full_running", False))
             if _all_ocr_probe_ok:
                 st.markdown('<style>.st-key-roi_ocr_probe_btn button{background:#3ddc84!important;border-color:#3ddc84!important;color:#07100b!important;box-shadow:0 0 14px rgba(61,220,132,.22)!important;}</style>', unsafe_allow_html=True)
 
@@ -587,6 +588,8 @@ def render(ns):
                 set_status(_msg_probe, "ok" if _ok_probe else "warn")
                 st.rerun()
 
+            st.caption("Vollständige Video-OCR wurde in den separaten Tab `Video OCR Full` verschoben.")
+
             if st.button("Ausgew\u00e4hlte ROI l\u00f6schen", width="stretch",
                          key="roi_del_btn", disabled=act_sel is None):
                 if isinstance(act_sel, int) and 0 <= act_sel < len(st.session_state.rois):
@@ -620,10 +623,11 @@ def render(ns):
 
         st.divider()
         st.subheader("3 · Speicherung")
-        st.caption("Speichert ROI-, Zeit- und Track-Konfiguration als JSON + MAT. Downloads sind nur optional nach dem Speichern.")
+        st.caption("Speichert ROI-, Zeit- und Track-Konfiguration als JSON (JSON-only). Download ist optional nach dem Speichern.")
         _has_any_roi = len(st.session_state.get("rois") or []) > 0
         _save_busy = bool(st.session_state.get("roi_save_running", False))
         _ocr_probe_busy = bool(st.session_state.get("roi_ocr_probe_running", False))
+        _ocr_full_busy = bool(st.session_state.get("roi_ocr_full_running", False))
         _ocr_ready_to_save = _roi_ocr_all_ok()
 
         if bool(st.session_state.get("roi_next_load_running", False)):
@@ -640,7 +644,7 @@ def render(ns):
             _save_busy = False
 
         if st.button("Speichern", type="primary", width="stretch", key="roi_save_json_mat_btn",
-                     disabled=(_save_busy or _ocr_probe_busy or not _has_any_roi or not _ocr_ready_to_save),
+                     disabled=(_save_busy or _ocr_probe_busy or _ocr_full_busy or not _has_any_roi or not _ocr_ready_to_save),
                      help="Erst aktiv, wenn der OCR-Test ROI grün ist."):
             st.session_state.tab_default = "ROI Setup"
             st.session_state.roi_save_running = True
@@ -659,7 +663,7 @@ def render(ns):
 
         _stamp_col1, _stamp_col2 = st.columns(2)
         if _stamp_col1.button("Kein ROI vorhanden", width="stretch", key="roi_mark_no_roi_btn",
-                              disabled=(_save_busy or _ocr_probe_busy),
+                              disabled=(_save_busy or _ocr_probe_busy or _ocr_full_busy),
                               help="Stempelt die Datei als nicht OCR/ROI-verwertbar."):
             st.session_state.tab_default = "ROI Setup"
             st.session_state.roi_save_running = True
@@ -677,7 +681,7 @@ def render(ns):
                 _save_busy = False
 
         if _stamp_col2.button("Video fehlerhaft", width="stretch", key="roi_mark_video_faulty_btn",
-                              disabled=(_save_busy or _ocr_probe_busy),
+                              disabled=(_save_busy or _ocr_probe_busy or _ocr_full_busy),
                               help="Video muss neu heruntergeladen werden. Wird in MAT Selection als 'Video fehlerhaft' markiert."):
             st.session_state.tab_default = "ROI Setup"
             st.session_state.roi_save_running = True
@@ -694,7 +698,7 @@ def render(ns):
                 st.session_state.roi_save_running = False
                 _save_busy = False
 
-        _next_disabled = _ocr_probe_busy or bool(st.session_state.get("roi_next_load_running", False)) or (not bool(st.session_state.get("roi_saved_once", False)))
+        _next_disabled = _ocr_probe_busy or _ocr_full_busy or bool(st.session_state.get("roi_next_load_running", False)) or (not bool(st.session_state.get("roi_saved_once", False)))
         if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn",
                      disabled=_next_disabled):
             st.session_state.roi_next_load_running = True
@@ -704,12 +708,11 @@ def render(ns):
         _last_save = st.session_state.get("_last_save_payload") or {}
         if _last_save:
             targets = " · ".join(str(x) for x in (_last_save.get("targets") or []))
-            st.markdown(f'<div class="save-status-card">Zuletzt gespeichert: <b>{_last_save.get("json_name","results.json")}</b> + <b>{_last_save.get("mat_name","results.mat")}</b><br>{targets}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="save-status-card">Zuletzt gespeichert: <b>{_last_save.get("json_name","results.json")}</b><br>{targets}</div>', unsafe_allow_html=True)
             with st.expander("Optionale Downloads anzeigen", expanded=False):
-                st.caption("Die Dateien wurden bereits gespeichert. Diese Buttons sind nur für eine lokale Kopie.")
-                _dl_json_col, _dl_mat_col = st.columns(2)
+                st.caption("Die Datei wurde bereits gespeichert. Dieser Button ist nur für eine lokale Kopie.")
+                _dl_json_col = st.columns(1)[0]
                 _dl_json_col.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch", key="json_download")
-                _dl_mat_col.download_button("MAT herunterladen", _last_save.get("mat_bytes", b""), _last_save.get("mat_name", "results.mat"), "application/octet-stream", width="stretch", key="mat_download")
 
 
 

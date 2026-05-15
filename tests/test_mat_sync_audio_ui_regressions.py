@@ -16,6 +16,7 @@ def _load_mat_summary_namespace():
     tree = ast.parse(source)
     needed = {
         "_compute_mat_summary_remote",
+        "_summary_from_json_sidecar",
         "_summarize_record_result_mat",
         "_summarize_record_result_hdf5",
         "_mat_scalar",
@@ -31,11 +32,13 @@ def _load_mat_summary_namespace():
         "_mat_roi_table_has_track",
         "_parse_roi_value",
         "_mat_capture_guess_from_key",
+        "_r2_json_sidecar_key",
     }
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in needed]
     namespace = {
         "np": np,
         "sio": sio,
+        "json": json,
         "Path": Path,
         "tempfile": tempfile,
         "summarize_mat_file": lambda _path: {"roi_selected": True, "track_selected": True},
@@ -96,33 +99,37 @@ def _load_audio_title_namespace():
     return namespace
 
 
-def _write_no_roi_mat(path: Path):
-    roi_dtype = [
-        ("name_roi", object),
-        ("roi", object),
-        ("fmt", object),
-        ("max_scale", object),
-    ]
-    empty_roi_table = np.empty((0, 1), dtype=roi_dtype)
-    sio.savemat(
-        str(path),
-        {
-            "recordResult": {
-                "metadata": {
-                    "title": "Unit Test Video Title",
-                    "no_roi_available": np.array([[1]], dtype=np.uint8),
-                    "roi_status": "kein_roi_vorhanden",
-                },
-                "ocr": {
-                    "params": {"start_s": 0.0, "end_s": 10.0},
-                    "roi_table": empty_roi_table,
-                    "no_roi_available": True,
-                    "roi_status": "kein_roi_vorhanden",
-                },
-            }
-        },
-        do_compression=True,
-    )
+def _write_no_roi_json(path: Path):
+    doc = {
+        "recordResult": {
+            "metadata": {
+                "title": "Unit Test Video Title",
+                "no_roi_available": True,
+                "roi_status": "kein_roi_vorhanden",
+            },
+            "ocr": {
+                "params": {"start_s": 0.0, "end_s": 10.0},
+                "roi_table": [],
+                "no_roi_available": True,
+                "roi_status": "kein_roi_vorhanden",
+            },
+        }
+    }
+    path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class _JsonClient:
+    def __init__(self, json_path: Path):
+        self.json_path = json_path
+
+    def download_file(self, remote_key, target):
+        if str(remote_key).lower().endswith(".json"):
+            shutil.copyfile(self.json_path, target)
+            return True, ""
+        return False, "mat read disabled in json-only test"
+    
+    def list_files(self, _prefix):
+        return False, []
 
 
 class _MatClient:
@@ -158,19 +165,19 @@ def test_no_roi_stamp_overrides_backend_roi_summary_and_keeps_title():
     repo = Path(__file__).resolve().parents[1]
     tmp_dir = repo / "logs" / "mat_sync_audio_ui_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    mat_path = tmp_dir / "results_capture.mat"
-    download_path = tmp_dir / "downloaded_capture.mat"
-    for path in (mat_path, download_path):
+    json_path = tmp_dir / "results_capture.json"
+    download_path = tmp_dir / "downloaded_capture.json"
+    for path in (json_path, download_path):
         try:
             path.unlink(missing_ok=True)
         except Exception:
             pass
     ns["tempfile"] = _TempfileStub(download_path)
-    _write_no_roi_mat(mat_path)
+    _write_no_roi_json(json_path)
 
     summary = ns["_compute_mat_summary_remote"](
         "results/results_capture.mat",
-        _MatClient(mat_path),
+        _JsonClient(json_path),
         "",
     )
 

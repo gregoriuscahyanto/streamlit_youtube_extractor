@@ -75,6 +75,238 @@ def render(ns):
                 pass
         return False, b"", "recordResult nicht lesbar"
 
+    def _json_recordresult_ocr_lengths(json_bytes: bytes) -> dict:
+        try:
+            d = json.loads((json_bytes or b"").decode("utf-8", errors="ignore"))
+            o = ((d.get("recordResult") or {}).get("ocr") or {}) if isinstance(d, dict) else {}
+            def _row_count(v):
+                if isinstance(v, list):
+                    return len(v)
+                if isinstance(v, dict):
+                    lens = [len(x) for x in v.values() if isinstance(x, list)]
+                    return max(lens) if lens else -1
+                return -1
+            out = {}
+            for k in ("roi_table", "table", "cleaned"):
+                v = o.get(k)
+                out[k] = _row_count(v)
+            return out
+        except Exception:
+            return {"roi_table": -1, "table": -1, "cleaned": -1}
+
+    def _json_recordresult_ocr_lengths_from_path(json_path: Path) -> dict:
+        try:
+            return _json_recordresult_ocr_lengths(json_path.read_bytes())
+        except Exception:
+            return {"roi_table": -1, "table": -1, "cleaned": -1}
+
+    def _json_has_row_table_lists(json_path: Path) -> bool:
+        def _walk(v) -> bool:
+            if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                return True
+            if isinstance(v, dict):
+                for vv in v.values():
+                    if _walk(vv):
+                        return True
+            if isinstance(v, list):
+                for vv in v:
+                    if _walk(vv):
+                        return True
+            return False
+
+        try:
+            obj = json.loads(json_path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return False
+        if not isinstance(obj, dict):
+            return False
+        return _walk(obj.get("recordResult"))
+
+    def _has_mcos_table_in_mat(raw: bytes) -> bool:
+        try:
+            data = sio.loadmat(io.BytesIO(raw), squeeze_me=True, struct_as_record=False, verify_compressed_data_integrity=False)
+            rr = data.get("recordResult")
+            if rr is None:
+                return False
+            ocr = rr.get("ocr") if isinstance(rr, dict) else getattr(rr, "ocr", None)
+            if ocr is None:
+                return False
+            for field in ("roi_table", "table", "cleaned"):
+                v = ocr.get(field) if isinstance(ocr, dict) else getattr(ocr, field, None)
+                if v is None:
+                    continue
+                if type(v).__name__ == "MatlabOpaque":
+                    return True
+                try:
+                    arr = np.asarray(v)
+                    if getattr(arr, "dtype", None) is not None and arr.dtype.names and {"s1", "s2", "arr"}.issubset(set(arr.dtype.names)):
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            return False
+        return False
+
+    def _matlab_convert_recordresult_json(raw: bytes) -> tuple[bool, bytes, str]:
+        matlab_exe = shutil.which("matlab")
+        if not matlab_exe:
+            return False, b"", "matlab.exe nicht gefunden"
+
+        mat_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
+        mat_tmp.close()
+        out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        out_tmp.close()
+        m_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".m")
+        m_tmp.close()
+
+        def _q(s: str) -> str:
+            return str(s).replace("\\", "/").replace("'", "''")
+
+        script = f"""
+inPath = '{_q(mat_tmp.name)}';
+outPath = '{_q(out_tmp.name)}';
+s = load(inPath);
+if ~isfield(s, 'recordResult')
+    error('recordResultMissing');
+end
+payload = struct();
+payload.recordResult = local_norm(s.recordResult);
+txt = jsonencode(payload, PrettyPrint=true);
+fid = fopen(outPath, 'w', 'n', 'UTF-8');
+if fid < 0
+    error('jsonOpenFailed');
+end
+fwrite(fid, txt, 'char');
+fclose(fid);
+
+function out = local_norm(x)
+    if istable(x)
+        out = table_to_rows(x);
+        return;
+    end
+    if isstruct(x)
+        if numel(x) > 1
+            out = repmat(struct(), size(x));
+            for i = 1:numel(x)
+                f = fieldnames(x(i));
+                for k = 1:numel(f)
+                    out(i).(f{{k}}) = local_norm(x(i).(f{{k}}));
+                end
+            end
+        else
+            out = struct();
+            f = fieldnames(x);
+            for k = 1:numel(f)
+                out.(f{{k}}) = local_norm(x.(f{{k}}));
+            end
+        end
+        return;
+    end
+    if iscell(x)
+        out = cell(size(x));
+        for i = 1:numel(x)
+            out{{i}} = local_norm(x{{i}});
+        end
+        return;
+    end
+    if isstring(x)
+        if isscalar(x)
+            out = char(x);
+        else
+            out = cellstr(x);
+        end
+        return;
+    end
+    if iscategorical(x) || isdatetime(x) || isduration(x)
+        sx = string(x);
+        if isscalar(sx)
+            out = char(sx);
+        else
+            out = cellstr(sx);
+        end
+        return;
+    end
+    out = x;
+end
+
+function rows = table_to_rows(t)
+    if isempty(t)
+        rows = struct([]);
+        return;
+    end
+    names = t.Properties.VariableNames;
+    n = height(t);
+    rows = repmat(struct(), n, 1);
+    for i = 1:n
+        for j = 1:numel(names)
+            v = t{{i, j}};
+            if iscell(v) && numel(v) == 1
+                v = v{{1}};
+            end
+            rows(i).(names{{j}}) = local_norm(v);
+        end
+    end
+end
+"""
+        try:
+            Path(mat_tmp.name).write_bytes(raw)
+            Path(m_tmp.name).write_text(script, encoding="utf-8")
+            cmd = [matlab_exe, "-batch", f"run('{_q(m_tmp.name)}')"]
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+            if p.returncode != 0:
+                err = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+                return False, b"", (err[-1200:] if err else "MATLAB-Konvertierung fehlgeschlagen")
+            raw_out = Path(out_tmp.name).read_bytes()
+            if not raw_out:
+                return False, b"", "MATLAB lieferte leere JSON"
+            return True, raw_out, "matlab fallback"
+        except Exception as e:
+            return False, b"", str(e)
+        finally:
+            for t in (mat_tmp.name, out_tmp.name, m_tmp.name):
+                try:
+                    Path(t).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def _maybe_fix_mcos_tables_with_matlab(raw: bytes, json_bytes: bytes) -> tuple[bytes, str]:
+        lengths = _json_recordresult_ocr_lengths(json_bytes)
+        needs = (lengths.get("table", -1) == 0 or lengths.get("cleaned", -1) == 0)
+        if needs and (not _has_mcos_table_in_mat(raw)):
+            return json_bytes, ""
+        if not needs:
+            return json_bytes, ""
+        ok_ml, out_ml, msg_ml = _matlab_convert_recordresult_json(raw)
+        if ok_ml and out_ml:
+            return out_ml, str(msg_ml or "")
+        return json_bytes, ""
+
+    def _normalize_json_bytes(json_bytes: bytes) -> bytes:
+        norm = globals().get("_normalize_sidecar_json_payload")
+        if not callable(norm):
+            return json_bytes
+        try:
+            obj = json.loads((json_bytes or b"").decode("utf-8", errors="ignore"))
+            if not isinstance(obj, dict):
+                return json_bytes
+            obj_n = norm(obj)
+            return json.dumps(obj_n, ensure_ascii=False, indent=2, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
+        except Exception:
+            return json_bytes
+
+    def _normalize_json_file_in_place(json_path: Path) -> tuple[bool, str]:
+        try:
+            raw = json_path.read_bytes()
+        except Exception as e:
+            return False, f"json read fehler: {e}"
+        normed = _normalize_json_bytes(raw)
+        if normed != raw:
+            try:
+                json_path.write_bytes(normed)
+            except Exception as e:
+                return False, f"json write fehler: {e}"
+        return True, ""
+
     def _convert_mat_bytes(raw: bytes) -> tuple[bool, bytes, str]:
         if not raw:
             return False, b"", "leere MAT-Datei"
@@ -83,13 +315,15 @@ def render(ns):
             if callable(helper):
                 out = helper(raw)
                 if out:
-                    return True, bytes(out), ""
+                    fixed, note = _maybe_fix_mcos_tables_with_matlab(raw, bytes(out))
+                    return True, _normalize_json_bytes(bytes(fixed)), str(note or "")
             from core.save_helpers import rr_from_mat_bytes
             rr, _extra = rr_from_mat_bytes(raw)
             if not isinstance(rr, dict) or not rr:
                 ok_fb, out_fb, msg_fb = _fallback_recordresult_json_bytes(raw)
                 if ok_fb:
-                    return True, out_fb, msg_fb
+                    fixed_fb, note_fb = _maybe_fix_mcos_tables_with_matlab(raw, out_fb)
+                    return True, _normalize_json_bytes(fixed_fb), str(note_fb or msg_fb or "")
                 return False, b"", str(msg_fb or "recordResult nicht lesbar")
             payload = {"recordResult": _mat_export_to_jsonable(rr)}
             norm = globals().get("_normalize_sidecar_json_payload")
@@ -101,7 +335,8 @@ def render(ns):
                 indent=2,
                 default=lambda o: _mat_export_to_jsonable(o),
             ).encode("utf-8")
-            return True, data, ""
+            fixed_data, note_data = _maybe_fix_mcos_tables_with_matlab(raw, data)
+            return True, _normalize_json_bytes(fixed_data), str(note_data or "")
         except Exception as e:
             return False, b"", str(e)
 
@@ -113,15 +348,30 @@ def render(ns):
             json_path = mat_path.with_suffix(".json")
             mat_exists = bool(mat_path.exists())
             json_exists = bool(json_path.exists())
-            if json_exists:
-                status = "bereits vorhanden"
-            else:
+            if not json_exists:
                 status = "ausstehend"
                 pending.append(mat_path)
+            else:
+                status = "bereits vorhanden"
+                lengths = _json_recordresult_ocr_lengths_from_path(json_path)
+                if lengths.get("table", -1) < 0 or lengths.get("cleaned", -1) < 0:
+                    status = "json fehlerhaft - neu konvertieren"
+                    pending.append(mat_path)
+                elif lengths.get("table", -1) == 0 or lengths.get("cleaned", -1) == 0:
+                    try:
+                        raw = mat_path.read_bytes()
+                    except Exception:
+                        raw = b""
+                    if raw and _has_mcos_table_in_mat(raw):
+                        status = "json leer (table/cleaned) - neu konvertieren"
+                        pending.append(mat_path)
+                elif _json_has_row_table_lists(json_path):
+                    status = "json zeilenformat gefunden - neu konvertieren"
+                    pending.append(mat_path)
             prev = status_map.get(mat_path.name)
             if isinstance(prev, dict):
                 prev_status = str(prev.get("status") or "").strip()
-                if prev_status:
+                if prev_status and status in ("ausstehend", "bereits vorhanden"):
                     status = prev_status
             rows.append(
                 {
@@ -135,6 +385,13 @@ def render(ns):
         return rows, pending
 
     st.session_state.setdefault("mat_to_json_status_map", {})
+    st.session_state.setdefault("mat_to_json_running", False)
+    st.session_state.setdefault("mat_to_json_stop_requested", False)
+    st.session_state.setdefault("mat_to_json_pending_paths", [])
+    st.session_state.setdefault("mat_to_json_done_n", 0)
+    st.session_state.setdefault("mat_to_json_total_n", 0)
+    st.session_state.setdefault("mat_to_json_ok_n", 0)
+    st.session_state.setdefault("mat_to_json_err_n", 0)
     status_map = dict(st.session_state.get("mat_to_json_status_map") or {})
 
     results_dir = _results_dir_from_local_db()
@@ -145,68 +402,169 @@ def render(ns):
     results_dir.mkdir(parents=True, exist_ok=True)
     st.caption(f"Verwendeter Ordner: {results_dir}")
 
-    rows, pending = _scan_results_rows(results_dir, status_map)
-    total = len(rows)
-    pending_n = len(pending)
+    def _convert_one_mat(mat_path: Path) -> dict:
+        mat_name = mat_path.name
+        json_path = mat_path.with_suffix(".json")
+        try:
+            if json_path.exists() and _json_has_row_table_lists(json_path):
+                ok_norm, err_norm = _normalize_json_file_in_place(json_path)
+                if ok_norm:
+                    return {"ok": True, "mat_name": mat_name, "json_name": json_path.name, "status": "konvertiert (json-normalisierung)", "error": ""}
+                return {"ok": False, "mat_name": mat_name, "json_name": json_path.name, "status": f"fehler: {err_norm}", "error": str(err_norm or "")}
+            raw = mat_path.read_bytes()
+            ok, json_bytes, err = _convert_mat_bytes(raw)
+            if ok:
+                json_path.write_bytes(json_bytes)
+                return {"ok": True, "mat_name": mat_name, "json_name": json_path.name, "status": "konvertiert", "error": ""}
+            return {"ok": False, "mat_name": mat_name, "json_name": json_path.name, "status": f"fehler: {err}", "error": str(err or "")}
+        except Exception as e:
+            return {"ok": False, "mat_name": mat_name, "json_name": json_path.name, "status": f"fehler: {e}", "error": str(e)}
 
-    if total > 0:
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=380)
-    else:
-        st.dataframe(
-            pd.DataFrame(
-                columns=[
-                    "name der mat datei",
-                    "äquivalente json datei",
-                    "mat datei vorhanden",
-                    "json datei vorhanden",
-                    "konvertierungsstatus",
-                ]
-            ),
-            width="stretch",
-            hide_index=True,
-            height=220,
-        )
+    run_every = 1.0 if bool(st.session_state.get("mat_to_json_running")) else None
+    fragment_fn = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
 
-    st.caption(f"MAT-Dateien: {total} | ohne JSON: {pending_n}")
-    progress_slot = st.empty()
-    current_slot = st.empty()
-    convert_clicked = st.button(
-        "alle .mat dateien ohne .json in .json konvertieren",
-        type="primary",
-        width="stretch",
-        key="mat_to_json_convert_all_missing_btn",
-        disabled=(pending_n <= 0),
-    )
+    def _render_conversion_panel() -> None:
+        status_map_local = dict(st.session_state.get("mat_to_json_status_map") or {})
+        rows_local, pending_local = _scan_results_rows(results_dir, status_map_local)
+        total_local = len(rows_local)
+        pending_n_local = len(pending_local)
+        running_local = bool(st.session_state.get("mat_to_json_running"))
 
-    if convert_clicked and pending_n > 0:
-        ok_n = 0
-        err_n = 0
-        for i, mat_path in enumerate(pending, start=1):
-            mat_name = mat_path.name
-            json_path = mat_path.with_suffix(".json")
-            current_slot.caption(f"Aktuell: {json_path.name} ({i}/{pending_n})")
-            try:
-                raw = mat_path.read_bytes()
-                ok, json_bytes, err = _convert_mat_bytes(raw)
-                if ok:
-                    json_path.write_bytes(json_bytes)
-                    status_map[mat_name] = {"status": "konvertiert", "error": ""}
-                    ok_n += 1
-                else:
-                    status_map[mat_name] = {"status": f"fehler: {err}", "error": str(err or "")}
-                    err_n += 1
-            except Exception as e:
-                status_map[mat_name] = {"status": f"fehler: {e}", "error": str(e)}
-                err_n += 1
-            remain = max(0, pending_n - i)
-            progress_slot.progress(
-                i / max(1, pending_n),
-                text=f"{i}/{pending_n} konvertiert | verbleibend: {remain}",
+        table_slot = st.empty()
+
+        def _render_rows_table(table_rows: list[dict]) -> None:
+            if table_rows:
+                table_slot.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True, height=380)
+                return
+            table_slot.dataframe(
+                pd.DataFrame(
+                    columns=[
+                        "name der mat datei",
+                        "äquivalente json datei",
+                        "mat datei vorhanden",
+                        "json datei vorhanden",
+                        "konvertierungsstatus",
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+                height=220,
             )
 
-        st.session_state.mat_to_json_status_map = status_map
-        if err_n == 0:
-            set_status(f"MAT->JSON abgeschlossen: {ok_n}/{pending_n} konvertiert.", "ok")
-        else:
-            set_status(f"MAT->JSON abgeschlossen: {ok_n} OK, {err_n} Fehler.", "warn")
-        st.rerun()
+        _render_rows_table(rows_local)
+        st.caption(f"MAT-Dateien: {total_local} | fehlend/neu zu konvertieren: {pending_n_local}")
+        st.caption("Konvertierung läuft seriell (Datei für Datei), um inkonsistente/leere JSON-Einträge zu vermeiden.")
+
+        progress_slot = st.empty()
+        current_slot = st.empty()
+        c1, c2 = st.columns(2)
+        can_start = not running_local
+        can_stop = running_local
+        convert_clicked = c1.button(
+            "alle .mat dateien ohne .json in .json konvertieren",
+            type="primary",
+            width="stretch",
+            key="mat_to_json_convert_all_missing_btn",
+            disabled=not can_start,
+        )
+        stop_clicked = c2.button(
+            "Auswahl stoppen",
+            width="stretch",
+            key="mat_to_json_stop_btn",
+            disabled=not can_stop,
+        )
+
+        if stop_clicked:
+            st.session_state.mat_to_json_stop_requested = True
+            set_status("Stop angefordert: MAT->JSON stoppt nach aktueller Datei.", "warn")
+
+        if convert_clicked:
+            if pending_n_local <= 0:
+                set_status("Keine ausstehenden MAT-Dateien zur Konvertierung.", "warn")
+            else:
+                st.session_state.mat_to_json_pending_paths = [str(p) for p in pending_local]
+                st.session_state.mat_to_json_total_n = int(pending_n_local)
+                st.session_state.mat_to_json_done_n = 0
+                st.session_state.mat_to_json_ok_n = 0
+                st.session_state.mat_to_json_err_n = 0
+                st.session_state.mat_to_json_stop_requested = False
+                st.session_state.mat_to_json_running = True
+                running_local = True
+
+        if bool(st.session_state.get("mat_to_json_running")):
+            pending_paths = [Path(p) for p in list(st.session_state.get("mat_to_json_pending_paths") or []) if str(p).strip()]
+            done_n = int(st.session_state.get("mat_to_json_done_n", 0) or 0)
+            total_n = int(st.session_state.get("mat_to_json_total_n", 0) or 0)
+            ok_n = int(st.session_state.get("mat_to_json_ok_n", 0) or 0)
+            err_n = int(st.session_state.get("mat_to_json_err_n", 0) or 0)
+
+            if bool(st.session_state.get("mat_to_json_stop_requested")):
+                st.session_state.mat_to_json_running = False
+                st.session_state.mat_to_json_status_map = status_map_local
+                st.session_state.mat_to_json_stop_requested = False
+                set_status(f"MAT->JSON gestoppt: {ok_n} OK, {err_n} Fehler, {max(0, total_n-done_n)} offen.", "warn")
+            elif not pending_paths:
+                st.session_state.mat_to_json_running = False
+                st.session_state.mat_to_json_status_map = status_map_local
+                if err_n == 0:
+                    set_status(f"MAT->JSON abgeschlossen: {ok_n}/{max(1,total_n)} konvertiert.", "ok")
+                else:
+                    set_status(f"MAT->JSON abgeschlossen: {ok_n} OK, {err_n} Fehler.", "warn")
+            else:
+                mat_path = pending_paths[0]
+                res = _convert_one_mat(mat_path)
+                done_n += 1
+                mat_name = str(res.get("mat_name") or "")
+                json_name = str(res.get("json_name") or "")
+                st_txt = str(res.get("status") or "")
+                er_txt = str(res.get("error") or "")
+                if bool(res.get("ok")):
+                    status_map_local[mat_name] = {"status": st_txt or "konvertiert", "error": ""}
+                    ok_n += 1
+                else:
+                    status_map_local[mat_name] = {"status": st_txt or f"fehler: {er_txt}", "error": er_txt}
+                    err_n += 1
+
+                pending_paths = pending_paths[1:]
+                st.session_state.mat_to_json_pending_paths = [str(p) for p in pending_paths]
+                st.session_state.mat_to_json_done_n = int(done_n)
+                st.session_state.mat_to_json_ok_n = int(ok_n)
+                st.session_state.mat_to_json_err_n = int(err_n)
+                st.session_state.mat_to_json_status_map = status_map_local
+
+                rows_live, _pending_live = _scan_results_rows(results_dir, status_map_local)
+                _render_rows_table(rows_live)
+                current_slot.caption(f"Aktuell fertig: {json_name} ({done_n}/{max(1,total_n)})")
+                remain = max(0, total_n - done_n)
+                progress_slot.progress(
+                    done_n / max(1, total_n),
+                    text=f"{done_n}/{max(1,total_n)} konvertiert | verbleibend: {remain}",
+                )
+
+                if not pending_paths:
+                    st.session_state.mat_to_json_running = False
+                    if err_n == 0:
+                        set_status(f"MAT->JSON abgeschlossen: {ok_n}/{max(1,total_n)} konvertiert.", "ok")
+                    else:
+                        set_status(f"MAT->JSON abgeschlossen: {ok_n} OK, {err_n} Fehler.", "warn")
+
+        if running_local or bool(st.session_state.get("mat_to_json_running")):
+            done_n = int(st.session_state.get("mat_to_json_done_n", 0) or 0)
+            total_n = int(st.session_state.get("mat_to_json_total_n", 0) or 0)
+            remain = max(0, total_n - done_n)
+            progress_slot.progress(
+                done_n / max(1, total_n),
+                text=f"{done_n}/{max(1,total_n)} konvertiert | verbleibend: {remain}",
+            )
+            st.caption("Hinweis: Stop wirkt zwischen Dateien.")
+
+    if callable(fragment_fn):
+        @fragment_fn(run_every=run_every)
+        def _panel_fragment():
+            _render_conversion_panel()
+        _panel_fragment()
+    else:
+        _render_conversion_panel()
+        if bool(st.session_state.get("mat_to_json_running")):
+            time.sleep(0.25)
+            st.rerun()

@@ -44,7 +44,7 @@ def test_tab_renderers_define_startup_placeholders_without_dynamic_empty_slots()
     assert 'key="roi_ph_hist_clear"' in roi_src
     assert "Frame aktuell nicht verfuegbar. Platzhalter wird angezeigt" in roi_src
 
-    assert "Noch keine MAT analysiert." in mat_src
+    assert "Noch keine JSON-Datei analysiert." in mat_src
     assert "pd.DataFrame(" in mat_src
     assert "column_config=MAT_OVERVIEW_COLCFG" in mat_src
     assert "Auto-Analyse deaktiviert" in mat_src

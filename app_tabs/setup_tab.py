@@ -6,6 +6,32 @@ session-state conventions remain shared during the incremental split.
 
 def render(ns):
     globals().update(ns)
+    st.session_state.setdefault("compressed_db_mode", "local")
+    st.session_state.setdefault("compressed_db_default_path", str((st.secrets.get("local") or {}).get("default_path") or Path.cwd()))
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    mode_opts = ["Lokale Database (bevorzugt)", "R2 Database"]
+    mode_cur = str(st.session_state.get("compressed_db_mode") or "local").strip().lower()
+    mode_idx = 0 if mode_cur != "r2" else 1
+    mode_label = st.selectbox(
+        "Datenbank für komprimierte Dateien",
+        options=mode_opts,
+        index=mode_idx,
+        key="compressed_db_mode_select",
+    )
+    new_mode = "r2" if "R2" in str(mode_label) else "local"
+    if new_mode != mode_cur:
+        st.session_state.compressed_db_mode = new_mode
+        st.session_state.mat_scan_prefix = None
+        sync_bind = globals().get("_sync_compressed_storage_binding")
+        if callable(sync_bind):
+            sync_bind()
+        st.rerun()
+    st.caption(
+        "Auswahl gilt für komprimierte Daten (results/captures reduced). "
+        "Lokale Database ist Standard/empfohlen."
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
     cloud_root_slot = st.empty()
     local_path_slot = st.empty()
     with st.expander("Debug-Logs", expanded=False):
@@ -36,21 +62,25 @@ def render(ns):
 
     cloud_ok = bool(st.session_state.r2_connected)
     local_ok = bool(st.session_state.local_connected)
+    compressed_mode = str(st.session_state.get("compressed_db_mode") or "local").strip().lower()
 
     col_cloud, col_local = st.columns(2, gap="large")
 
     with col_cloud:
         st.markdown('<div class="section-card" style="background:#0b1524;border-color:#234465;">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Cloud DB | Cloudflare R2</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Datenbank für komprimierte Dateien</div>', unsafe_allow_html=True)
         # Card 1: Status
+        status_txt = "Verbunden" if cloud_ok else "Nicht verbunden"
+        status_color = "#3ddc84" if cloud_ok else "#ff5c5c"
+        status_sub = "R2 Database" if compressed_mode == "r2" else "Lokale Database"
         st.markdown(
             f"""
             <div style="background:#0b1524;border:1px solid #2b4f77;border-radius:10px;padding:.8rem 1rem;margin-bottom:.7rem;">
-              <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;">Cloud DB Status</div>
+              <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;">Status ({status_sub})</div>
               <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
                 <span class="conn-dot {'ok' if cloud_ok else 'off'}" style="width:13px;height:13px;"></span>
-                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if cloud_ok else '#ff5c5c'};">
-                  {'Verbunden' if cloud_ok else 'Nicht verbunden'}
+                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{status_color};">
+                  {status_txt}
                 </span>
               </div>
             </div>
@@ -58,70 +88,77 @@ def render(ns):
             unsafe_allow_html=True,
         )
 
-        # Card 2: Credentials + connect
-        with st.container(border=True, key="cloud_access_card"):
-            st.markdown(
-                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Cloud Zugang</div>",
-                unsafe_allow_html=True,
-            )
-            r2_account = st.text_input(
-                "Account ID",
-                key="r2_account_id",
-                help="Cloudflare Dashboard -> R2 -> Account ID",
-            )
-            r2_key = st.text_input(
-                "Access Key ID",
-                key="r2_access_key_id",
-                help="R2 -> Manage API Tokens -> Create API Token",
-            )
-            r2_secret = st.text_input(
-                "Secret Access Key",
-                key="r2_secret_access_key",
-                type="password",
-            )
-            r2_bucket = st.text_input(
-                "Bucket Name",
-                key="r2_bucket",
-                placeholder="mein-bucket",
-            )
+        if compressed_mode == "r2":
+            # Card 2: Credentials + connect
+            with st.container(border=True, key="cloud_access_card"):
+                st.markdown(
+                    "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">R2 Zugang</div>",
+                    unsafe_allow_html=True,
+                )
+                r2_account = st.text_input(
+                    "Account ID",
+                    key="r2_account_id",
+                    help="Cloudflare Dashboard -> R2 -> Account ID",
+                )
+                r2_key = st.text_input(
+                    "Access Key ID",
+                    key="r2_access_key_id",
+                    help="R2 -> Manage API Tokens -> Create API Token",
+                )
+                r2_secret = st.text_input(
+                    "Secret Access Key",
+                    key="r2_secret_access_key",
+                    type="password",
+                )
+                r2_bucket = st.text_input(
+                    "Bucket Name",
+                    key="r2_bucket",
+                    placeholder="mein-bucket",
+                )
 
-            try:
-                r2_connect_clicked = st.button("Cloud DB verbinden", type="primary", width="stretch", key="r2_connect_btn")
-            except Exception as e:
-                if "can't be used in an `st.form()`" not in str(e):
-                    raise
-                r2_connect_clicked = st.form_submit_button("Cloud DB verbinden", type="primary", width="stretch")
+                try:
+                    r2_connect_clicked = st.button("R2 Database verbinden", type="primary", width="stretch", key="r2_connect_btn")
+                except Exception as e:
+                    if "can't be used in an `st.form()`" not in str(e):
+                        raise
+                    r2_connect_clicked = st.form_submit_button("R2 Database verbinden", type="primary", width="stretch")
 
-            if r2_connect_clicked:
-                if r2_account and r2_key and r2_secret and r2_bucket:
-                    with st.spinner("Verbinde Cloud DB ... (max. 3 Versuche)"):
-                        _ok, _msg, _client = _connect_r2_with_retry(
-                            r2_account,
-                            r2_key,
-                            r2_secret,
-                            r2_bucket,
-                            max_attempts=3,
-                            delay_s=1.2,
-                        )
-                    if _ok:
-                        st.session_state.r2_connected = True
-                        st.session_state.r2_client = _client
-                        st.session_state.r2_prefix_options = list_root_prefixes(_client)
-                        st.session_state.r2_prefix = ""
-                        st.session_state.mat_scan_prefix = None
-                        set_status("Cloud DB verbunden.", "ok")
+                if r2_connect_clicked:
+                    if r2_account and r2_key and r2_secret and r2_bucket:
+                        with st.spinner("Verbinde R2 Database ... (max. 3 Versuche)"):
+                            _ok, _msg, _client = _connect_r2_with_retry(
+                                r2_account,
+                                r2_key,
+                                r2_secret,
+                                r2_bucket,
+                                max_attempts=3,
+                                delay_s=1.2,
+                            )
+                        if _ok:
+                            st.session_state.r2_connected = True
+                            st.session_state.r2_client = _client
+                            st.session_state.r2_prefix_options = list_root_prefixes(_client)
+                            st.session_state.r2_prefix = ""
+                            st.session_state.mat_scan_prefix = None
+                            sync_bind = globals().get("_sync_compressed_storage_binding")
+                            if callable(sync_bind):
+                                sync_bind()
+                            set_status("R2 Database verbunden.", "ok")
+                        else:
+                            st.session_state.r2_connected = False
+                            set_status(f"R2 Database Verbindung fehlgeschlagen: {_msg}", "warn")
+                        st.rerun()
                     else:
-                        st.session_state.r2_connected = False
-                        set_status(f"Cloud DB Verbindung fehlgeschlagen: {_msg}", "warn")
-                    st.rerun()
-                else:
-                    set_status("Bitte alle Cloud-DB Felder ausfuellen.", "warn")
-                    st.rerun()
+                        set_status("Bitte alle R2-Felder ausfuellen.", "warn")
+                        st.rerun()
+        else:
+            with st.container(border=True, key="compressed_local_notice"):
+                st.info("Lokale Database ist ausgewählt. Ordnerauswahl erfolgt im Bereich 'Lokale DB'.")
 
         # Card 3: Root + refresh
         with st.container(border=True, key="cloud_root_card"):
             st.markdown(
-                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Cloud Root</div>",
+                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Root für komprimierte Dateien</div>",
                 unsafe_allow_html=True,
             )
             with cloud_root_slot.container():
@@ -140,9 +177,12 @@ def render(ns):
                     if chosen != st.session_state.r2_prefix:
                         st.session_state.r2_prefix = chosen
                         st.session_state.mat_scan_prefix = None
-                        set_status(f"Cloud Root: {chosen or '(root)'}", "ok")
-                    if st.button("Cloud Liste aktualisieren", width="stretch", key="refresh_root"):
-                        st.session_state.r2_prefix_options = get_root_prefixes()
+                        set_status(f"Komprimierte Dateien Root: {chosen or '(root)'}", "ok")
+                    if st.button("Liste aktualisieren", width="stretch", key="refresh_root"):
+                        if compressed_mode == "r2":
+                            st.session_state.r2_prefix_options = get_root_prefixes()
+                        else:
+                            st.session_state.r2_prefix_options = _list_local_root_options(st.session_state.local_base_path)
                         st.rerun()
                 else:
                     st.selectbox(
@@ -154,8 +194,8 @@ def render(ns):
                         key="root_dd_placeholder",
                         disabled=True,
                     )
-                    st.button("Cloud Liste aktualisieren", width="stretch", key="refresh_root_placeholder", disabled=True)
-                    st.caption("Erst Cloud DB verbinden.")
+                    st.button("Liste aktualisieren", width="stretch", key="refresh_root_placeholder", disabled=True)
+                    st.caption("Bitte zuerst die ausgewählte Datenbank verbinden.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col_local:
@@ -207,6 +247,9 @@ def render(ns):
                                 st.session_state.local_client = local_client
                                 st.session_state.local_base_path = str(lp)
                                 st.session_state.local_root = ""
+                                sync_bind = globals().get("_sync_compressed_storage_binding")
+                                if callable(sync_bind):
+                                    sync_bind()
                                 set_status(f"Lokale DB verbunden: {lp}", "ok")
                             else:
                                 st.session_state.local_connected = False

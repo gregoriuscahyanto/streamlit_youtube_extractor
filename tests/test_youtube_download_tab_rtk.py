@@ -30,6 +30,7 @@ def test_tab_uses_record_youtube_cfr_script_not_ytdlp():
 
 def test_tab_writes_metadata_to_json_not_mat():
     txt = _read("app_tabs/youtube_tab.py")
+    meta_blk = txt[txt.index("def _write_capture_metadata_json"):txt.index("def _local_framepack_1fps")]
     assert "def _write_capture_metadata_json" in txt
     assert "def _capture_media_paths" in txt
     assert "def _ensure_audio_file" in txt
@@ -54,12 +55,12 @@ def test_tab_writes_metadata_to_json_not_mat():
     assert '"pubDate": pub_v' in txt
     assert '"desc": desc_v' in txt
     assert '"chanName": chan_v' in txt
-    assert '"youtube_url": url_v' not in txt
-    assert '"source_url": url_v' not in txt
-    assert '"video_title": title_v' not in txt
-    assert '"youtube_title": title_v' not in txt
-    assert '"capture_folder": folder' not in txt
-    assert '"download_status"' not in txt[txt.index("def _write_capture_metadata_json"):txt.index("def _ensure_audio_file")]
+    assert '"youtube_url": url_v' not in meta_blk
+    assert '"source_url": url_v' not in meta_blk
+    assert '"video_title": title_v' not in meta_blk
+    assert '"youtube_title": title_v' not in meta_blk
+    assert '"capture_folder": folder' not in meta_blk
+    assert '"download_status"' not in meta_blk
     assert 'audio fehlt:' in txt
     assert "kein echtes Audio gefunden (kein Platzhalter erzeugt)" in txt
     assert ".mat" not in txt[txt.index("def _write_capture_metadata_json"):txt.index("def _status_lamp")]

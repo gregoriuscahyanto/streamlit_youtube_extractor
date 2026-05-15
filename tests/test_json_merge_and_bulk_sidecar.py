@@ -192,3 +192,47 @@ def test_sidecar_payload_normalizer_strips_mcos_wrappers():
     assert out["recordResult"]["metadata"]["created_at"] == ""
     assert out["recordResult"]["ocr"]["table"] == []
     assert out["recordResult"]["validation"]["results"]["comparison_accuracy_v"] is None
+
+
+def test_sidecar_normalizer_adds_audio_rpm_processed_col_with_missing_values():
+    ns = _load_app_functions({"_normalize_sidecar_json_payload"})
+    payload = {
+        "recordResult": {
+            "audio_rpm": {
+                "processed": [
+                    {"t_s_spec": 0.34, "rpm_audio": 4891.8, "rpm_final": 4754.6, "gear_est": 3},
+                    {"t_s_spec": 0.95, "rpm_audio": 4498.1, "rpm_final": 4754.6},
+                ]
+            }
+        }
+    }
+    out = ns["_normalize_sidecar_json_payload"](payload)
+    processed = out["recordResult"]["audio_rpm"]["processed"]
+    processed_col = out["recordResult"]["audio_rpm"]["processed_col"]
+    assert isinstance(processed, dict)
+    assert isinstance(processed_col, dict)
+    assert processed["t_s_spec"] == [0.34, 0.95]
+    assert processed_col["t_s_spec"] == [0.34, 0.95]
+    assert processed_col["rpm_audio"] == [4891.8, 4498.1]
+    assert processed_col["rpm_final"] == [4754.6, 4754.6]
+    assert processed_col["gear_est"][0] == 3.0
+    assert processed_col["gear_est"][1] is None
+
+
+def test_sidecar_normalizer_converts_generic_table_lists_to_columnar():
+    ns = _load_app_functions({"_normalize_sidecar_json_payload", "_mat_scalar", "_mat_export_to_jsonable"})
+    payload = {
+        "recordResult": {
+            "ocr": {
+                "roi_table": [
+                    {"name_roi": "speed", "roi": [10, 20, 30, 40], "fmt": "float"},
+                    {"name_roi": "rpm", "roi": [50, 60, 70, 80], "fmt": "int_4"},
+                ]
+            }
+        }
+    }
+    out = ns["_normalize_sidecar_json_payload"](payload)
+    ocr = out["recordResult"]["ocr"]
+    assert isinstance(ocr["roi_table"], dict)
+    assert ocr["roi_table"]["name_roi"] == ["speed", "rpm"]
+    assert ocr["roi_table"]["roi"] == [[10, 20, 30, 40], [50, 60, 70, 80]]

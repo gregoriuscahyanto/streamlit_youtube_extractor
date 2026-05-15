@@ -9,7 +9,7 @@ def render(ns):
     mat_request_rerun = False
     filter_info_slot = st.empty()
     st.markdown('<div class="section-card mat-selection-no-scroll">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">MAT-Auswahl und Analyse</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">JSON-Auswahl und Analyse</div>', unsafe_allow_html=True)
     st.markdown(
         """
         <div style="
@@ -23,9 +23,8 @@ def render(ns):
             font-size: .68rem;
             line-height: 1.45;
         ">
-          <b>MAT -> JSON Auto-Cache aktiv:</b> Vorhandene JSON-Sidecars werden automatisch genutzt.
-          Fehlt die JSON, liest das Update die MAT-Datei und erzeugt automatisch
-          eine gleichnamige JSON-Datei in R2/results.
+          <b>JSON-only Auswahl aktiv:</b> Es werden nur <code>results_*.json</code> aus <code>results/</code> berücksichtigt.
+          MAT-Dateien werden in diesem Tab nicht mehr berücksichtigt.
         </div>
         """,
         unsafe_allow_html=True,
@@ -61,7 +60,7 @@ def render(ns):
             set_status(f"Analyse gestartet ({len(_targets)} Eintraege).", "info")
         else:
             st.session_state.mat_run_state = "idle"
-            set_status("Keine MAT-Dateien gefunden.", "warn")
+            set_status("Keine JSON-Dateien gefunden.", "warn")
 
     def _stop_update_clicked():
         st.session_state.mat_update_stop_requested = True
@@ -104,13 +103,13 @@ def render(ns):
                 set_status("Analyse abgeschlossen.", "ok")
             else:
                 st.session_state.mat_run_state = "idle"
-                set_status("Keine MAT-Dateien gefunden.", "warn")
+                set_status("Keine JSON-Dateien gefunden.", "warn")
         st.rerun()
     if stop_clicked:
         _stop_update_clicked()
         st.rerun()
     # Button soll nach Update/Filter nicht durch einen veralteten Selection-State
-    # blockiert werden. Ob wirklich eine sichtbare MAT-Zeile gewaehlt ist, wird
+    # blockiert werden. Ob wirklich eine sichtbare JSON-Zeile gewaehlt ist, wird
     # beim Klick gegen die aktuell sichtbare Tabelle validiert.
     can_load = (
         connected
@@ -119,7 +118,7 @@ def render(ns):
         and not load_running
     )
     load_clicked = c3.button(
-        "MAT + Video laden",
+        "JSON + Video laden",
         type="primary",
         width="stretch",
         key="mat_load_all_tab",
@@ -231,7 +230,7 @@ def render(ns):
     json_created = int(st.session_state.get("mat_json_sidecar_created_count", 0) or 0)
     json_used = int(st.session_state.get("mat_json_sidecar_used_count", 0) or 0)
     if json_created:
-        st.success(f"MAT->JSON Cache aktualisiert: {json_created} JSON-Sidecar(s) automatisch erzeugt.")
+        st.success(f"JSON-Cache aktualisiert: {json_created} JSON-Sidecar(s) automatisch erzeugt.")
     elif json_used:
         st.caption(f"JSON-Cache aktiv: {json_used} vorhandene JSON-Sidecar(s) fuer die schnelle Analyse verwendet.")
 
@@ -315,7 +314,7 @@ def render(ns):
                     st.session_state.mat_user_selected_key = current_selected_key
         else:
             filter_info_slot.empty()
-            st.caption("MAT-Auswahl wird aktualisiert ... (Live-Status je Zeile sichtbar)")
+            st.caption("JSON-Auswahl wird aktualisiert ... (Live-Status je Zeile sichtbar)")
             table_slot.dataframe(
                 visible_df,
                 width="stretch",
@@ -328,7 +327,7 @@ def render(ns):
             title_suffix=" (gefilterte Ansicht)" if filter_missing_roi else "",
         )
     else:
-        st.caption("Noch keine MAT analysiert.")
+        st.caption("Noch keine JSON-Datei analysiert.")
         table_slot.dataframe(
             pd.DataFrame(
                 columns=[
@@ -360,13 +359,13 @@ def render(ns):
             st.session_state.mat_selected_key = ""
             st.session_state.mat_selected_summary = None
             st.session_state.mat_user_selected_key = ""
-            set_status("Bitte zuerst genau eine MAT-Zeile in der aktuell sichtbaren Tabelle anwaehlen.", "warn")
+            set_status("Bitte zuerst genau eine JSON-Zeile in der aktuell sichtbaren Tabelle anwaehlen.", "warn")
 
     if st.session_state.mat_load_requested and (not running) and connected:
         selected = st.session_state.mat_selected_key
         st.session_state.mat_load_requested = False
         if not selected:
-            set_status("Bitte zuerst eine Zeile mit MAT-Datei waehlen.", "warn")
+            set_status("Bitte zuerst eine Zeile mit JSON-Datei waehlen.", "warn")
             st.rerun()
         st.session_state.mat_load_running = True
         st.rerun()
@@ -394,22 +393,23 @@ def render(ns):
               font-weight: 700;
             }
             </style>
-            <div class="mat-load-overlay"><div class="mat-load-overlay-box">MAT + Video wird geladen ...</div></div>
+            <div class="mat-load-overlay"><div class="mat-load-overlay-box">JSON + Video wird geladen ...</div></div>
             """,
             unsafe_allow_html=True,
         )
-        with st.spinner("Lade MAT + Video ..."):
+        with st.spinner("Lade JSON + Video ..."):
             _analyze_mat_from_r2(selected)
             summary = st.session_state.mat_selected_summary or {}
             capture_folder = summary.get("capture_folder") or _mat_capture_guess_from_key(selected)
-            video_ok = _try_load_video_for_capture_folder(capture_folder)
+            json_doc = _r2_download_json_doc(_r2_json_sidecar_key(selected))
+            video_ok = _try_load_video_for_capture_folder_with_fallback(capture_folder, json_doc)
             if video_ok:
-                st.session_state.capture_folder = capture_folder
-            mat_loaded = _load_mat_from_r2(selected)
+                st.session_state.capture_folder = str(st.session_state.get("_mat_last_video_capture_folder") or capture_folder)
+            mat_loaded = _load_mat_from_r2(selected, preloaded_doc=json_doc)
             if mat_loaded is None:
-                set_status("MAT konnte nicht geladen werden.", "warn")
+                set_status("JSON konnte nicht geladen werden.", "warn")
             elif not video_ok:
-                set_status("MAT geladen, aber kein passendes Video gefunden.", "warn")
+                set_status("JSON geladen, aber kein passendes Video gefunden.", "warn")
             if mat_loaded:
                 st.session_state.audio_last_mat_path = mat_loaded
         st.session_state.tab_default = "ROI Setup"

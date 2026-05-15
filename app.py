@@ -1,4 +1,4 @@
-﻿"""
+"""
 OCR Extractor - Streamlit App v4
 Tab 1: Cloudflare R2-Verbindung, Prefix waehlen, Datei-Browser
 Tab 2: Video laden, Start/Ende, ROI-Auswahl
@@ -89,12 +89,12 @@ from core.track_analysis import (
     extract_minimap_crop,
     project_point_with_homography,
 )
-from app_tabs import audio_tab, mat_selection_tab, mat_to_json_tab, roi_setup_tab, setup_tab, sync_tab, youtube_tab
+from app_tabs import audio_tab, mat_selection_tab, mat_to_json_tab, roi_setup_tab, setup_tab, sync_tab, video_ocr_tab, watchdog_tab, youtube_tab
 try:
     # Streamlit reruns app.py in the same Python process. Reload extracted tab modules
     # so changes in app_tabs/*.py are visible without a full server restart.
     import importlib
-    for _tab_module in (audio_tab, mat_selection_tab, mat_to_json_tab, roi_setup_tab, setup_tab, sync_tab, youtube_tab):
+    for _tab_module in (audio_tab, mat_selection_tab, mat_to_json_tab, roi_setup_tab, setup_tab, sync_tab, video_ocr_tab, watchdog_tab, youtube_tab):
         importlib.reload(_tab_module)
 except Exception:
     pass
@@ -410,6 +410,11 @@ MOJIBAKE_RED = "\u00f0\u0178\u201d\u00b4"
 def init_state():
     _acc, _key, _sec, _bkt = load_r2_credentials(streamlit_secrets=st.secrets)
     _local_default = str((st.secrets.get("local") or {}).get("default_path") or Path.cwd())
+    _db_cfg = st.secrets.get("database") or {}
+    _compressed_mode = str(_db_cfg.get("compressed_mode") or "local").strip().lower()
+    if _compressed_mode not in {"local", "r2"}:
+        _compressed_mode = "local"
+    _compressed_default_path = str(_db_cfg.get("default_path") or _local_default or Path.cwd())
 
     defs = dict(
         # R2
@@ -431,6 +436,8 @@ def init_state():
         local_client=None,
         local_root="",
         local_root_options=[],
+        compressed_db_mode=_compressed_mode,
+        compressed_db_default_path=_compressed_default_path,
         sync_overview_rows=[],
         sync_queue_rows=[],
         sync_status_map={},
@@ -475,6 +482,8 @@ def init_state():
         mat_load_running=False,
         roi_save_running=False,
         roi_ocr_probe_running=False,
+        roi_ocr_full_running=False,
+        video_ocr_full_running=False,
         roi_next_load_running=False,
         roi_saved_once=False,
         roi_delete_confirm_idx=None,
@@ -528,6 +537,8 @@ def init_state():
         roi_display_meta={},
         roi_editor_df=None,
         roi_ocr_probe_result=None,
+        roi_ocr_full_result=None,
+        video_ocr_full_result=None,
         roi_global_scale=1.2,
         roi_editor_widget_key="roi_data_editor_v3",
         # Track
@@ -1238,6 +1249,8 @@ def _get_dynamic_roi_target_width(default_width: int = 620, anchor_id: str = "ro
 
 
 def _try_auto_connect_once():
+    if str(st.session_state.get("compressed_db_mode") or "local").strip().lower() != "r2":
+        return
     if st.session_state.r2_connected or st.session_state.auto_connect_attempted:
         return
 
@@ -1288,7 +1301,7 @@ def _try_auto_connect_local_once():
     if st.session_state.local_connected or st.session_state.get("local_auto_connect_attempted"):
         return
     st.session_state.local_auto_connect_attempted = True
-    lp_str = str((st.secrets.get("local") or {}).get("default_path") or "").strip()
+    lp_str = str(st.session_state.get("compressed_db_default_path") or (st.secrets.get("local") or {}).get("default_path") or "").strip()
     if not lp_str:
         return
     try:
@@ -1444,6 +1457,308 @@ def _run_roi_ocr_probe_now(frame, fw, fh, indices: list[int]) -> tuple[bool, str
     st.session_state.roi_editor_df = None
     ok = _roi_ocr_all_ok()
     return ok, "OCR-Test ROI abgeschlossen." if ok else "OCR-Test ROI abgeschlossen; mindestens eine ROI ist noch nicht OK."
+
+
+def _run_video_ocr_full_now() -> tuple[bool, str, dict]:
+    """Run full OCR over the selected time range and persist into recordResult.ocr."""
+    indices = _roi_ocr_probe_indices()
+    if not indices:
+        st.session_state.roi_ocr_full_result = None
+        return False, "Keine OCR-ROIs vorhanden (nur track_minimap oder leer).", {}
+    tess_cmd = find_tesseract_cmd()
+    if not tess_cmd:
+        st.session_state.roi_ocr_full_result = None
+        return False, "Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD.", {}
+    if not _has_media_source():
+        st.session_state.roi_ocr_full_result = None
+        return False, "Kein Video/Framepack geladen.", {}
+
+    try:
+        start_s = float(st.session_state.get("t_start", 0.0) or 0.0)
+        end_s = float(st.session_state.get("t_end", 0.0) or 0.0)
+    except Exception:
+        start_s, end_s = 0.0, 0.0
+    if (not np.isfinite(start_s)) or (not np.isfinite(end_s)) or end_s <= start_s:
+        st.session_state.roi_ocr_full_result = None
+        return False, "Ungueltiges Start/Ende-Zeitfenster.", {}
+
+    src = str(st.session_state.get("media_source") or "none")
+    times: list[float] = []
+    if src == "framepack":
+        t0 = int(max(0, np.floor(start_s)))
+        t1 = int(max(t0, np.ceil(end_s)))
+        times = [float(t) for t in range(t0, t1 + 1)]
+    else:
+        fps = float(st.session_state.get("vid_fps", 1.0) or 1.0)
+        fps = max(1.0, fps)
+        step = 1.0 / fps
+        n = int(np.floor((end_s - start_s) / step)) + 1
+        if n > 120000:
+            st.session_state.roi_ocr_full_result = None
+            return False, f"OCR-Zeitfenster zu gross ({n} Frames). Bitte Zeitfenster verkuerzen.", {}
+        times = [float(start_s + i * step) for i in range(max(1, n))]
+
+    raw_rows: list[dict] = []
+    clean_rows: list[dict] = []
+    roi_stats: dict[str, dict] = {}
+    for _idx in indices:
+        nm = str(st.session_state.rois[_idx].get("name", f"roi_{_idx}") or f"roi_{_idx}")
+        roi_stats[nm] = {"ok": 0, "seen": 0}
+
+    for t_s in times:
+        frame = _get_media_frame(float(t_s))
+        if frame is None:
+            continue
+        fh, fw = frame.shape[:2]
+        raw_row = {"time_s": float(t_s)}
+        clean_row = {"time_s": float(t_s)}
+        for _idx in indices:
+            roi_cfg = {
+                **st.session_state.rois[_idx],
+                "max_scale": float(st.session_state.get("roi_global_scale", 1.2)),
+            }
+            nm = str(roi_cfg.get("name", f"roi_{_idx}") or f"roi_{_idx}")
+            probe = diagnose_roi_ocr(frame, roi_cfg, (int(fw), int(fh)), tmp_root=LOG_DIR / "ocr_tmp")
+            raw_row[nm] = str(probe.get("raw", "") or "")
+            clean_row[nm] = str(probe.get("value", "") or "") if bool(probe.get("ok")) else ""
+            roi_stats[nm]["seen"] += 1
+            if bool(probe.get("ok")):
+                roi_stats[nm]["ok"] += 1
+        raw_rows.append(raw_row)
+        clean_rows.append(clean_row)
+
+    for _idx in indices:
+        nm = str(st.session_state.rois[_idx].get("name", f"roi_{_idx}") or f"roi_{_idx}")
+        seen_n = int((roi_stats.get(nm) or {}).get("seen", 0))
+        ok_n = int((roi_stats.get(nm) or {}).get("ok", 0))
+        is_ok = bool(seen_n > 0 and ok_n > 0)
+        st.session_state.rois[_idx] = {
+            **st.session_state.rois[_idx],
+            "ocr_test_ok": is_ok,
+            "ocr_test_value": f"{ok_n}/{seen_n}",
+            "ocr_test_details": f"ok_frames={ok_n}; seen_frames={seen_n}",
+        }
+
+    rr_doc = _build_save_mat_struct(build_result_json(), no_roi=False, video_faulty=False).get("recordResult", {})
+    rr_doc = _mat_struct_to_plain(rr_doc)
+    if not isinstance(rr_doc, dict):
+        rr_doc = {}
+    ocr_doc = rr_doc.get("ocr", {}) if isinstance(rr_doc.get("ocr", {}), dict) else {}
+    ocr_doc["table"] = raw_rows
+    ocr_doc["cleaned"] = clean_rows
+    ocr_doc["created"] = datetime.now().isoformat(timespec="seconds")
+    rr_doc["ocr"] = ocr_doc
+
+    cf = _current_capture_folder() or str(st.session_state.get("capture_folder") or "")
+    safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(cf)).strip("._") or "output"
+    res_dir = _results_dir_key().strip("/")
+    mat_key = f"{res_dir}/results_{safe_cf}.mat" if res_dir else f"results_{safe_cf}.mat"
+    ok_save, msg_save, _mat_bytes, _json_bytes = _save_recordresult_fields_to_r2_mat(
+        replace_fields={"ocr": ocr_doc},
+        force=True,
+        target_key=mat_key,
+        allow_missing=True,
+        base_record_result=rr_doc,
+    )
+    if not ok_save:
+        st.session_state.roi_ocr_full_result = {"ok": False, "error": str(msg_save), "rows": int(len(clean_rows))}
+        return False, f"OCR-Auswertung abgeschlossen, Speichern fehlgeschlagen: {msg_save}", st.session_state.roi_ocr_full_result
+
+    out = {
+        "ok": True,
+        "rows": int(len(clean_rows)),
+        "raw_rows": int(len(raw_rows)),
+        "start_s": float(start_s),
+        "end_s": float(end_s),
+        "source": src,
+        "json_key": _r2_json_sidecar_key(mat_key),
+        "roi_stats": roi_stats,
+    }
+    st.session_state.roi_ocr_full_result = out
+    try:
+        _invalidate_and_update_mat_selection_for_capture(str(cf), mat_key)
+    except Exception:
+        pass
+
+
+def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tuple[bool, str, dict]:
+    """Run OCR frame-by-frame on the full local video (not framepack/lite)."""
+    indices = _roi_ocr_probe_indices()
+    if not indices:
+        st.session_state.video_ocr_full_result = None
+        return False, "Keine OCR-ROIs vorhanden (nur track_minimap oder leer).", {}
+    tess_cmd = find_tesseract_cmd()
+    if not tess_cmd:
+        st.session_state.video_ocr_full_result = None
+        return False, "Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD.", {}
+
+    capture_folder = _current_capture_folder() or str(st.session_state.get("capture_folder") or "").strip()
+    if not capture_folder:
+        st.session_state.video_ocr_full_result = None
+        return False, "Kein capture_folder aktiv. Bitte zuerst MAT/JSON laden.", {}
+    video_path = _find_local_fullfps_video(capture_folder)
+    if video_path is None or (not video_path.exists()):
+        st.session_state.video_ocr_full_result = None
+        return False, "Kein Vollvideo gefunden. Bitte zuerst das Originalvideo lokal laden/herunterladen.", {}
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        st.session_state.video_ocr_full_result = None
+        return False, f"Video konnte nicht geöffnet werden: {video_path.name}", {}
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if (not np.isfinite(fps)) or fps <= 0:
+        fps = max(1.0, float(st.session_state.get("vid_fps", 25.0) or 25.0))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if frame_count <= 0:
+        cap.release()
+        st.session_state.video_ocr_full_result = None
+        return False, f"Ungültige Frame-Anzahl: {video_path.name}", {}
+
+    raw_rows: list[dict] = []
+    clean_rows: list[dict] = []
+    roi_stats: dict[str, dict] = {}
+    for _idx in indices:
+        nm = str(st.session_state.rois[_idx].get("name", f"roi_{_idx}") or f"roi_{_idx}")
+        roi_stats[nm] = {"ok": 0, "seen": 0}
+
+    processed = 0
+    cancelled = False
+    try:
+        while True:
+            if callable(stop_cb):
+                try:
+                    if bool(stop_cb()):
+                        cancelled = True
+                        break
+                except Exception:
+                    pass
+            ok, frame_bgr = cap.read()
+            if (not ok) or frame_bgr is None:
+                break
+            t_s = float(processed) / float(max(1e-9, fps))
+            frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            fh, fw = frame.shape[:2]
+            raw_row = {"time_s": float(t_s), "frame_idx": int(processed)}
+            clean_row = {"time_s": float(t_s), "frame_idx": int(processed)}
+            for _idx in indices:
+                roi_cfg = {
+                    **st.session_state.rois[_idx],
+                    "max_scale": float(st.session_state.get("roi_global_scale", 1.2)),
+                }
+                nm = str(roi_cfg.get("name", f"roi_{_idx}") or f"roi_{_idx}")
+                probe = diagnose_roi_ocr(frame, roi_cfg, (int(fw), int(fh)), tmp_root=LOG_DIR / "ocr_tmp")
+                raw_row[nm] = str(probe.get("raw", "") or "")
+                clean_row[nm] = str(probe.get("value", "") or "") if bool(probe.get("ok")) else ""
+                roi_stats[nm]["seen"] += 1
+                if bool(probe.get("ok")):
+                    roi_stats[nm]["ok"] += 1
+            raw_rows.append(raw_row)
+            clean_rows.append(clean_row)
+            processed += 1
+            if callable(progress_cb) and (processed % 20 == 0 or processed == frame_count):
+                try:
+                    progress_cb(processed, frame_count, t_s)
+                except Exception:
+                    pass
+    finally:
+        cap.release()
+
+    for _idx in indices:
+        nm = str(st.session_state.rois[_idx].get("name", f"roi_{_idx}") or f"roi_{_idx}")
+        seen_n = int((roi_stats.get(nm) or {}).get("seen", 0))
+        ok_n = int((roi_stats.get(nm) or {}).get("ok", 0))
+        is_ok = bool(seen_n > 0 and ok_n > 0)
+        st.session_state.rois[_idx] = {
+            **st.session_state.rois[_idx],
+            "ocr_test_ok": is_ok,
+            "ocr_test_value": f"{ok_n}/{seen_n}",
+            "ocr_test_details": f"ok_frames={ok_n}; seen_frames={seen_n}",
+        }
+
+    rr_doc = _build_save_mat_struct(build_result_json(), no_roi=False, video_faulty=False).get("recordResult", {})
+    rr_doc = _mat_struct_to_plain(rr_doc)
+    if not isinstance(rr_doc, dict):
+        rr_doc = {}
+    ocr_doc = rr_doc.get("ocr", {}) if isinstance(rr_doc.get("ocr", {}), dict) else {}
+    ocr_doc["table"] = raw_rows
+    ocr_doc["cleaned"] = clean_rows
+    ocr_doc["created"] = datetime.now().isoformat(timespec="seconds")
+    ocr_doc["sample_rate_hz"] = float(max(1e-9, fps))
+    rr_doc["ocr"] = ocr_doc
+
+    cf = _current_capture_folder() or str(st.session_state.get("capture_folder") or "")
+    safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(cf)).strip("._") or "output"
+    res_dir = _results_dir_key().strip("/")
+    mat_key = f"{res_dir}/results_{safe_cf}.mat" if res_dir else f"results_{safe_cf}.mat"
+    ok_save, msg_save, _mat_bytes, _json_bytes = _save_recordresult_fields_to_r2_mat(
+        replace_fields={"ocr": ocr_doc},
+        force=True,
+        target_key=mat_key,
+        allow_missing=True,
+        base_record_result=rr_doc,
+    )
+    if not ok_save:
+        out_err = {"ok": False, "error": str(msg_save), "rows": int(len(clean_rows)), "frames_processed": int(processed)}
+        st.session_state.video_ocr_full_result = out_err
+        return False, f"OCR-Auswertung abgeschlossen, Speichern fehlgeschlagen: {msg_save}", out_err
+
+    out = {
+        "ok": True,
+        "rows": int(len(clean_rows)),
+        "raw_rows": int(len(raw_rows)),
+        "frames_processed": int(processed),
+        "frames_total": int(frame_count),
+        "fps": float(fps),
+        "source": "full_video",
+        "video_path": str(video_path),
+        "capture_folder": str(capture_folder),
+        "cancelled": bool(cancelled),
+        "json_key": _r2_json_sidecar_key(mat_key),
+        "roi_stats": roi_stats,
+    }
+    st.session_state.video_ocr_full_result = out
+    st.session_state.roi_ocr_full_result = out
+    try:
+        _invalidate_and_update_mat_selection_for_capture(str(cf), mat_key)
+    except Exception:
+        pass
+    msg = (
+        f"OCR vollstaendig ausgewertet (Full Video): {len(clean_rows)} Zeilen gespeichert."
+        if not cancelled
+        else f"OCR abgebrochen: {len(clean_rows)} Zeilen bis Abbruch gespeichert."
+    )
+    return True, msg, out
+
+
+def _sync_compressed_storage_binding():
+    """Bind compressed-storage client to selected backend (R2 or local)."""
+    mode = str(st.session_state.get("compressed_db_mode") or "local").strip().lower()
+    if mode == "local":
+        local_ok = bool(st.session_state.get("local_connected")) and st.session_state.get("local_client") is not None
+        if local_ok:
+            st.session_state.r2_connected = True
+            st.session_state.r2_client = st.session_state.local_client
+            try:
+                st.session_state.r2_prefix_options = list_root_prefixes(st.session_state.r2_client)
+            except Exception:
+                st.session_state.r2_prefix_options = [""]
+            if str(st.session_state.get("r2_prefix") or "") not in list(st.session_state.get("r2_prefix_options") or [""]):
+                st.session_state.r2_prefix = ""
+        else:
+            st.session_state.r2_connected = False
+            st.session_state.r2_client = None
+            st.session_state.r2_prefix_options = [""]
+            st.session_state.r2_prefix = ""
+        return
+
+    # mode == "r2"
+    if isinstance(st.session_state.get("r2_client"), LocalStorageAdapter):
+        st.session_state.r2_connected = False
+        st.session_state.r2_client = None
+        st.session_state.r2_prefix_options = [""]
+        st.session_state.r2_prefix = ""
+    return True, f"OCR vollstaendig ausgewertet: {len(clean_rows)} Zeilen gespeichert.", out
 
 
 def build_result_json():
@@ -1858,17 +2173,13 @@ def _save_result_json_and_mat(no_roi: bool = False, video_faulty: bool = False) 
     else:
         result = build_result_json()
     mat_struct_for_save = _build_save_mat_struct(result, no_roi=no_roi, video_faulty=video_faulty)
-    mat_name = f"results_{safe_cf}.mat"
     json_name = f"results_{safe_cf}.json"
     saved_targets = []
     saved_mat_key = ""
     if not (st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None):
         json_payload = _mat_export_to_jsonable(mat_struct_for_save)
         json_bytes = json.dumps(json_payload, indent=2, ensure_ascii=False, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
-        mat_buf = io.BytesIO()
-        sio.savemat(mat_buf, mat_struct_for_save, do_compression=True)
-        mat_bytes = mat_buf.getvalue()
-        payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=["R2 nicht verbunden: nicht gespeichert"], mat_key="")
+        payload = dict(json_name=json_name, mat_name="", json_bytes=json_bytes, mat_bytes=b"", targets=["R2 nicht verbunden: nicht gespeichert"], mat_key="")
         return False, "R2 nicht verbunden. ROI Setup wird ausschliesslich in R2 gespeichert.", payload
 
     # ROI Setup updates only recordResult.ocr plus metadata status/title fields.
@@ -1881,7 +2192,7 @@ def _save_result_json_and_mat(no_roi: bool = False, video_faulty: bool = False) 
         replace_fields["metadata"] = rr_for_save["metadata"]
 
     res_dir = _results_dir_key().strip("/")
-    mat_key = f"{res_dir}/{mat_name}" if res_dir else mat_name
+    mat_key = f"{res_dir}/results_{safe_cf}.mat" if res_dir else f"results_{safe_cf}.mat"
     ok_save, msg_save, mat_bytes, json_bytes = _save_recordresult_fields_to_r2_mat(
         replace_fields,
         force=True,
@@ -1895,14 +2206,14 @@ def _save_result_json_and_mat(no_roi: bool = False, video_faulty: bool = False) 
         _invalidate_and_update_mat_selection_for_capture(str(cf), saved_mat_key, no_roi=no_roi, video_faulty=video_faulty)
     else:
         saved_targets.append(f"R2 results fehlgeschlagen: {msg_save}")
-    payload = dict(json_name=json_name, mat_name=mat_name, json_bytes=json_bytes, mat_bytes=mat_bytes, targets=saved_targets, mat_key=saved_mat_key)
+    payload = dict(json_name=json_name, mat_name="", json_bytes=json_bytes, mat_bytes=b"", targets=saved_targets, mat_key=saved_mat_key)
     if video_faulty:
         msg_prefix = "Video fehlerhaft abgestempelt"
     elif no_roi:
         msg_prefix = "Kein ROI vorhanden abgestempelt"
     else:
         msg_prefix = "Gespeichert"
-    return True, f"{msg_prefix}: {json_name} + {mat_name}", payload
+    return True, f"{msg_prefix}: {json_name}", payload
 
 
 def load_json_config(data):
@@ -2136,18 +2447,25 @@ def _refresh_mat_files():
         cap_items = []
 
     mats = []
+    json_sidecars = []
     for name in res_items:
         if not name.endswith("/"):
             full_key = f"{res_key}/{name}" if res_key else name
             if full_key.lower().endswith(".mat"):
                 mats.append(full_key.strip("/"))
+            elif full_key.lower().endswith(".json") and Path(full_key).name.startswith("results_"):
+                json_sidecars.append(full_key.strip("/"))
     mats.sort(reverse=True)
-    st.session_state.mat_files = mats
+    json_sidecars.sort(reverse=True)
+    # MAT Selection is JSON-only: consider only results_*.json in results/.
+    all_keys = list(json_sidecars)
+    all_keys.sort(reverse=True)
+    st.session_state.mat_files = all_keys
 
     folders = sorted([n.rstrip("/") for n in cap_items if n.endswith("/")], reverse=True)
-    mats_set = set(mats)
+    mats_set = set(all_keys)
     mat_by_folder = {}
-    for mk in mats:
+    for mk in all_keys:
         g = _mat_capture_guess_from_key(mk)
         if g and g not in mat_by_folder:
             mat_by_folder[g] = mk
@@ -2155,20 +2473,23 @@ def _refresh_mat_files():
     targets = []
     used_mats = set()
     for folder in folders:
-        expected = f"{res_key}/results_{folder}.mat" if res_key else f"results_{folder}.mat"
-        mat_key = expected if expected in mats_set else mat_by_folder.get(folder, "")
+        expected_json = f"{res_key}/results_{folder}.json" if res_key else f"results_{folder}.json"
+        if expected_json in mats_set:
+            mat_key = expected_json
+        else:
+            mat_key = mat_by_folder.get(folder, "")
         if mat_key:
             used_mats.add(mat_key)
         targets.append({"kind": "folder", "folder": folder, "mat_key": mat_key})
 
-    for mk in mats:
+    for mk in all_keys:
         if mk not in used_mats:
             targets.append({"kind": "mat_only", "folder": _mat_capture_guess_from_key(mk), "mat_key": mk})
     st.session_state.mat_targets = targets
 
     # Invalidate summary cache when file set changes.
     cache = st.session_state.get("mat_summary_cache") or {}
-    st.session_state.mat_summary_cache = {k: v for k, v in cache.items() if k in mats}
+    st.session_state.mat_summary_cache = {k: v for k, v in cache.items() if k in all_keys}
     valid_mat_keys = [t.get("mat_key", "") for t in targets if t.get("mat_key")]
     # Keine implizite Auswahl des ersten Eintrags: MAT+Video laden erfordert
     # immer einen expliziten Klick in der aktuell sichtbaren Tabelle.
@@ -2184,8 +2505,9 @@ def _refresh_mat_files():
 
 def _mat_capture_guess_from_key(remote_key: str) -> str:
     filename = Path(remote_key).name
-    if filename.startswith("results_") and filename.lower().endswith(".mat"):
-        return filename[len("results_"):-4]
+    fl = filename.lower()
+    if filename.startswith("results_") and (fl.endswith(".mat") or fl.endswith(".json")):
+        return Path(filename).stem[len("results_"):]
     return ""
 
 
@@ -3730,9 +4052,17 @@ def _summary_from_json_sidecar(data: dict) -> tuple[dict, dict]:
     if not (start_s != start_s): record_summary["t_start"] = start_s
     if not (end_s != end_s):     record_summary["t_end"]   = end_s
 
+    def _table_row_count(tbl) -> int:
+        if isinstance(tbl, list):
+            return len(tbl)
+        if isinstance(tbl, dict):
+            lens = [len(v) for v in tbl.values() if isinstance(v, list)]
+            return max(lens) if lens else 0
+        return 0
+
     # ROI table
     roi_table = ocr.get("roi_table")
-    roi_rows = len(roi_table) if isinstance(roi_table, list) else 0
+    roi_rows = _table_row_count(roi_table)
     record_summary["roi_selected"] = bool((not record_summary["no_roi_available"]) and roi_rows > 0)
     record_summary["roi_count"] = roi_rows
 
@@ -3752,26 +4082,50 @@ def _summary_from_json_sidecar(data: dict) -> tuple[dict, dict]:
     # OCR done/complete
     raw  = ocr.get("table") or ocr.get("roi_table_raw")
     clean = ocr.get("cleaned")
-    raw_rows   = len(raw)   if isinstance(raw,   list) else 0
-    clean_rows = len(clean) if isinstance(clean, list) else 0
+    raw_rows = _table_row_count(raw)
+    clean_rows = _table_row_count(clean)
     record_summary["ocr_done"]      = bool(raw_rows > 0 or clean_rows > 0)
     record_summary["ocr_row_count"] = int(max(raw_rows, clean_rows))
     if record_summary["ocr_done"] and not (end_s != end_s):
         t_vals = []
-        for row in (raw or []):
-            try: t_vals.append(float(row.get("time_s") or row.get("t_s") or "nan"))
-            except Exception: pass
+        if isinstance(raw, list):
+            for row in (raw or []):
+                try:
+                    t_vals.append(float(row.get("time_s") or row.get("t_s") or "nan"))
+                except Exception:
+                    pass
+        elif isinstance(raw, dict):
+            t_col = raw.get("time_s")
+            if not isinstance(t_col, list):
+                t_col = raw.get("t_s")
+            if isinstance(t_col, list):
+                for v in t_col:
+                    try:
+                        t_vals.append(float(v))
+                    except Exception:
+                        pass
         record_summary["ocr_complete"] = bool(t_vals and max(t_vals) >= (end_s - 1.0))
     else:
         record_summary["ocr_complete"] = bool(record_summary["ocr_done"] and (end_s != end_s))
 
     # audio_rpm
     proc = arpm.get("processed") or {}
-    t_s  = proc.get("t_s") or []
-    record_summary["audio_spectrogram_done"] = bool(
-        (isinstance(t_s, list) and len(t_s) > 0)
-        or bool(arpm.get("params"))
-    )
+    proc_col = arpm.get("processed_col") or {}
+    audio_rows = 0
+    if isinstance(proc, dict):
+        t_s = proc.get("t_s") or proc.get("t_s_spec") or []
+        if isinstance(t_s, list):
+            audio_rows = max(audio_rows, len(t_s))
+        for v in proc.values():
+            if isinstance(v, list):
+                audio_rows = max(audio_rows, len(v))
+    elif isinstance(proc, list):
+        audio_rows = max(audio_rows, len(proc))
+    if isinstance(proc_col, dict):
+        for v in proc_col.values():
+            if isinstance(v, list):
+                audio_rows = max(audio_rows, len(v))
+    record_summary["audio_spectrogram_done"] = bool(audio_rows > 0 or bool(arpm.get("params")))
     record_summary["audio_config_done"] = bool(rr.get("audio_config"))
 
     # validation
@@ -3781,117 +4135,91 @@ def _summary_from_json_sidecar(data: dict) -> tuple[dict, dict]:
 
 
 def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
-    # â”€â”€ Fast path: try JSON sidecar first (much smaller than MAT) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    """Build MAT-selection summary from JSON sidecar only (no MAT read)."""
     try:
         json_key = _r2_json_sidecar_key(remote_key)
     except NameError:
         json_key = str(remote_key or "").replace("\\", "/").rsplit(".", 1)[0] + ".json"
-    _mat_keys: set = set()
-    record_summary: dict = {}
-    summary: dict = {}
-    used_json = False
-    json_sidecar_created = False
 
-    tmp_json = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+    summary: dict = {
+        "mat_file": Path(remote_key).name,
+        "remote_key": remote_key,
+        "error": "",
+        "json_sidecar_used": False,
+        "json_sidecar_created": False,
+        "json_sidecar_key": json_key,
+    }
+    record_summary: dict = {}
+    mat_keys: set = set()
+
+    tmp_json = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
     tmp_json.close()
     try:
-        ok_j, _ = client.download_file(json_key, tmp_json.name)
-        if ok_j:
+        ok_j, msg_j = client.download_file(json_key, tmp_json.name)
+        if not ok_j:
+            summary['error'] = f'JSON-Download: {msg_j}'
+        else:
             try:
-                json_data = json.loads(Path(tmp_json.name).read_text(encoding="utf-8", errors="ignore"))
-                # Nur vollstaendige recordResult-Sidecars als Fast-Path nutzen.
-                # Aeltere Audio-JSONs mit nur {"audio_rpm": ...} duerfen die MAT-Analyse nicht ueberspringen.
-                if isinstance(json_data.get("recordResult"), dict):
-                    record_summary, _mat_keys = _summary_from_json_sidecar(json_data)
-                    summary = {
-                        "mat_file": Path(remote_key).name,
-                        "remote_key": remote_key,
-                        "error": "",
-                        "json_sidecar_used": True,
-                        "json_sidecar_created": False,
-                        "json_sidecar_key": json_key,
-                    }
-                    used_json = True
-            except Exception:
-                pass
+                json_data = json.loads(Path(tmp_json.name).read_text(encoding='utf-8', errors='ignore'))
+            except Exception as e:
+                json_data = {}
+                summary['error'] = f'JSON-Parse: {e}'
+            if isinstance(json_data, dict) and isinstance(json_data.get('recordResult'), dict):
+                record_summary, mat_keys = _summary_from_json_sidecar(json_data)
+                summary['json_sidecar_used'] = True
+                summary['error'] = ''
+            elif not summary.get('error'):
+                summary['error'] = 'JSON enthaelt kein recordResult.'
     finally:
-        try: Path(tmp_json.name).unlink(missing_ok=True)
-        except Exception: pass
-
-    # â”€â”€ Slow path: download and parse MAT file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    _mat_json_bytes_for_sidecar: bytes | None = None  # generated during slow path, uploaded later
-    if not used_json:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat")
-        tmp.close()
-        ok, msg = client.download_file(remote_key, tmp.name)
-        if not ok:
-            return {"mat_file": Path(remote_key).name, "remote_key": remote_key, "error": f"Download: {msg}"}
         try:
-            summary = summarize_mat_file(tmp.name)
-            record_summary = _summarize_record_result_mat(tmp.name)
-            try:
-                mat_data_raw = sio.loadmat(tmp.name, squeeze_me=True, struct_as_record=False)
-                _mat_keys = set(mat_data_raw.keys())
-                # Build JSON sidecar bytes while we have the MAT in memory
-                try:
-                    _raw_mat_bytes = Path(tmp.name).read_bytes()
-                    _mat_json_bytes_for_sidecar = _mat_bytes_to_recordresult_json_bytes(_raw_mat_bytes)
-                except Exception:
-                    _mat_json_bytes_for_sidecar = None
-            except Exception:
-                _mat_keys = set()
-        except Exception as e:
-            summary = {"error": f"{e.__class__.__name__}: {e}"}
-            record_summary = _summarize_record_result_mat(tmp.name)
-        finally:
-            try: Path(tmp.name).unlink(missing_ok=True)
-            except Exception: pass
+            Path(tmp_json.name).unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _mat_has_any(keys):
-        lk = {str(k).lower() for k in _mat_keys}
+        lk = {str(k).lower() for k in mat_keys}
         return any(str(k).lower() in lk for k in keys)
 
     for k, v in record_summary.items():
         if v is not None:
             summary[k] = v
-    summary["no_roi_available"] = bool(summary.get("no_roi_available") or _mat_has_any(["no_roi_available"]))
-    summary["video_faulty"] = bool(summary.get("video_faulty") or _mat_has_any(["video_faulty"]))
-    if summary.get("no_roi_available"):
-        summary["roi_selected"] = False
-    elif "roi_selected" in record_summary:
-        summary["roi_selected"] = bool(record_summary.get("roi_selected"))
+    summary['no_roi_available'] = bool(summary.get('no_roi_available') or _mat_has_any(['no_roi_available']))
+    summary['video_faulty'] = bool(summary.get('video_faulty') or _mat_has_any(['video_faulty']))
+    if summary.get('no_roi_available'):
+        summary['roi_selected'] = False
+    elif 'roi_selected' in record_summary:
+        summary['roi_selected'] = bool(record_summary.get('roi_selected'))
     else:
-        summary["roi_selected"] = bool(summary.get("roi_selected") or _mat_has_any(["rois", "roi", "roi_table", "roitable"]))
-    # Track status follows OCRExtractor.m: only recordResult.ocr.trkCalSlim.roi counts.
-    summary["track_selected"] = bool((not summary.get("no_roi_available")) and summary.get("track_selected"))
-    summary["start_end_selected"] = bool(summary.get("start_end_selected") or _mat_has_any(["t_start", "t_end", "start_time", "end_time", "startend", "time_range"]))
-    summary["ocr_done"] = bool(summary.get("ocr_done") or _mat_has_any(["ocr_results", "ocr_values", "results_table"]))
-    summary["ocr_complete"] = bool(summary.get("ocr_complete") or (summary.get("ocr_done") and not _mat_has_any(["ocr_missing", "ocr_errors", "missing_values"])))
-    summary["audio_spectrogram_done"] = bool(summary.get("audio_spectrogram_done") or _mat_has_any(["spectrogram", "audio_spectrogram", "audioanalysis", "audio_analysis", "pxx", "audio_rpm"]))
-    summary["audio_config_done"] = bool(summary.get("audio_config_done") or _mat_has_any(["audio_config", "audioconfig"]))
-    summary["validation_done"] = bool(summary.get("validation_done") or _mat_has_any(["validation", "validated", "validierung", "validation_results"]))
+        summary['roi_selected'] = bool(summary.get('roi_selected') or _mat_has_any(['rois', 'roi', 'roi_table', 'roitable']))
+    summary['track_selected'] = bool((not summary.get('no_roi_available')) and summary.get('track_selected'))
+    summary['start_end_selected'] = bool(summary.get('start_end_selected') or _mat_has_any(['t_start', 't_end', 'start_time', 'end_time', 'startend', 'time_range']))
+    summary['ocr_done'] = bool(summary.get('ocr_done') or _mat_has_any(['ocr_results', 'ocr_values', 'results_table']))
+    summary['ocr_complete'] = bool(summary.get('ocr_complete') or (summary.get('ocr_done') and not _mat_has_any(['ocr_missing', 'ocr_errors', 'missing_values'])))
+    summary['audio_spectrogram_done'] = bool(summary.get('audio_spectrogram_done') or _mat_has_any(['spectrogram', 'audio_spectrogram', 'audioanalysis', 'audio_analysis', 'pxx', 'audio_rpm']))
+    summary['audio_config_done'] = bool(summary.get('audio_config_done') or _mat_has_any(['audio_config', 'audioconfig']))
+    summary['validation_done'] = bool(summary.get('validation_done') or _mat_has_any(['validation', 'validated', 'validierung', 'validation_results']))
 
-    summary["mat_file"] = Path(remote_key).name
-    summary["remote_key"] = remote_key
-    if not summary.get("capture_folder"):
-        summary["capture_folder"] = _mat_capture_guess_from_key(remote_key)
-    capture_folder = summary.get("capture_folder", "")
-    summary["video_file_exists"] = None
-    summary["audio_file_exists"] = None
+    summary['mat_file'] = Path(remote_key).name
+    summary['remote_key'] = remote_key
+    if not summary.get('capture_folder'):
+        summary['capture_folder'] = _mat_capture_guess_from_key(remote_key)
+    capture_folder = summary.get('capture_folder', '')
+    summary['video_file_exists'] = None
+    summary['audio_file_exists'] = None
 
     if capture_folder:
         cap_dir = f"{prefix}/captures/{capture_folder}" if prefix else f"captures/{capture_folder}"
         ok_list, items = client.list_files(cap_dir)
         if ok_list and isinstance(items, list):
-            files = [n for n in items if not n.endswith("/")]
+            files = [n for n in items if not n.endswith('/')]
             lower_files = [n.lower() for n in files]
             has_full_or_proxy_video = any(
-                n.endswith((".mp4", ".mov", ".avi", ".mkv")) for n in lower_files
+                n.endswith(('.mp4', '.mov', '.avi', '.mkv')) for n in lower_files
             )
             has_audio_file = any(
-                n.endswith((".wav", ".mp3", ".m4a", ".aac", ".flac")) for n in lower_files
+                n.endswith(('.wav', '.mp3', '.m4a', '.aac', '.flac')) for n in lower_files
             )
-            has_framepack = "frames_1fps/" in items
+            has_framepack = 'frames_1fps/' in items
             framepack_count = 0
             framepack_expected = 0
             framepack_complete = False
@@ -3899,16 +4227,16 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
                 ok_fp, fp_items = client.list_files(f"{cap_dir}/frames_1fps")
                 if ok_fp and isinstance(fp_items, list):
                     framepack_count = len([
-                        x for x in fp_items if str(x).lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+                        x for x in fp_items if str(x).lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
                     ])
-                    if "index.json" in fp_items:
-                        tmp_idx = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+                    if 'index.json' in fp_items:
+                        tmp_idx = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
                         tmp_idx.close()
                         ok_idx, _ = client.download_file(f"{cap_dir}/frames_1fps/index.json", tmp_idx.name)
                         if ok_idx:
                             try:
-                                payload = json.loads(Path(tmp_idx.name).read_text(encoding="utf-8", errors="ignore"))
-                                framepack_expected = int(payload.get("frame_count", 0) or 0)
+                                payload = json.loads(Path(tmp_idx.name).read_text(encoding='utf-8', errors='ignore'))
+                                framepack_expected = int(payload.get('frame_count', 0) or 0)
                             except Exception:
                                 framepack_expected = 0
                         try:
@@ -3919,62 +4247,32 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
                         framepack_expected <= 0 or framepack_count >= framepack_expected
                     )
             has_audio_proxy = any(n == AUDIO_PROXY_NAME.lower() for n in lower_files)
-            summary["framepack_count"] = int(framepack_count)
-            summary["framepack_expected"] = int(framepack_expected)
-            summary["framepack_complete"] = bool(framepack_complete)
-            summary["audio_proxy_present"] = bool(has_audio_proxy)
-            summary["video_file_exists"] = bool(has_full_or_proxy_video or framepack_complete)
-            summary["audio_file_exists"] = bool(has_audio_file or has_audio_proxy)
+            summary['framepack_count'] = int(framepack_count)
+            summary['framepack_expected'] = int(framepack_expected)
+            summary['framepack_complete'] = bool(framepack_complete)
+            summary['audio_proxy_present'] = bool(has_audio_proxy)
+            summary['video_file_exists'] = bool(has_full_or_proxy_video or framepack_complete)
+            summary['audio_file_exists'] = bool(has_audio_file or has_audio_proxy)
             if not framepack_complete and has_framepack:
-                summary["media_detail"] = f"Frames unvollstaendig ({framepack_count}/{framepack_expected or '?'})."
+                summary['media_detail'] = f"Frames unvollstaendig ({framepack_count}/{framepack_expected or '?' })."
             elif not has_framepack:
-                summary["media_detail"] = "Frames fehlen."
-            elif not summary["audio_file_exists"]:
-                summary["media_detail"] = "Audio fehlt."
+                summary['media_detail'] = 'Frames fehlen.'
+            elif not summary['audio_file_exists']:
+                summary['media_detail'] = 'Audio fehlt.'
             else:
-                summary["media_detail"] = ""
+                summary['media_detail'] = ''
         else:
-            summary["media_detail"] = "Capture-Ordner nicht lesbar."
+            summary['media_detail'] = 'Capture-Ordner nicht lesbar.'
     else:
-        summary["media_detail"] = ""
+        summary['media_detail'] = ''
 
-    # Auto-convert MAT â†’ JSON sidecar whenever the slow path was used and JSON bytes
-    # were successfully generated.  No content conditions â€” every MAT without a sidecar
-    # gets one so the fast path is available on the next scan.
-    if not used_json and _mat_json_bytes_for_sidecar is not None:
-        try:
-            _sidecar_key = _r2_json_sidecar_key(remote_key)
-        except NameError:
-            _sidecar_key = str(remote_key or "").replace("\\", "/").rsplit(".", 1)[0] + ".json"
-        _tmp_sj = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-        try:
-            _tmp_sj.write(_mat_json_bytes_for_sidecar)
-            _tmp_sj.close()
-            try:
-                if hasattr(client, "upload_bytes"):
-                    ok_upload, _msg_upload = client.upload_bytes(
-                        _mat_json_bytes_for_sidecar,
-                        _sidecar_key,
-                        content_type="application/json",
-                    )
-                else:
-                    ok_upload, _msg_upload = client.upload_file(_tmp_sj.name, _sidecar_key)
-                json_sidecar_created = bool(ok_upload)
-            except Exception:
-                json_sidecar_created = False
-        finally:
-            try: Path(_tmp_sj.name).unlink(missing_ok=True)
-            except Exception: pass
-
-    summary["json_sidecar_used"] = bool(used_json)
-    summary["json_sidecar_created"] = bool(json_sidecar_created)
+    summary['json_sidecar_created'] = False
     try:
-        summary["json_sidecar_key"] = _r2_json_sidecar_key(remote_key)
+        summary['json_sidecar_key'] = _r2_json_sidecar_key(remote_key)
     except NameError:
-        summary["json_sidecar_key"] = str(remote_key or "").replace("\\", "/").rsplit(".", 1)[0] + ".json"
+        summary['json_sidecar_key'] = str(remote_key or '').replace('\\', '/').rsplit('.', 1)[0] + '.json'
 
     return summary
-
 
 def _compute_folder_only_summary(folder: str, client, prefix: str) -> dict:
     summary = {
@@ -4065,7 +4363,7 @@ def _get_mat_summary_from_r2(remote_key: str):
 def _analyze_mat_from_r2(remote_key: str):
     summary = _get_mat_summary_from_r2(remote_key)
     if summary.get("error"):
-        set_status(f"MAT-Analysefehler: {summary['error']}", "warn")
+        set_status(f"JSON-Analysefehler: {summary['error']}", "warn")
     st.session_state.mat_selected_summary = summary
 
 
@@ -4558,12 +4856,90 @@ def _update_all_mat_overview_rows(remote_keys: list[str], live_table=None, progr
 
 
 def _try_load_video_for_capture_folder(capture_folder: str) -> bool:
-    if not capture_folder:
+    return _try_load_video_for_capture_folder_with_fallback(capture_folder, None)
+
+
+def _capture_folder_from_path_hint(path_hint) -> str:
+    txt = str(path_hint or "").strip().replace("\\", "/")
+    if not txt:
+        return ""
+    parts = [p for p in txt.split("/") if p not in ("", ".", "..")]
+    if not parts:
+        return ""
+    low = [p.lower() for p in parts]
+    if "captures" in low:
+        i = low.index("captures")
+        if i + 1 < len(parts):
+            return str(parts[i + 1]).strip()
+    return str(parts[-1]).strip()
+
+
+def _capture_folder_candidates_from_json_doc(capture_folder: str, json_doc: dict | None) -> list[str]:
+    cands: list[str] = []
+
+    def _add(v):
+        txt = str(v or "").strip().strip("/\\")
+        if not txt:
+            return
+        if txt not in cands:
+            cands.append(txt)
+
+    _add(capture_folder)
+    rr = (json_doc or {}).get("recordResult") if isinstance(json_doc, dict) else {}
+    rr = rr if isinstance(rr, dict) else {}
+    meta = rr.get("metadata") if isinstance(rr.get("metadata"), dict) else {}
+    for k in ("outdir", "video", "audio", "capture_folder"):
+        _add(_capture_folder_from_path_hint((meta or {}).get(k)))
+    for k in ("video", "audio", "outdir", "capture_folder"):
+        _add(_capture_folder_from_path_hint(rr.get(k)))
+    return cands
+
+
+def _load_full_video_from_r2(capture_folder: str) -> bool:
+    if not capture_folder or st.session_state.get("r2_client") is None:
         return False
-    if st.session_state.r2_client is None:
+    pfx = str(st.session_state.get("r2_prefix") or "").strip("/")
+    cap_dir = f"{pfx}/captures/{capture_folder}" if pfx else f"captures/{capture_folder}"
+    ok, items = st.session_state.r2_client.list_files(cap_dir)
+    if not ok or not isinstance(items, list):
         return False
-    # Cloud workflow: always use reduced frame-pack.
-    return _load_framepack_from_r2(capture_folder)
+    files = [str(n) for n in items if isinstance(n, str) and not str(n).endswith("/")]
+    vids = [n for n in files if str(n).lower().endswith(VIDEO_EXTS) and "_1fps" not in str(n).lower()]
+    if not vids:
+        return False
+    prio = {".avi": 0, ".mp4": 1, ".mov": 2, ".mkv": 3}
+    vids = sorted(vids, key=lambda n: (prio.get(Path(n).suffix.lower(), 9), n.lower()))
+    key = f"{cap_dir}/{vids[0]}"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(vids[0]).suffix or ".mp4")
+    tmp.close()
+    ok_dl, msg_dl = st.session_state.r2_client.download_file(key, tmp.name)
+    if not ok_dl:
+        set_status(f"Video-Download: {msg_dl}", "warn")
+        return False
+    _apply_video(tmp.name, Path(vids[0]).name)
+    return True
+
+
+def _try_load_video_for_capture_folder_with_fallback(capture_folder: str, json_doc: dict | None = None) -> bool:
+    cands = _capture_folder_candidates_from_json_doc(capture_folder, json_doc)
+    if not cands:
+        return False
+    for folder in cands:
+        if st.session_state.get("r2_client") is not None and _load_framepack_from_r2(folder):
+            st.session_state.capture_folder = folder
+            st.session_state["_mat_last_video_capture_folder"] = folder
+            return True
+        local_video = _find_local_fullfps_video(folder)
+        if local_video is not None and local_video.exists():
+            _apply_video(str(local_video), local_video.name)
+            st.session_state.capture_folder = folder
+            st.session_state["_mat_last_video_capture_folder"] = folder
+            return True
+        if st.session_state.get("r2_client") is not None and _load_full_video_from_r2(folder):
+            st.session_state.capture_folder = folder
+            st.session_state["_mat_last_video_capture_folder"] = folder
+            return True
+    return False
 
 
 def _overview_status_is_green(value) -> bool:
@@ -4721,7 +5097,7 @@ def _load_next_roi_setup_file() -> tuple[bool, str]:
     folder = str(nxt.get("folder") or "")
     if not _try_load_video_for_capture_folder(folder):
         return False, f"Reduzierte Datei konnte nicht geladen werden: {folder}"
-    st.session_state.capture_folder = folder
+    st.session_state.capture_folder = str(st.session_state.get("_mat_last_video_capture_folder") or folder)
     key = str(nxt.get("remote_key") or "")
     if key:
         st.session_state.mat_selected_key = key
@@ -4756,22 +5132,129 @@ def _load_json_from_r2(remote_key):
         except Exception as e: set_status(f"JSON-Parse: {e}", "warn")
     else: set_status(f"JSON-Download: {msg}", "warn")
 
-def _load_mat_from_r2(remote_key):
+def _recordresult_json_to_cfg(doc: dict, vid_duration: float = 0.0) -> dict:
+    """Convert results-sidecar JSON (recordResult-based) to UI config."""
+    rr = (doc or {}).get("recordResult") if isinstance(doc, dict) else {}
+    if not isinstance(rr, dict):
+        return {"rois": [], "t_start": 0.0, "t_end": float(vid_duration)}
+    ocr = rr.get("ocr") or {}
+    if not isinstance(ocr, dict):
+        ocr = {}
+    params = ocr.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    def _to_float(v, default):
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    out = {"rois": [], "t_start": float(0.0), "t_end": float(vid_duration)}
+    out["t_start"] = _to_float(
+        params.get("start_s", params.get("t_start", params.get("start_time", 0.0))),
+        0.0,
+    )
+    out["t_end"] = _to_float(
+        params.get("end_s", params.get("t_end", params.get("end_time", vid_duration))),
+        vid_duration,
+    )
+    def _table_rows(tbl) -> list[dict]:
+        if isinstance(tbl, list):
+            return [r for r in tbl if isinstance(r, dict)]
+        if isinstance(tbl, dict):
+            cols = {str(k): v for k, v in tbl.items() if isinstance(v, list)}
+            if not cols:
+                return []
+            n = max(len(v) for v in cols.values())
+            rows = []
+            for i in range(n):
+                row = {}
+                for k, vv in cols.items():
+                    row[k] = vv[i] if i < len(vv) else None
+                rows.append(row)
+            return rows
+        return []
+
+    roi_table = ocr.get("roi_table")
+    for row in _table_rows(roi_table):
+        if not isinstance(row, dict):
+            continue
+        rv = _parse_roi_value(row.get("roi"))
+        rv = list(rv or [])
+        if len(rv) < 4:
+            continue
+        out["rois"].append(
+            {
+                "name": str(row.get("name_roi") or row.get("name") or "_"),
+                "x": float(rv[0]),
+                "y": float(rv[1]),
+                "w": float(rv[2]),
+                "h": float(rv[3]),
+                "fmt": str(row.get("fmt") or "any"),
+                "pattern": str(row.get("pattern") or ""),
+                "max_scale": float(row.get("max_scale", 1.2) or 1.2),
+            }
+        )
+    trk = ocr.get("trkCalSlim") or {}
+    if isinstance(trk, dict):
+        ref_pts = trk.get("ref_pts")
+        if not isinstance(ref_pts, list):
+            ref_pts = _pts_from_mat_value(trk.get("ptsRef"))
+        if isinstance(ref_pts, list) and ref_pts:
+            out["ref_track_pts"] = ref_pts
+        mini_pts = trk.get("minimap_pts")
+        if not isinstance(mini_pts, list):
+            mini_pts = _pts_from_mat_value(trk.get("ptsMini"))
+        if isinstance(mini_pts, list) and mini_pts:
+            out["minimap_pts"] = mini_pts
+        if isinstance(trk.get("moving_pt_color_range"), dict):
+            out["moving_pt_color_range"] = trk.get("moving_pt_color_range")
+        else:
+            cr = _marker_to_color_range(trk.get("marker"))
+            if isinstance(cr, dict) and cr:
+                out["moving_pt_color_range"] = cr
+        track_roi = _parse_roi_value(trk.get("roi"))
+        if track_roi:
+            out["track_roi"] = track_roi
+    ac = rr.get("audio_config")
+    if isinstance(ac, dict) and ac:
+        out["audio_config"] = ac
+    else:
+        arpm = rr.get("audio_rpm") if isinstance(rr.get("audio_rpm"), dict) else {}
+        ap = arpm.get("params") if isinstance(arpm.get("params"), dict) else {}
+        if ap:
+            mapped = {
+                "nfft": ap.get("nfft"),
+                "overlap_pct": ap.get("overlap_pct", ap.get("ovPerc")),
+                "fmax": ap.get("fmax"),
+                "order": ap.get("order"),
+                "r_dyn_m": ap.get("r_dyn"),
+                "tol_pct": ap.get("tol_pct"),
+                "axle_ratio": ap.get("i_axle"),
+                "gear_ratios": ap.get("gears"),
+                "prefer_low": ap.get("prefer_low"),
+                "use_ocr_v": ap.get("use_v"),
+            }
+            audio_offset = params.get("audio_offset_s")
+            if audio_offset is not None:
+                mapped["audio_offset_s"] = audio_offset
+            out["audio_config"] = {k: v for k, v in mapped.items() if v is not None}
+    return out
+
+
+def _load_mat_from_r2(remote_key, preloaded_doc: dict | None = None):
+    """JSON-only loader for MAT-selection entries (no MAT read)."""
     _reset_track_analysis_state()
-    client = st.session_state.r2_client
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mat"); tmp.close()
-    ok, msg = client.download_file(remote_key, tmp.name)
-    if not ok: set_status(f"MAT-Download: {msg}", "warn"); return None
+    doc = preloaded_doc if isinstance(preloaded_doc, dict) else _r2_download_json_doc(_r2_json_sidecar_key(remote_key))
+    if not isinstance(doc, dict) or not isinstance(doc.get("recordResult"), dict):
+        set_status("JSON-Sidecar fehlt oder ist ungueltig (recordResult).", "warn")
+        return None
     try:
-        cfg = config_from_mat_file(tmp.name, vid_duration=st.session_state.vid_duration)
+        cfg = _recordresult_json_to_cfg(doc, vid_duration=st.session_state.vid_duration)
         st.session_state.t_start = cfg.get("t_start", st.session_state.t_start)
         st.session_state.t_end = cfg.get("t_end", st.session_state.t_end)
         st.session_state.t_current = float(st.session_state.t_start)
-        direct_rois = _extract_rois_from_recordresult_mat(tmp.name)
-        use_rois = direct_rois or cfg.get("rois", st.session_state.rois)
-        if not direct_rois:
-            use_rois = _apply_roi_format_map(use_rois, _extract_roi_format_map_from_recordresult_hdf5(tmp.name))
-        st.session_state.rois = _sanitize_rois(use_rois)
+        st.session_state.rois = _sanitize_rois(cfg.get("rois", st.session_state.rois))
         st.session_state.selected_roi = None
         st.session_state.roi_draw_armed = False
         st.session_state.drag_roi = {}
@@ -4783,38 +5266,57 @@ def _load_mat_from_r2(remote_key):
             st.session_state.ref_track_pts = cfg["ref_track_pts"]
         if cfg.get("minimap_pts"):
             st.session_state.minimap_pts = cfg["minimap_pts"]
-        try:
-            _audio_title_summary = _summarize_record_result_mat(tmp.name)
-            for _title_key in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
-                _title_txt = str(_audio_title_summary.get(_title_key, "") or "").strip()
-                if _title_txt:
-                    st.session_state["audio_vehicle_title"] = _title_txt
-                    if isinstance(st.session_state.get("mat_selected_summary"), dict):
-                        st.session_state.mat_selected_summary[_title_key] = _title_txt
-                    break
-        except Exception:
-            pass
-        track_cfg = _extract_track_cal_from_recordresult_mat(tmp.name)
-        if track_cfg.get("track_roi"):
-            _upsert_track_minimap_roi_from_mat(track_cfg["track_roi"])
-        if track_cfg.get("minimap_pts"):
-            st.session_state.minimap_pts = track_cfg["minimap_pts"]
-            st.session_state.minimap_next_pt_idx = len(track_cfg["minimap_pts"])
-        if track_cfg.get("moving_pt_color_range"):
-            st.session_state.moving_pt_color_range = track_cfg["moving_pt_color_range"]
-        _track_name = _extract_track_name_from_recordresult_mat(tmp.name)
+            st.session_state.minimap_next_pt_idx = len(st.session_state.minimap_pts or [])
+        if cfg.get("moving_pt_color_range"):
+            st.session_state.moving_pt_color_range = cfg["moving_pt_color_range"]
+        if cfg.get("track_roi"):
+            _upsert_track_minimap_roi_from_mat(cfg["track_roi"])
+        rr = doc.get("recordResult") or {}
+        meta = rr.get("metadata") or {}
+        ocr = rr.get("ocr") or {}
+        trk = ocr.get("trkCalSlim") if isinstance(ocr, dict) else {}
+        for _title_key in ("video_title", "youtube_title", "title", "vehicle_title", "name"):
+            _title_txt = str(meta.get(_title_key, "") or "").strip() if isinstance(meta, dict) else ""
+            if _title_txt:
+                st.session_state["audio_vehicle_title"] = _title_txt
+                if isinstance(st.session_state.get("mat_selected_summary"), dict):
+                    st.session_state.mat_selected_summary[_title_key] = _title_txt
+                break
+        if isinstance(trk, dict):
+            track_roi = _parse_roi_value(trk.get("roi"))
+            if track_roi:
+                _upsert_track_minimap_roi_from_mat(track_roi)
+            mini_pts = trk.get("minimap_pts")
+            if not isinstance(mini_pts, list):
+                mini_pts = _pts_from_mat_value(trk.get("ptsMini"))
+            if isinstance(mini_pts, list) and mini_pts:
+                st.session_state.minimap_pts = mini_pts
+                st.session_state.minimap_next_pt_idx = len(st.session_state.minimap_pts or [])
+            mcr = trk.get("moving_pt_color_range") if isinstance(trk.get("moving_pt_color_range"), dict) else _marker_to_color_range(trk.get("marker"))
+            if isinstance(mcr, dict) and mcr:
+                st.session_state.moving_pt_color_range = mcr
+        _track_name = ""
+        if isinstance(ocr, dict):
+            trk_name = ocr.get("track")
+            if isinstance(trk_name, dict):
+                for field in ("name", "track_name", "label", "track"):
+                    txt = str(trk_name.get(field, "") or "").strip()
+                    if txt:
+                        _track_name = txt
+                        break
         if _track_name:
             st.session_state["loaded_track_name"] = _track_name
             _try_auto_load_reference_track_for_name(_track_name)
         try:
-            _ac_dict = _extract_audio_config_from_mat(tmp.name)
+            _ac_dict = cfg.get("audio_config") if isinstance(cfg.get("audio_config"), dict) else {}
             if _ac_dict:
                 _apply_audio_config_to_widgets(_ac_dict)
         except Exception:
             pass
-        set_status("MAT geladen OK","ok")
-        return tmp.name
-    except Exception as e: set_status(f"MAT-Parse: {e}","warn")
+        set_status("JSON geladen OK", "ok")
+        return ""
+    except Exception as e:
+        set_status(f"JSON-Parse: {e}", "warn")
     return None
 
 def _apply_centerline_to_session(mat_path: str, mat_name: str) -> None:
@@ -6093,8 +6595,12 @@ def _mat_bytes_to_recordresult_json_bytes(raw_mat_bytes: bytes) -> bytes | None:
         rr, _extra = rr_from_mat_bytes(raw_mat_bytes)
         if not isinstance(rr, dict) or not rr:
             return None
-        _fix_mcos_roi_table_v5(rr, raw_mat_bytes)
-        _fix_roi_table_in_rr(rr)
+        _fix_mcos = globals().get("_fix_mcos_roi_table_v5")
+        if callable(_fix_mcos):
+            _fix_mcos(rr, raw_mat_bytes)
+        _fix_roi = globals().get("_fix_roi_table_in_rr")
+        if callable(_fix_roi):
+            _fix_roi(rr)
         payload = {"recordResult": _mat_export_to_jsonable(rr)}
         payload = _normalize_sidecar_json_payload(payload)
         return json.dumps(
@@ -6116,6 +6622,90 @@ def _normalize_sidecar_json_payload(obj):
     expectations, so they are converted to stable JSON primitives.
     """
     if isinstance(obj, dict):
+        def _is_missing(v) -> bool:
+            if v is None:
+                return True
+            if isinstance(v, str) and (not v.strip()):
+                return True
+            if isinstance(v, float):
+                try:
+                    return bool(np.isnan(v) or np.isinf(v))
+                except Exception:
+                    return False
+            return False
+
+        def _to_float(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        def _build_columnar_from_row_list(rows: list[dict]) -> dict:
+            rows = [r for r in (rows or []) if isinstance(r, dict)]
+            if not rows:
+                return {}
+            col_names: list[str] = []
+            for r in rows:
+                for k in r.keys():
+                    name = str(k)
+                    if name not in col_names:
+                        col_names.append(name)
+            out = {}
+            for name in col_names:
+                vals = [r.get(name, None) for r in rows]
+                non_missing = [v for v in vals if not _is_missing(v)]
+                is_num = bool(non_missing) and all(_to_float(v) is not None for v in non_missing)
+                if is_num:
+                    out[name] = [(_to_float(v) if not _is_missing(v) else float("nan")) for v in vals]
+                else:
+                    out[name] = [(None if _is_missing(v) else _mat_export_to_jsonable(v)) for v in vals]
+            return out
+
+        def _build_columnar_from_col_dict(proc_dict: dict) -> dict:
+            if not isinstance(proc_dict, dict):
+                return {}
+            keys = [str(k) for k in proc_dict.keys()]
+            if not keys:
+                return {}
+            max_len = 0
+            as_lists: dict[str, list] = {}
+            for k in keys:
+                v = proc_dict.get(k, None)
+                if isinstance(v, list):
+                    arr = list(v)
+                else:
+                    arr = [v]
+                as_lists[k] = arr
+                max_len = max(max_len, len(arr))
+            out = {}
+            for k, arr in as_lists.items():
+                vals = list(arr) + [None] * max(0, max_len - len(arr))
+                non_missing = [v for v in vals if not _is_missing(v)]
+                is_num = bool(non_missing) and all(_to_float(v) is not None for v in non_missing)
+                if is_num:
+                    out[k] = [(_to_float(v) if not _is_missing(v) else float("nan")) for v in vals]
+                else:
+                    out[k] = [(None if _is_missing(v) else _mat_export_to_jsonable(v)) for v in vals]
+            return out
+
+        def _is_row_table_list(v) -> bool:
+            return isinstance(v, list) and len(v) > 0 and all(isinstance(x, dict) for x in v)
+
+        def _normalize_table_like_fields(d: dict) -> dict:
+            if not isinstance(d, dict):
+                return d
+            out_d = {}
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    out_d[k] = _normalize_table_like_fields(v)
+                    continue
+                if _is_row_table_list(v):
+                    col = _build_columnar_from_row_list(v)
+                    out_d[k] = _normalize_sidecar_json_payload(col)
+                    continue
+                out_d[k] = v
+            return out_d
+
         keys = set(obj.keys())
         if {"s0", "s1", "s2", "arr"}.issubset(keys) and str(obj.get("s1", "")).upper() == "MCOS":
             kind = str(obj.get("s2", "")).strip().lower()
@@ -6124,7 +6714,27 @@ def _normalize_sidecar_json_payload(obj):
             if kind in ("string", "datetime", "duration", "categorical"):
                 return ""
             return None
-        return {str(k): _normalize_sidecar_json_payload(v) for k, v in obj.items()}
+        out = {str(k): _normalize_sidecar_json_payload(v) for k, v in obj.items()}
+        out = _normalize_table_like_fields(out)
+        rr = out.get("recordResult")
+        if isinstance(rr, dict):
+            arpm = rr.get("audio_rpm")
+            if isinstance(arpm, dict):
+                proc = arpm.get("processed")
+                proc_col = arpm.get("processed_col")
+                if not isinstance(proc_col, dict) or not proc_col:
+                    built = {}
+                    if isinstance(proc, list):
+                        built = _build_columnar_from_row_list(proc)
+                    elif isinstance(proc, dict):
+                        built = _build_columnar_from_col_dict(proc)
+                    if built:
+                        built_n = _normalize_sidecar_json_payload(built)
+                        arpm["processed"] = built_n
+                        arpm["processed_col"] = built_n
+                        rr["audio_rpm"] = arpm
+                        out["recordResult"] = rr
+        return out
     if isinstance(obj, list):
         return [_normalize_sidecar_json_payload(v) for v in obj]
     if isinstance(obj, float):
@@ -6213,17 +6823,14 @@ def _build_json_sidecar_bytes_preserving_fields(
 
 
 def _r2_upload_mat_json(selected_key: str, mat_bytes: bytes, json_bytes: bytes) -> tuple[bool, str]:
-    """Upload MAT + JSON sidecar to R2. Returns (ok, error_msg)."""
+    """Upload JSON sidecar to R2 (JSON-only mode)."""
     client = st.session_state.get("r2_client")
     if not st.session_state.get("r2_connected") or client is None:
         return False, "Cloud (R2) nicht verbunden. Speichern nur in R2 moeglich."
-    ok_mat, msg_mat = _upload_bytes_compat(client, selected_key, mat_bytes, "application/octet-stream")
-    if not ok_mat:
-        return False, f"MAT-Upload fehlgeschlagen: {msg_mat}"
     json_key = _r2_json_sidecar_key(selected_key)
     ok_json, msg_json = _upload_bytes_compat(client, json_key, json_bytes, "application/json")
     if not ok_json:
-        return False, f"MAT gespeichert, JSON-Upload fehlgeschlagen: {msg_json}"
+        return False, f"JSON-Upload fehlgeschlagen: {msg_json}"
     try:
         st.session_state.mat_summary_cache.pop(selected_key, None)
     except Exception:
@@ -6238,8 +6845,7 @@ def _save_recordresult_fields_to_r2_mat(
     allow_missing: bool = False,
     base_record_result: dict | None = None,
 ) -> tuple[bool, str, bytes, bytes]:
-    """Update selected recordResult fields in R2 while preserving all others."""
-    from core.save_helpers import build_merged_mat_json_fields, rr_from_mat_bytes
+    """Update selected recordResult fields in R2 JSON sidecar while preserving others."""
 
     selected_key = str(target_key or st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or "").strip()
     if not selected_key:
@@ -6247,46 +6853,43 @@ def _save_recordresult_fields_to_r2_mat(
     if not st.session_state.get("r2_connected"):
         return False, "Cloud (R2) nicht verbunden. Speichern ist nur in R2 moeglich.", b"", b""
 
-    existing_bytes, dl_err = _r2_download_mat_bytes(selected_key)
-    if dl_err:
-        if allow_missing:
-            existing_bytes = b""
-        else:
-            return False, dl_err, b"", b""
-
     json_key = _r2_json_sidecar_key(selected_key)
     existing_json_doc = _r2_download_json_doc(json_key)
     existing_json_rr = existing_json_doc.get("recordResult") if isinstance(existing_json_doc, dict) else {}
     if not isinstance(existing_json_rr, dict):
         existing_json_rr = {}
+    if (not existing_json_rr) and (not allow_missing):
+        return False, "JSON-Sidecar fehlt oder ist leer.", b"", b""
     if isinstance(base_record_result, dict) and base_record_result:
         _deep_merge_missing_json(existing_json_rr, base_record_result)
 
-    existing_rr, _ = rr_from_mat_bytes(existing_bytes)
     if not force:
         for field_name in dict(replace_fields or {}):
-            if existing_rr.get(field_name) is not None or existing_json_rr.get(field_name) is not None:
+            if existing_json_rr.get(field_name) is not None:
                 return False, _SAVE_NEEDS_CONFIRM, b"", b""
 
     merged_extra = None
     if extra_rr_fields:
         merged_extra = {}
         for k, v in extra_rr_fields.items():
-            if existing_rr.get(k) is None and existing_json_rr.get(k) is None:
+            if existing_json_rr.get(k) is None:
                 merged_extra[k] = v
 
-    mat_bytes, generated_json_bytes = build_merged_mat_json_fields(
-        existing_bytes,
-        dict(replace_fields or {}),
-        extra_rr_fields=merged_extra,
-        base_record_result=existing_json_rr,
-    )
-    json_bytes = _build_json_sidecar_bytes_preserving_fields(
-        existing_json_doc,
-        dict(replace_fields or {}),
-        extra_rr_fields=merged_extra,
-        fallback_json_bytes=generated_json_bytes,
-    )
+    doc = existing_json_doc if isinstance(existing_json_doc, dict) else {}
+    rr = doc.get("recordResult") if isinstance(doc.get("recordResult"), dict) else {}
+    rr = dict(rr)
+    for k, v in dict(replace_fields or {}).items():
+        rr[str(k)] = _mat_export_to_jsonable(v)
+    if isinstance(merged_extra, dict):
+        _deep_merge_missing_json(rr, merged_extra)
+    doc["recordResult"] = rr
+    json_bytes = json.dumps(
+        doc,
+        ensure_ascii=False,
+        indent=2,
+        default=lambda o: _mat_export_to_jsonable(o),
+    ).encode("utf-8")
+    mat_bytes = b""
 
     ok, msg = _r2_upload_mat_json(selected_key, mat_bytes, json_bytes)
     if not ok:
@@ -6310,7 +6913,7 @@ def _save_field_to_r2_mat(
 
 
 def _save_audio_config_to_selected_mat(config: dict, force: bool = False) -> tuple[bool, str]:
-    """Save audio_config into recordResult in R2 (MAT + JSON).
+    """Save audio_config into recordResult in R2 JSON sidecar.
 
     Returns (False, _SAVE_NEEDS_CONFIRM) when the field already exists and force=False.
     """
@@ -6320,7 +6923,7 @@ def _save_audio_config_to_selected_mat(config: dict, force: bool = False) -> tup
     selected_key = result
     _invalidate_and_update_mat_selection_for_capture(_current_capture_folder(), selected_key)
     st.session_state.audio_config_last_saved_key = selected_key
-    return True, f"Audio Config in R2 gespeichert: {selected_key}"
+    return True, f"Audio Config in R2-JSON gespeichert: {selected_key}"
 
 
 def _find_next_audio_config_target() -> dict | None:
@@ -6349,7 +6952,7 @@ def _load_next_audio_config_file() -> tuple[bool, str]:
     key = str(nxt.get("remote_key") or "")
     if not _try_load_video_for_capture_folder(folder):
         return False, f"Reduzierte Datei konnte nicht geladen werden: {folder}"
-    st.session_state.capture_folder = folder
+    st.session_state.capture_folder = str(st.session_state.get("_mat_last_video_capture_folder") or folder)
     if key:
         st.session_state.mat_selected_key = key
         st.session_state.mat_pending_selected_key = key
@@ -6525,7 +7128,7 @@ def _audio_find_best_validation_shift(
 
 
 def _save_audio_result_to_selected_mat(res: dict, force: bool = False) -> tuple[bool, str]:
-    """Save audio_rpm into recordResult in R2 (MAT + JSON).
+    """Save audio_rpm into recordResult in R2 JSON sidecar.
 
     Returns (False, _SAVE_NEEDS_CONFIRM) when the field already exists and force=False.
     """
@@ -6553,7 +7156,7 @@ def _save_audio_result_to_selected_mat(res: dict, force: bool = False) -> tuple[
         ok, result = save_field("audio_rpm", audio_rpm_struct, force, extra_rr)
         if not ok:
             return False, result
-        return True, f"Audioanalyse in R2 gespeichert: {result}"
+        return True, f"Audioanalyse in R2-JSON gespeichert: {result}"
 
     # Offline/local fallback for test environments.
     local_mat_path = str(st.session_state.get("audio_last_mat_path") or "").strip()
@@ -6626,6 +7229,7 @@ def _save_audio_validation_to_selected_mat(vr: dict, force: bool = False) -> tup
 
 _try_auto_connect_once()
 _try_auto_connect_local_once()
+_sync_compressed_storage_binding()
 
 # App header
 st.markdown("""
@@ -6652,7 +7256,9 @@ _tab_labels = [
     "MAT Selection",
     "MAT to JSON",
     "YouTube Download",
+    "Watchdog",
     "ROI Setup",
+    "Video OCR Full",
     "Audio Auswertung",
 ]
 _tabs = st.tabs(_tab_labels)
@@ -6667,7 +7273,11 @@ with _tabs[3]:
 with _tabs[4]:
     youtube_tab.render(globals())
 with _tabs[5]:
-    roi_setup_tab.render(globals())
+    watchdog_tab.render(globals())
 with _tabs[6]:
+    roi_setup_tab.render(globals())
+with _tabs[7]:
+    video_ocr_tab.render(globals())
+with _tabs[8]:
     audio_tab.render(globals())
 
