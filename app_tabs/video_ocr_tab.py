@@ -34,14 +34,46 @@ def render(ns):
             st.session_state.video_ocr_full_running = False
             st.session_state.roi_ocr_full_running = False
 
+    # ── Watchdog OCR live indicator ───────────────────────────────────────────
+    try:
+        from app_tabs.youtube_tab import watchdog_snapshot
+        wd_snap = watchdog_snapshot()
+        wd_running = bool(wd_snap.get("running"))
+        wd_current = str(wd_snap.get("current") or "")
+        capture_folder_now = _current_capture_folder() or str(st.session_state.get("capture_folder") or "").strip()
+        wd_ocr_active = wd_running and "OCR" in wd_current and capture_folder_now and capture_folder_now in wd_current
+    except Exception:
+        wd_running = False
+        wd_current = ""
+        wd_ocr_active = False
+
+    if wd_ocr_active:
+        st.info(
+            f"**Watchdog läuft automatisiert:** {wd_current}\n\n"
+            "OCR wird im Hintergrund durchgeführt. Manuelle Auswertung ist währenddessen deaktiviert.",
+            icon="🤖",
+        )
+    elif wd_running:
+        st.caption(f"Watchdog aktiv (anderer Task): {wd_current or '—'}")
+
+    def _scalar(v, default: float = 0.0) -> float:
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else default
+        try:
+            return float(v) if v is not None else default
+        except Exception:
+            return default
+
     rois = list(st.session_state.get("rois") or [])
     ocr_rois = [
         r for r in rois
         if str(r.get("name", "")).strip().lower() != "track_minimap"
-        and float(r.get("w", 0.0) or 0.0) > 0.0
-        and float(r.get("h", 0.0) or 0.0) > 0.0
+        and _scalar(r.get("w")) > 0.0
+        and _scalar(r.get("h")) > 0.0
     ]
-    capture_folder = _current_capture_folder() or str(st.session_state.get("capture_folder") or "").strip()
+    capture_folder = capture_folder_now if "capture_folder_now" in dir() else (
+        _current_capture_folder() or str(st.session_state.get("capture_folder") or "").strip()
+    )
     full_video = _find_local_fullfps_video(capture_folder) if capture_folder else None
 
     if not ocr_rois:
@@ -55,7 +87,7 @@ def render(ns):
     st.caption(f"Vollvideo: {str(full_video) if full_video is not None else '-'}")
     st.caption(f"OCR-ROI (ohne track_minimap): {len(ocr_rois)}")
 
-    can_run = bool(ocr_rois) and bool(capture_folder) and (full_video is not None)
+    can_run = bool(ocr_rois) and bool(capture_folder) and (full_video is not None) and not wd_ocr_active
     running = _is_running()
     stop_requested = bool(st.session_state.get("video_ocr_full_stop_requested"))
 
@@ -65,7 +97,7 @@ def render(ns):
         type="primary",
         width="stretch",
         key="video_ocr_full_run_btn",
-        disabled=(not can_run) or running or stop_requested,
+        disabled=(not can_run) or running or stop_requested or wd_ocr_active,
     )
     stop_clicked = c2.button(
         "OCR stoppen",

@@ -1,39 +1,11 @@
-"""Renderer for the Streamlit tab extracted from app.py.
+"""Cloud Connection & Root tab — local DB only."""
 
-The renderer receives app.py globals so existing helper functions and
-session-state conventions remain shared during the incremental split.
-"""
 
 def render(ns):
     globals().update(ns)
-    st.session_state.setdefault("compressed_db_mode", "local")
-    st.session_state.setdefault("compressed_db_default_path", str((st.secrets.get("local") or {}).get("default_path") or Path.cwd()))
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    mode_opts = ["Lokale Database (bevorzugt)", "R2 Database"]
-    mode_cur = str(st.session_state.get("compressed_db_mode") or "local").strip().lower()
-    mode_idx = 0 if mode_cur != "r2" else 1
-    mode_label = st.selectbox(
-        "Datenbank für komprimierte Dateien",
-        options=mode_opts,
-        index=mode_idx,
-        key="compressed_db_mode_select",
-    )
-    new_mode = "r2" if "R2" in str(mode_label) else "local"
-    if new_mode != mode_cur:
-        st.session_state.compressed_db_mode = new_mode
-        st.session_state.mat_scan_prefix = None
-        sync_bind = globals().get("_sync_compressed_storage_binding")
-        if callable(sync_bind):
-            sync_bind()
-        st.rerun()
-    st.caption(
-        "Auswahl gilt für komprimierte Daten (results/captures reduced). "
-        "Lokale Database ist Standard/empfohlen."
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
 
-    cloud_root_slot = st.empty()
-    local_path_slot = st.empty()
+    st.markdown('<div class="section-title">Verbindung & Pfad</div>', unsafe_allow_html=True)
+
     with st.expander("Debug-Logs", expanded=False):
         st.caption(f"Crash-Log Datei: {LOG_FILE}")
         if LOG_FILE.exists():
@@ -60,217 +32,77 @@ def render(ns):
         else:
             st.info("Noch kein Crash-Log vorhanden.")
 
-    cloud_ok = bool(st.session_state.r2_connected)
     local_ok = bool(st.session_state.local_connected)
-    compressed_mode = str(st.session_state.get("compressed_db_mode") or "local").strip().lower()
 
-    col_cloud, col_local = st.columns(2, gap="large")
+    st.markdown('<div class="section-card" style="background:#132114;border-color:#305b34;">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Lokale DB</div>', unsafe_allow_html=True)
 
-    with col_cloud:
-        st.markdown('<div class="section-card" style="background:#0b1524;border-color:#234465;">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Datenbank für komprimierte Dateien</div>', unsafe_allow_html=True)
-        # Card 1: Status
-        status_txt = "Verbunden" if cloud_ok else "Nicht verbunden"
-        status_color = "#3ddc84" if cloud_ok else "#ff5c5c"
-        status_sub = "R2 Database" if compressed_mode == "r2" else "Lokale Database"
+    st.markdown(
+        f"""
+        <div style="background:#132114;border:1px solid #376a3d;border-radius:10px;padding:.8rem 1rem;margin-bottom:.7rem;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#9fbe9f;text-transform:uppercase;letter-spacing:.08em;">Status</div>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+            <span class="conn-dot {'ok' if local_ok else 'off'}" style="width:13px;height:13px;"></span>
+            <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if local_ok else '#ff5c5c'};">
+              {'Verbunden' if local_ok else 'Nicht verbunden'}
+            </span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
         st.markdown(
-            f"""
-            <div style="background:#0b1524;border:1px solid #2b4f77;border-radius:10px;padding:.8rem 1rem;margin-bottom:.7rem;">
-              <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;">Status ({status_sub})</div>
-              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
-                <span class="conn-dot {'ok' if cloud_ok else 'off'}" style="width:13px;height:13px;"></span>
-                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{status_color};">
-                  {status_txt}
-                </span>
-              </div>
+            "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#9fbe9f;"
+            "text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Lokaler Zugriff</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div style="background:#17301a;border:1px solid #2b5a31;border-radius:8px;padding:.55rem .7rem;
+                 font-family:'JetBrains Mono',monospace;font-size:.68rem;color:#b8ddb9;line-height:1.5;margin-bottom:.6rem;">
+            Hinweis: Nur auf localhost nutzbar. Der gewaehlte Ordner muss einen Unterordner <b>captures</b> enthalten.
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        if compressed_mode == "r2":
-            # Card 2: Credentials + connect
-            with st.container(border=True, key="cloud_access_card"):
-                st.markdown(
-                    "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">R2 Zugang</div>",
-                    unsafe_allow_html=True,
-                )
-                r2_account = st.text_input(
-                    "Account ID",
-                    key="r2_account_id",
-                    help="Cloudflare Dashboard -> R2 -> Account ID",
-                )
-                r2_key = st.text_input(
-                    "Access Key ID",
-                    key="r2_access_key_id",
-                    help="R2 -> Manage API Tokens -> Create API Token",
-                )
-                r2_secret = st.text_input(
-                    "Secret Access Key",
-                    key="r2_secret_access_key",
-                    type="password",
-                )
-                r2_bucket = st.text_input(
-                    "Bucket Name",
-                    key="r2_bucket",
-                    placeholder="mein-bucket",
-                )
-
-                try:
-                    r2_connect_clicked = st.button("R2 Database verbinden", type="primary", width="stretch", key="r2_connect_btn")
-                except Exception as e:
-                    if "can't be used in an `st.form()`" not in str(e):
-                        raise
-                    r2_connect_clicked = st.form_submit_button("R2 Database verbinden", type="primary", width="stretch")
-
-                if r2_connect_clicked:
-                    if r2_account and r2_key and r2_secret and r2_bucket:
-                        with st.spinner("Verbinde R2 Database ... (max. 3 Versuche)"):
-                            _ok, _msg, _client = _connect_r2_with_retry(
-                                r2_account,
-                                r2_key,
-                                r2_secret,
-                                r2_bucket,
-                                max_attempts=3,
-                                delay_s=1.2,
-                            )
-                        if _ok:
-                            st.session_state.r2_connected = True
-                            st.session_state.r2_client = _client
-                            st.session_state.r2_prefix_options = list_root_prefixes(_client)
-                            st.session_state.r2_prefix = ""
-                            st.session_state.mat_scan_prefix = None
-                            sync_bind = globals().get("_sync_compressed_storage_binding")
-                            if callable(sync_bind):
-                                sync_bind()
-                            set_status("R2 Database verbunden.", "ok")
-                        else:
-                            st.session_state.r2_connected = False
-                            set_status(f"R2 Database Verbindung fehlgeschlagen: {_msg}", "warn")
-                        st.rerun()
-                    else:
-                        set_status("Bitte alle R2-Felder ausfuellen.", "warn")
-                        st.rerun()
-        else:
-            with st.container(border=True, key="compressed_local_notice"):
-                st.info("Lokale Database ist ausgewählt. Ordnerauswahl erfolgt im Bereich 'Lokale DB'.")
-
-        # Card 3: Root + refresh
-        with st.container(border=True, key="cloud_root_card"):
-            st.markdown(
-                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#8aa8c7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Root für komprimierte Dateien</div>",
-                unsafe_allow_html=True,
-            )
-            with cloud_root_slot.container():
-                if st.session_state.r2_connected:
-                    opts = st.session_state.r2_prefix_options or [""]
-                    cur = st.session_state.r2_prefix
-                    idx = opts.index(cur) if cur in opts else 0
-                    chosen = st.selectbox(
-                        "Cloud Prefix",
-                        opts,
-                        index=idx,
-                        format_func=lambda x: x or "(Bucket-Root)",
-                        label_visibility="collapsed",
-                        key="root_dd",
-                    )
-                    if chosen != st.session_state.r2_prefix:
-                        st.session_state.r2_prefix = chosen
-                        st.session_state.mat_scan_prefix = None
-                        set_status(f"Komprimierte Dateien Root: {chosen or '(root)'}", "ok")
-                    if st.button("Liste aktualisieren", width="stretch", key="refresh_root"):
-                        if compressed_mode == "r2":
-                            st.session_state.r2_prefix_options = get_root_prefixes()
-                        else:
-                            st.session_state.r2_prefix_options = _list_local_root_options(st.session_state.local_base_path)
-                        st.rerun()
-                else:
-                    st.selectbox(
-                        "Cloud Prefix",
-                        [""],
-                        index=0,
-                        format_func=lambda _x: "(Bucket-Root)",
-                        label_visibility="collapsed",
-                        key="root_dd_placeholder",
-                        disabled=True,
-                    )
-                    st.button("Liste aktualisieren", width="stretch", key="refresh_root_placeholder", disabled=True)
-                    st.caption("Bitte zuerst die ausgewählte Datenbank verbinden.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col_local:
-        st.markdown('<div class="section-card" style="background:#132114;border-color:#305b34;">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Lokale DB</div>', unsafe_allow_html=True)
-        # Card 1: Status
-        st.markdown(
-            f"""
-            <div style="background:#132114;border:1px solid #376a3d;border-radius:10px;padding:.8rem 1rem;margin-bottom:.7rem;">
-              <div style="font-family:'JetBrains Mono',monospace;font-size:.66rem;color:#9fbe9f;text-transform:uppercase;letter-spacing:.08em;">Lokale DB Status</div>
-              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
-                <span class="conn-dot {'ok' if local_ok else 'off'}" style="width:13px;height:13px;"></span>
-                <span style="font-family:'Syne',sans-serif;font-size:1.03rem;font-weight:700;color:{'#3ddc84' if local_ok else '#ff5c5c'};">
-                  {'Verbunden' if local_ok else 'Nicht verbunden'}
-                </span>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        # Card 2: Notice + picker + path
-        with st.container(border=True, key="local_access_card"):
-            st.markdown(
-                "<div style=\"font-family:JetBrains Mono,monospace;font-size:.66rem;color:#9fbe9f;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.45rem;\">Lokaler Zugriff</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                """
-                <div style="background:#17301a;border:1px solid #2b5a31;border-radius:8px;padding:.55rem .7rem;
-                     font-family:'JetBrains Mono',monospace;font-size:.68rem;color:#b8ddb9;line-height:1.5;margin-bottom:.6rem;">
-                Hinweis: Nur auf localhost nutzbar. Der gewaehlte Ordner muss einen Unterordner <b>captures</b> enthalten.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            if st.button("Ordner waehlen (lokal)", width="stretch", key="local_pick_btn"):
-                try:
-                    ok_pick, picked = _pick_local_folder_dialog(st.session_state.local_base_path_input)
-                    if ok_pick and picked:
-                        st.session_state.local_base_path_input = picked
-                        lp = Path(picked).expanduser().resolve()
-                        captures_dir = lp / "captures"
-                        if captures_dir.exists() and captures_dir.is_dir():
-                            local_client = LocalStorageAdapter(str(lp))
-                            ok_local, msg_local = local_client.test_connection()
-                            if ok_local:
-                                st.session_state.local_connected = True
-                                st.session_state.local_client = local_client
-                                st.session_state.local_base_path = str(lp)
-                                st.session_state.local_root = ""
-                                sync_bind = globals().get("_sync_compressed_storage_binding")
-                                if callable(sync_bind):
-                                    sync_bind()
-                                set_status(f"Lokale DB verbunden: {lp}", "ok")
-                            else:
-                                st.session_state.local_connected = False
-                                st.session_state.local_client = None
-                                set_status(f"Lokale DB Verbindung fehlgeschlagen: {msg_local}", "warn")
+        if st.button("Ordner waehlen (lokal)", width="stretch", key="local_pick_btn"):
+            try:
+                ok_pick, picked = _pick_local_folder_dialog(st.session_state.local_base_path_input)
+                if ok_pick and picked:
+                    st.session_state.local_base_path_input = picked
+                    lp = Path(picked).expanduser().resolve()
+                    captures_dir = lp / "captures"
+                    if captures_dir.exists() and captures_dir.is_dir():
+                        local_client = LocalStorageAdapter(str(lp))
+                        ok_local, msg_local = local_client.test_connection()
+                        if ok_local:
+                            st.session_state.local_connected = True
+                            st.session_state.local_client = local_client
+                            st.session_state.local_base_path = str(lp)
+                            st.session_state.local_root = ""
+                            set_status(f"Lokale DB verbunden: {lp}", "ok")
                         else:
                             st.session_state.local_connected = False
                             st.session_state.local_client = None
-                            set_status("Lokale DB nicht verbunden: Unterordner 'captures' fehlt.", "warn")
-                        st.rerun()
-                    elif picked:
-                        set_status(f"Ordnerdialog nicht verfuegbar: {picked}", "warn")
-                except Exception as e:
-                    set_status(f"Lokale DB Verbindung fehlgeschlagen: {e}", "warn")
-            with local_path_slot.container():
-                st.markdown(
-                    f'<div class="breadcrumb">Lokaler Basispfad: {st.session_state.local_base_path if st.session_state.local_connected else "(noch nicht gesetzt)"}</div>',
-                    unsafe_allow_html=True,
-                )
+                            set_status(f"Lokale DB Verbindung fehlgeschlagen: {msg_local}", "warn")
+                    else:
+                        st.session_state.local_connected = False
+                        st.session_state.local_client = None
+                        set_status("Lokale DB nicht verbunden: Unterordner 'captures' fehlt.", "warn")
+                    st.rerun()
+                elif picked:
+                    set_status(f"Ordnerdialog nicht verfuegbar: {picked}", "warn")
+            except Exception as e:
+                set_status(f"Lokale DB Verbindung fehlgeschlagen: {e}", "warn")
 
+        st.markdown(
+            f'<div class="breadcrumb">Lokaler Basispfad: '
+            f'{st.session_state.local_base_path if st.session_state.local_connected else "(noch nicht gesetzt)"}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
-        st.markdown('</div>', unsafe_allow_html=True)
-
-
+    st.markdown('</div>', unsafe_allow_html=True)

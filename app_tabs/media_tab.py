@@ -75,6 +75,10 @@ def _read_json_detail(jp: Path) -> dict:
         ocr_st = "teilweise"
     else:
         ocr_st = "nein"
+    # video_faulty: set during ROI setup when video is marked as defective
+    video_faulty = bool(ocr.get("video_faulty")) or bool(
+        (meta.get("video_faulty") if isinstance(meta, dict) else False)
+    )
     detail = {
         "title": str(meta.get("title") or meta.get("video_title") or ""),
         "youtube_link": str(meta.get("url") or meta.get("youtube_url") or meta.get("link") or ""),
@@ -84,6 +88,7 @@ def _read_json_detail(jp: Path) -> dict:
         "ocr": ocr_st,
         "audio_config": bool(rr.get("audio_config")),
         "validierung": bool(rr.get("audio_validation")),
+        "video_faulty": video_faulty,
     }
     _DETAIL_CACHE[cache_key] = (mtime, detail)
     return detail
@@ -136,6 +141,7 @@ def _scan_rows(base: Path) -> list[dict]:
                 "mat_exists": stem in mat_by_stem,
                 "video_exists": has_video,
                 "audio_exists": has_audio,
+                "video_faulty": detail.get("video_faulty", False),
                 "download_status": "",
                 "downloaded_at": "",
                 "last_error": "",
@@ -390,7 +396,7 @@ def render(ns: dict) -> None:
             st.code("\n".join(log_lines[-30:]), language="text")
 
     # ── Action bar ─────────────────────────────────────────────────────────────
-    col_mat, col_dl, col_retry, col_link = st.columns([2, 2, 2, 3])
+    col_mat, col_dl, col_link = st.columns([2, 3, 3])
 
     # MAT → JSON (alle ausstehenden)
     pending_mats = [
@@ -405,21 +411,26 @@ def render(ns: dict) -> None:
         t.start()
         st.rerun()
 
-    # Download ausstehend
-    pending_dl = [r for r in rows if r["youtube_link"] and not r["video_exists"]
-                  and r["download_status"] not in ("downloading",)]
-    if col_dl.button(f"Herunterladen ({len(pending_dl)})",
-                     disabled=not pending_dl, use_container_width=True, key="lib_dl_btn"):
+    # Herunterladen: video fehlt, audio fehlt, oder als fehlerhaft markiert
+    def _needs_download(r: dict) -> bool:
+        if not r.get("youtube_link"):
+            return False
+        if r.get("download_status") == "downloading":
+            return False
+        if not r.get("video_exists") or not r.get("audio_exists"):
+            return True
+        if r.get("video_faulty") or r.get("download_status") == "error":
+            return True
+        return False
+
+    pending_dl = [r for r in rows if _needs_download(r)]
+    dl_label = f"Herunterladen / Wiederholen ({len(pending_dl)})"
+    if col_dl.button(dl_label, disabled=not pending_dl,
+                     use_container_width=True, key="lib_dl_btn"):
+        for r in pending_dl:
+            _update_db_status(r["folder"], r["youtube_link"], "pending", "")
         st.session_state.yt_watchdog_task_download = True
         st.session_state.yt_watchdog_cmd = "start"
-        st.info("Watchdog-Download für ausstehende Videos aktiviert.")
-
-    # Fehlerhafte neu laden
-    faulty = [r for r in rows if r["youtube_link"] and r["download_status"] == "error"]
-    if col_retry.button(f"Neu laden ({len(faulty)})",
-                        disabled=not faulty, use_container_width=True, key="lib_retry_btn"):
-        for r in faulty:
-            _update_db_status(r["folder"], r["youtube_link"], "pending", "")
         st.rerun()
 
     # Neuer YouTube-Link
@@ -478,73 +489,134 @@ def render(ns: dict) -> None:
     st.divider()
     st.markdown(f"**Ausgewählt:** `{sel_row['folder']}` — {sel_row['title'] or '(kein Titel)'}")
 
-    def _load_folder(folder: str, json_path_str: str, load_video: bool = True) -> list[str]:
-        """Load folder into session state. Returns list of warning messages."""
+    def _scalar(v, default: float = 0.0) -> float:
+        """Unwrap single-element list/array from MAT conversion, then convert to float."""
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else default
+        try:
+            return float(v) if v is not None else default
+        except Exception:
+            return default
+
+    def _parse_roi_table(roi_table) -> list[dict]:
+        """Convert roi_table (list-of-dicts OR columnar dict) to list of normalized dicts."""
+        out: list[dict] = []
+        if isinstance(roi_table, list):
+            # Format A: [{"name":…,"x":…,"y":…,"w":…,"h":…}, …]
+            for r in roi_table:
+                if not isinstance(r, dict):
+                    continue
+                nr: dict = {}
+                for k, v in r.items():
+                    nr[k] = v[0] if isinstance(v, (list, tuple)) and len(v) == 1 else v
+                for field in ("x", "y", "w", "h"):
+                    nr[field] = _scalar(nr.get(field), 0.0)
+                nr.setdefault("name", "roi")
+                nr.setdefault("fmt", "any")
+                nr.setdefault("max_scale", 1.2)
+                out.append(nr)
+
+        elif isinstance(roi_table, dict):
+            # Format B: columnar {"name_roi":[…], "roi":[[x,y,w,h],…], "fmt":[…], "max_scale":[…]}
+            names = roi_table.get("name_roi") or roi_table.get("name") or []
+            coords_list = roi_table.get("roi") or []
+            fmts = roi_table.get("fmt") or []
+            scales = roi_table.get("max_scale") or []
+            if not isinstance(names, list):
+                names = []
+            for i, name in enumerate(names):
+                coords = coords_list[i] if i < len(coords_list) else []
+                if isinstance(coords, (list, tuple)) and len(coords) >= 4:
+                    x = _scalar(coords[0])
+                    y = _scalar(coords[1])
+                    w = _scalar(coords[2])
+                    h = _scalar(coords[3])
+                else:
+                    x = y = w = h = 0.0
+                fmt_val = fmts[i] if i < len(fmts) else "any"
+                scale_val = _scalar(scales[i], 1.2) if i < len(scales) else 1.2
+                out.append({
+                    "name": str(name),
+                    "x": x, "y": y, "w": w, "h": h,
+                    "fmt": str(fmt_val),
+                    "max_scale": scale_val,
+                })
+        return out
+
+    def _load_folder(folder: str, json_path_str: str) -> list[str]:
+        """Load folder into session state (JSON + ROIs + video). Returns warnings."""
         msgs: list[str] = []
         st.session_state.capture_folder = folder
 
-        # Load JSON: extract ROIs and t_start/t_end into session state
         if json_path_str:
             try:
-                doc = json.loads(Path(json_path_str).read_text(encoding="utf-8", errors="ignore"))
+                raw_text = Path(json_path_str).read_text(encoding="utf-8", errors="ignore")
+                doc = json.loads(raw_text)
+            except Exception as e:
+                msgs.append(f"JSON lesen: {e}")
+                doc = {}
+
+            try:
                 rr = doc.get("recordResult") if isinstance(doc, dict) else {}
-                if isinstance(rr, dict):
-                    ocr = rr.get("ocr") or {}
-                    if isinstance(ocr, dict):
-                        roi_table = ocr.get("roi_table") or []
-                        if isinstance(roi_table, list) and roi_table:
-                            st.session_state.rois = [
-                                dict(r) for r in roi_table if isinstance(r, dict)
-                            ]
-                        params = ocr.get("params") or {}
-                        if isinstance(params, dict):
-                            if "start_s" in params:
-                                st.session_state.t_start = float(params["start_s"])
-                            if "end_s" in params:
-                                st.session_state.t_end = float(params["end_s"])
+                if not isinstance(rr, dict):
+                    rr = {}
+                ocr = rr.get("ocr") or {}
+                if not isinstance(ocr, dict):
+                    ocr = {}
+
+                roi_table = ocr.get("roi_table")
+                parsed = _parse_roi_table(roi_table)
+                if parsed:
+                    st.session_state.rois = parsed
+                else:
+                    msgs.append(f"roi_table: kein ROI gefunden (type={type(roi_table).__name__}, val={str(roi_table)[:80]})")
+
+                params = ocr.get("params") or {}
+                if isinstance(params, dict):
+                    if "start_s" in params:
+                        st.session_state.t_start = _scalar(params.get("start_s", 0.0))
+                    if "end_s" in params:
+                        st.session_state.t_end = _scalar(params.get("end_s", 0.0))
+
                 st.session_state["mat_selected_key"] = json_path_str
             except Exception as e:
-                msgs.append(f"JSON: {e}")
+                msgs.append(f"JSON verarbeiten: {e}")
 
-        # Load video
-        if load_video:
-            try:
-                load_vid = globals().get("_try_load_video_for_capture_folder_with_fallback")
-                if callable(load_vid):
-                    load_vid(folder)
-                else:
-                    find_vid = globals().get("_find_local_fullfps_video")
-                    apply_vid = globals().get("_apply_video")
-                    if callable(find_vid) and callable(apply_vid):
-                        vp = find_vid(folder)
-                        if vp and vp.exists():
-                            apply_vid(str(vp), vp.name)
-            except Exception as e:
-                msgs.append(f"Video: {e}")
+        try:
+            load_vid = globals().get("_try_load_video_for_capture_folder_with_fallback")
+            if callable(load_vid):
+                load_vid(folder)
+            else:
+                find_vid = globals().get("_find_local_fullfps_video")
+                apply_vid = globals().get("_apply_video")
+                if callable(find_vid) and callable(apply_vid):
+                    vp = find_vid(folder)
+                    if vp and vp.exists():
+                        apply_vid(str(vp), vp.name)
+        except Exception as e:
+            msgs.append(f"Video: {e}")
 
         return msgs
 
     can_load = sel_row["json_exists"] or sel_row["video_exists"] or sel_row["audio_exists"]
-    ra1, ra2, ra3, ra4, ra5 = st.columns(5)
+    ra1, ra2, ra3, ra4 = st.columns(4)
 
-    # ── Für ROI Setup laden ────────────────────────────────────────────────────
-    if ra1.button("→ ROI Setup laden", disabled=not can_load,
-                  use_container_width=True, key="lib_load_roi_btn"):
+    # ── Laden (JSON + ROIs + Video) ────────────────────────────────────────────
+    if ra1.button("Laden", disabled=not can_load,
+                  use_container_width=True, key="lib_load_btn", type="primary"):
         msgs = _load_folder(sel_row["folder"], sel_row["json_path"])
         for m in msgs:
             st.warning(m)
-        st.success(f"Geladen: {sel_row['folder']} — jetzt Tab **ROI Setup** öffnen.")
-
-    # ── Für Audio Setup laden ──────────────────────────────────────────────────
-    if ra2.button("→ Audio Setup laden", disabled=not can_load,
-                  use_container_width=True, key="lib_load_audio_btn"):
-        msgs = _load_folder(sel_row["folder"], sel_row["json_path"], load_video=False)
-        for m in msgs:
-            st.warning(m)
-        st.success(f"Geladen: {sel_row['folder']} — jetzt Tab **Audio Auswertung** öffnen.")
+        rois_now = st.session_state.get("rois") or []
+        n_ocr = sum(1 for r in rois_now if str(r.get("name", "")).strip().lower() != "track_minimap"
+                    and _scalar(r.get("w")) > 0 and _scalar(r.get("h")) > 0)
+        st.success(
+            f"Geladen: **{sel_row['folder']}** — "
+            f"{n_ocr} OCR-ROI(s) geladen. Jetzt Tab **ROI Setup**, **Video OCR Full** oder **Audio Auswertung** öffnen."
+        )
 
     # ── MAT→JSON (nur diese Zeile) ─────────────────────────────────────────────
-    if ra3.button("MAT→JSON",
+    if ra2.button("MAT→JSON",
                   disabled=not sel_row["mat_exists"] or sel_row["json_exists"] or running,
                   use_container_width=True, key="lib_row_mat_btn"):
         t = threading.Thread(
@@ -557,16 +629,18 @@ def render(ns: dict) -> None:
 
     # ── Video herunterladen (diese Zeile) ──────────────────────────────────────
     has_link = bool(sel_row["youtube_link"])
-    if ra4.button("Video herunterladen",
-                  disabled=not has_link or sel_row["video_exists"],
+    if ra3.button("Video herunterladen",
+                  disabled=not has_link or (sel_row["video_exists"] and sel_row["audio_exists"]
+                                             and not sel_row["video_faulty"]),
                   use_container_width=True, key="lib_row_dl_btn"):
         _write_db_entry(sel_row["youtube_link"], sel_row["folder"], sel_row["title"])
+        _update_db_status(sel_row["folder"], sel_row["youtube_link"], "pending", "")
         st.session_state.yt_watchdog_task_download = True
         st.session_state.yt_watchdog_cmd = "start"
         st.info("Download wird vom Watchdog gestartet.")
 
     # ── Details ────────────────────────────────────────────────────────────────
-    with ra5:
+    with ra4:
         with st.expander("Details", expanded=False):
             display = {k: v for k, v in sel_row.items() if k not in ("duration",)}
             st.json(display)
