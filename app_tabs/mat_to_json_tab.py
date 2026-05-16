@@ -1,5 +1,22 @@
 """Renderer for local MAT-to-JSON conversion in <local_base_path>/results."""
 
+import threading as _threading
+from core.watchdog_state import get_path_lock
+
+_CONV_LOCK = _threading.Lock()
+_CONV: dict = {
+    "running": False,
+    "done_n": 0,
+    "total_n": 0,
+    "ok_n": 0,
+    "err_n": 0,
+    "current": "",
+    "next_file": "",
+    "stop_requested": False,
+    "status_map": {},
+    "thread": None,
+}
+
 
 def render(ns):
     globals().update(ns)
@@ -309,10 +326,15 @@ end
             return False, f"json read fehler: {e}"
         normed = _normalize_json_bytes(raw)
         if normed != raw:
+            _lock = get_path_lock(str(json_path))
+            if not _lock.acquire(blocking=False):
+                return False, "Datei wird vom Watchdog bearbeitet"
             try:
                 json_path.write_bytes(normed)
             except Exception as e:
                 return False, f"json write fehler: {e}"
+            finally:
+                _lock.release()
         return True, ""
 
     def _convert_mat_bytes(raw: bytes) -> tuple[bool, bytes, str]:
@@ -393,14 +415,6 @@ end
         return rows, pending
 
     st.session_state.setdefault("mat_to_json_status_map", {})
-    st.session_state.setdefault("mat_to_json_running", False)
-    st.session_state.setdefault("mat_to_json_stop_requested", False)
-    st.session_state.setdefault("mat_to_json_pending_paths", [])
-    st.session_state.setdefault("mat_to_json_done_n", 0)
-    st.session_state.setdefault("mat_to_json_total_n", 0)
-    st.session_state.setdefault("mat_to_json_ok_n", 0)
-    st.session_state.setdefault("mat_to_json_err_n", 0)
-    status_map = dict(st.session_state.get("mat_to_json_status_map") or {})
 
     results_dir = _results_dir_from_local_db()
     if results_dir is None:
@@ -417,166 +431,153 @@ end
             if json_path.exists() and _json_has_row_table_lists(json_path):
                 ok_norm, err_norm = _normalize_json_file_in_place(json_path)
                 if ok_norm:
-                    return {"ok": True, "mat_name": mat_name, "json_name": json_path.name, "status": "konvertiert (json-normalisierung)", "error": ""}
-                return {"ok": False, "mat_name": mat_name, "json_name": json_path.name, "status": f"fehler: {err_norm}", "error": str(err_norm or "")}
+                    return {"ok": True, "mat_name": mat_name, "status": "konvertiert (json-normalisierung)", "error": ""}
+                return {"ok": False, "mat_name": mat_name, "status": f"fehler: {err_norm}", "error": str(err_norm or "")}
             raw = mat_path.read_bytes()
             ok, json_bytes, err = _convert_mat_bytes(raw)
             if ok:
-                json_path.write_bytes(json_bytes)
-                return {"ok": True, "mat_name": mat_name, "json_name": json_path.name, "status": "konvertiert", "error": ""}
-            return {"ok": False, "mat_name": mat_name, "json_name": json_path.name, "status": f"fehler: {err}", "error": str(err or "")}
+                _lock = get_path_lock(str(json_path))
+                if not _lock.acquire(blocking=False):
+                    return {"ok": False, "mat_name": mat_name, "status": "gesperrt (Watchdog aktiv)", "error": "Datei wird vom Watchdog bearbeitet"}
+                try:
+                    json_path.write_bytes(json_bytes)
+                finally:
+                    _lock.release()
+                return {"ok": True, "mat_name": mat_name, "status": "konvertiert", "error": ""}
+            return {"ok": False, "mat_name": mat_name, "status": f"fehler: {err}", "error": str(err or "")}
         except Exception as e:
-            return {"ok": False, "mat_name": mat_name, "json_name": json_path.name, "status": f"fehler: {e}", "error": str(e)}
+            return {"ok": False, "mat_name": mat_name, "status": f"fehler: {e}", "error": str(e)}
 
-    run_every = 1.0 if bool(st.session_state.get("mat_to_json_running")) else None
+    def _run_conversion_thread(pending: list[Path]) -> None:
+        with _CONV_LOCK:
+            _CONV["running"] = True
+            _CONV["done_n"] = 0
+            _CONV["total_n"] = len(pending)
+            _CONV["ok_n"] = 0
+            _CONV["err_n"] = 0
+            _CONV["stop_requested"] = False
+            _CONV["current"] = ""
+            _CONV["next_file"] = pending[1].name if len(pending) > 1 else ""
+            _CONV["status_map"] = {}
+
+        for i, mat_path in enumerate(pending):
+            with _CONV_LOCK:
+                if _CONV["stop_requested"]:
+                    break
+                _CONV["current"] = mat_path.name
+                _CONV["next_file"] = pending[i + 1].name if i + 1 < len(pending) else ""
+
+            res = _convert_one_mat(mat_path)
+
+            with _CONV_LOCK:
+                mat_name = str(res.get("mat_name") or "")
+                st_txt = str(res.get("status") or "")
+                er_txt = str(res.get("error") or "")
+                if res.get("ok"):
+                    _CONV["status_map"][mat_name] = {"status": st_txt or "konvertiert", "error": ""}
+                    _CONV["ok_n"] += 1
+                else:
+                    _CONV["status_map"][mat_name] = {"status": st_txt, "error": er_txt}
+                    _CONV["err_n"] += 1
+                _CONV["done_n"] += 1
+
+        with _CONV_LOCK:
+            _CONV["running"] = False
+            _CONV["current"] = ""
+
     fragment_fn = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
 
-    def _render_conversion_panel() -> None:
+    def _render_panel() -> None:
         status_map_local = dict(st.session_state.get("mat_to_json_status_map") or {})
-        rows_local, pending_local = _scan_results_rows(results_dir, status_map_local)
-        total_local = len(rows_local)
-        pending_n_local = len(pending_local)
-        running_local = bool(st.session_state.get("mat_to_json_running"))
 
-        table_slot = st.empty()
+        with _CONV_LOCK:
+            running = bool(_CONV["running"])
+            done_n = int(_CONV["done_n"])
+            total_n = int(_CONV["total_n"])
+            ok_n = int(_CONV["ok_n"])
+            err_n = int(_CONV["err_n"])
+            current = str(_CONV["current"])
+            next_file = str(_CONV["next_file"])
+            stop_req = bool(_CONV["stop_requested"])
+            live_map = dict(_CONV["status_map"])
 
-        def _render_rows_table(table_rows: list[dict]) -> None:
-            if table_rows:
-                table_slot.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True, height=380)
-                return
-            table_slot.dataframe(
-                pd.DataFrame(
-                    columns=[
-                        "name der mat datei",
-                        "äquivalente json datei",
-                        "mat datei vorhanden",
-                        "json datei vorhanden",
-                        "konvertierungsstatus",
-                    ]
-                ),
-                width="stretch",
-                hide_index=True,
-                height=220,
+        # Merge live conversion results into display map
+        if live_map:
+            status_map_local = dict(status_map_local)
+            status_map_local.update(live_map)
+
+        rows, pending = _scan_results_rows(results_dir, status_map_local)
+        total = len(rows)
+        pending_n = len(pending)
+
+        if total > 0:
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=380)
+        else:
+            st.dataframe(
+                pd.DataFrame(columns=["name der mat datei", "äquivalente json datei",
+                                       "mat datei vorhanden", "json datei vorhanden", "konvertierungsstatus"]),
+                width="stretch", hide_index=True, height=220,
             )
 
-        _render_rows_table(rows_local)
-        st.caption(f"MAT-Dateien: {total_local} | fehlend/neu zu konvertieren: {pending_n_local}")
-        st.caption("Konvertierung läuft seriell (Datei für Datei), um inkonsistente/leere JSON-Einträge zu vermeiden.")
+        st.caption(f"MAT-Dateien: {total} | fehlend/neu zu konvertieren: {pending_n}")
 
-        progress_slot = st.empty()
-        current_slot = st.empty()
+        # Progress bar (only while running)
+        if running:
+            remain = max(0, total_n - done_n)
+            st.progress(
+                done_n / max(1, total_n),
+                text=f"{done_n}/{total_n} konvertiert | verbleibend: {remain}",
+            )
+            lbl = "Stop angefordert – läuft noch..." if stop_req else f"Aktuell: {current} | Nächste: {next_file or '–'}"
+            st.caption(lbl)
+
         c1, c2 = st.columns(2)
-        can_start = not running_local
-        can_stop = running_local
         convert_clicked = c1.button(
             "alle .mat dateien ohne .json in .json konvertieren",
             type="primary",
             width="stretch",
             key="mat_to_json_convert_all_missing_btn",
-            disabled=not can_start,
+            disabled=running,
         )
         stop_clicked = c2.button(
             "Auswahl stoppen",
             width="stretch",
             key="mat_to_json_stop_btn",
-            disabled=not can_stop,
+            disabled=not running,
         )
 
         if stop_clicked:
-            st.session_state.mat_to_json_stop_requested = True
-            set_status("Stop angefordert: MAT->JSON stoppt nach aktueller Datei.", "warn")
+            with _CONV_LOCK:
+                _CONV["stop_requested"] = True
 
         if convert_clicked:
-            if pending_n_local <= 0:
+            if pending_n <= 0:
                 set_status("Keine ausstehenden MAT-Dateien zur Konvertierung.", "warn")
             else:
-                st.session_state.mat_to_json_pending_paths = [str(p) for p in pending_local]
-                st.session_state.mat_to_json_total_n = int(pending_n_local)
-                st.session_state.mat_to_json_done_n = 0
-                st.session_state.mat_to_json_ok_n = 0
-                st.session_state.mat_to_json_err_n = 0
-                st.session_state.mat_to_json_stop_requested = False
-                st.session_state.mat_to_json_running = True
-                running_local = True
+                th = _threading.Thread(target=_run_conversion_thread, args=(list(pending),), daemon=True)
+                with _CONV_LOCK:
+                    _CONV["thread"] = th
+                th.start()
 
-        if bool(st.session_state.get("mat_to_json_running")):
-            pending_paths = [Path(p) for p in list(st.session_state.get("mat_to_json_pending_paths") or []) if str(p).strip()]
-            done_n = int(st.session_state.get("mat_to_json_done_n", 0) or 0)
-            total_n = int(st.session_state.get("mat_to_json_total_n", 0) or 0)
-            ok_n = int(st.session_state.get("mat_to_json_ok_n", 0) or 0)
-            err_n = int(st.session_state.get("mat_to_json_err_n", 0) or 0)
-
-            if bool(st.session_state.get("mat_to_json_stop_requested")):
-                st.session_state.mat_to_json_running = False
-                st.session_state.mat_to_json_status_map = status_map_local
-                st.session_state.mat_to_json_stop_requested = False
-                set_status(f"MAT->JSON gestoppt: {ok_n} OK, {err_n} Fehler, {max(0, total_n-done_n)} offen.", "warn")
-            elif not pending_paths:
-                st.session_state.mat_to_json_running = False
-                st.session_state.mat_to_json_status_map = status_map_local
-                if err_n == 0:
-                    set_status(f"MAT->JSON abgeschlossen: {ok_n}/{max(1,total_n)} konvertiert.", "ok")
-                else:
-                    set_status(f"MAT->JSON abgeschlossen: {ok_n} OK, {err_n} Fehler.", "warn")
+        # Sync finished results to session state (once, after thread completes)
+        if not running and live_map:
+            merged = dict(st.session_state.get("mat_to_json_status_map") or {})
+            merged.update(live_map)
+            st.session_state.mat_to_json_status_map = merged
+            with _CONV_LOCK:
+                _CONV["status_map"] = {}
+            if err_n == 0:
+                set_status(f"MAT->JSON abgeschlossen: {ok_n}/{max(1,total_n)} konvertiert.", "ok")
             else:
-                mat_path = pending_paths[0]
-                res = _convert_one_mat(mat_path)
-                done_n += 1
-                mat_name = str(res.get("mat_name") or "")
-                json_name = str(res.get("json_name") or "")
-                st_txt = str(res.get("status") or "")
-                er_txt = str(res.get("error") or "")
-                if bool(res.get("ok")):
-                    status_map_local[mat_name] = {"status": st_txt or "konvertiert", "error": ""}
-                    ok_n += 1
-                else:
-                    status_map_local[mat_name] = {"status": st_txt or f"fehler: {er_txt}", "error": er_txt}
-                    err_n += 1
-
-                pending_paths = pending_paths[1:]
-                st.session_state.mat_to_json_pending_paths = [str(p) for p in pending_paths]
-                st.session_state.mat_to_json_done_n = int(done_n)
-                st.session_state.mat_to_json_ok_n = int(ok_n)
-                st.session_state.mat_to_json_err_n = int(err_n)
-                st.session_state.mat_to_json_status_map = status_map_local
-
-                rows_live, _pending_live = _scan_results_rows(results_dir, status_map_local)
-                _render_rows_table(rows_live)
-                next_name = pending_paths[0].name if pending_paths else "–"
-                current_slot.caption(
-                    f"Zuletzt: {json_name} ({done_n}/{max(1,total_n)}) | "
-                    f"Nächste: {next_name}"
-                )
-                remain = max(0, total_n - done_n)
-                progress_slot.progress(
-                    done_n / max(1, total_n),
-                    text=f"{done_n}/{max(1,total_n)} konvertiert | verbleibend: {remain}",
-                )
-
-                if not pending_paths:
-                    st.session_state.mat_to_json_running = False
-                    if err_n == 0:
-                        set_status(f"MAT->JSON abgeschlossen: {ok_n}/{max(1,total_n)} konvertiert.", "ok")
-                    else:
-                        set_status(f"MAT->JSON abgeschlossen: {ok_n} OK, {err_n} Fehler.", "warn")
-
-        if running_local or bool(st.session_state.get("mat_to_json_running")):
-            done_n = int(st.session_state.get("mat_to_json_done_n", 0) or 0)
-            total_n = int(st.session_state.get("mat_to_json_total_n", 0) or 0)
-            remain = max(0, total_n - done_n)
-            progress_slot.progress(
-                done_n / max(1, total_n),
-                text=f"{done_n}/{max(1,total_n)} konvertiert | verbleibend: {remain}",
-            )
-            st.caption("Hinweis: Stop wirkt zwischen Dateien.")
+                set_status(f"MAT->JSON abgeschlossen: {ok_n} OK, {err_n} Fehler.", "warn")
 
     if callable(fragment_fn):
-        @fragment_fn(run_every=run_every)
+        @fragment_fn(run_every=1.0)
         def _panel_fragment():
-            _render_conversion_panel()
+            _render_panel()
         _panel_fragment()
     else:
-        _render_conversion_panel()
-        if bool(st.session_state.get("mat_to_json_running")):
-            time.sleep(0.25)
+        _render_panel()
+        if _CONV["running"]:
+            time.sleep(1.0)
             st.rerun()

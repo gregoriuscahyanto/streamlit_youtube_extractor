@@ -7,30 +7,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-
-_YT_WATCHDOG_LOCK = threading.Lock()
-_YT_WATCHDOG = {
-    "running": False,
-    "thread": None,
-    "stop_event": None,
-    "interval_sec": 20,
-    "last_tick": "",
-    "current": "",
-    "logs": [],
-    "errors": 0,
-    "downloads": 0,
-    "lite": 0,
-    "sync_lite": 0,
-    "ocr": 0,
-    "mat_json": 0,
-    "mat_json_skip": set(),
-    "tasks": {
-        "mat_json": True,
-        "download": True,
-        "sync_lite": True,
-        "ocr": True,
-    },
-}
+from core.watchdog_state import _YT_WATCHDOG, _YT_WATCHDOG_LOCK, _JSON_ROW_CACHE, get_path_lock
 
 
 def watchdog_snapshot() -> dict:
@@ -41,7 +18,7 @@ def watchdog_snapshot() -> dict:
             _YT_WATCHDOG["running"] = False
         return {
             "running": running,
-            "interval_sec": int(_YT_WATCHDOG.get("interval_sec", 20) or 20),
+            "interval_sec": int(_YT_WATCHDOG.get("interval_sec", 10) or 10),
             "last_tick": str(_YT_WATCHDOG.get("last_tick") or ""),
             "current": str(_YT_WATCHDOG.get("current") or ""),
             "downloads": int(_YT_WATCHDOG.get("downloads", 0) or 0),
@@ -248,6 +225,12 @@ def render(ns):
             return out
         for jp in sorted(res_dir.glob("results_*.json")):
             try:
+                mtime = jp.stat().st_mtime
+                cache_key = str(jp)
+                cached = _JSON_ROW_CACHE.get(cache_key)
+                if cached is not None and cached[0] == mtime:
+                    out.append(cached[1])
+                    continue
                 doc = json.loads(jp.read_text(encoding="utf-8", errors="ignore"))
             except Exception:
                 continue
@@ -263,20 +246,20 @@ def render(ns):
             dl_status = "downloaded" if (has_v and has_a) else "pending"
             if has_v and not has_a:
                 dl_status = "error"
-            out.append(
-                {
-                    "youtube_link": url,
-                    "title": title,
-                    "upload_date": pub,
-                    "capture_folder": cf,
-                    "download_status": dl_status,
-                    "last_error": "" if dl_status != "error" else "audio fehlt",
-                    "downloaded_at": str(meta.get("created_at") or ""),
-                    "lite_target": _lite_target_mode(),
-                    "lite_status": "",
-                    "json_path": str(jp),
-                }
-            )
+            row = {
+                "youtube_link": url,
+                "title": title,
+                "upload_date": pub,
+                "capture_folder": cf,
+                "download_status": dl_status,
+                "last_error": "" if dl_status != "error" else "audio fehlt",
+                "downloaded_at": str(meta.get("created_at") or ""),
+                "lite_target": _lite_target_mode(),
+                "lite_status": "",
+                "json_path": str(jp),
+            }
+            _JSON_ROW_CACHE[cache_key] = (mtime, row)
+            out.append(row)
         return out
 
     def _merge_rows_with_results_json(rows: list[dict]) -> tuple[list[dict], bool]:
@@ -651,8 +634,15 @@ def render(ns):
         with _YT_WATCHDOG_LOCK:
             logs = list(_YT_WATCHDOG.get("logs") or [])
             logs.append(line)
-            _YT_WATCHDOG["logs"] = logs[-80:]
+            _YT_WATCHDOG["logs"] = logs[-200:]
             _YT_WATCHDOG["last_tick"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            log_path = Path(str(st.session_state.get("local_base_path") or ".")).expanduser().resolve() / "logs" / "watchdog.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as _f:
+                _f.write(line + "\n")
+        except Exception:
+            pass
 
     def _wd_set_current(step: str) -> None:
         with _YT_WATCHDOG_LOCK:
@@ -748,18 +738,52 @@ def render(ns):
         if not isinstance(rr, dict):
             return False, "recordResult fehlt"
         ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
-        rois, has_track = _wd_extract_ocr_rois(doc)
+        rois, _ = _wd_extract_ocr_rois(doc)
         if not rois:
             return False, "keine OCR-ROIs"
-        if not has_track:
-            return False, "track_minimap fehlt"
         cleaned = ocr.get("cleaned")
         table = ocr.get("table")
-        if isinstance(cleaned, list) and len(cleaned) > 0 and isinstance(table, list) and len(table) > 0:
-            return False, "bereits vorhanden"
-        return True, "ausstehend"
+        # Columnar format: {"time_s": [...], "frame_idx": [...], ...}
+        _tbl_ok = isinstance(table, dict) and len(table.get("time_s") or []) > 0
+        _cln_ok = isinstance(cleaned, dict) and len(cleaned.get("time_s") or []) > 0
+        if not (_tbl_ok and _cln_ok):
+            return True, "ausstehend"
+        params = ocr.get("params") if isinstance(ocr.get("params"), dict) else {}
+        # Partial flag: was interrupted mid-run
+        if bool(params.get("partial")):
+            try:
+                last_time = float(table["time_s"][-1])
+            except Exception:
+                last_time = 0.0
+            return True, f"unvollständig (abgebrochen bei {last_time:.1f}s)"
+        # Completeness check: last time_s must reach end_s (with tolerance)
+        end_s: float | None = None
+        start_s: float = 0.0
+        try:
+            if "end_s" in params:
+                end_s = float(params["end_s"])
+            elif isinstance(rr.get("metadata"), dict):
+                dur = rr["metadata"].get("duration")
+                if dur is not None:
+                    end_s = float(dur)
+        except Exception:
+            end_s = None
+        try:
+            if "start_s" in params:
+                start_s = float(params["start_s"])
+        except Exception:
+            start_s = 0.0
+        if end_s is not None and end_s > 0:
+            try:
+                last_time = float(table["time_s"][-1])
+                tolerance = max(2.0, (end_s - start_s) * 0.05)
+                if last_time < end_s - tolerance:
+                    return True, f"unvollständig (bis {last_time:.1f}s von {end_s:.1f}s)"
+            except Exception:
+                pass
+        return False, "bereits vorhanden"
 
-    def _wd_run_ocr(folder: str, json_path: Path, base_override=None) -> tuple[bool, str]:
+    def _wd_run_ocr(folder: str, json_path: Path, base_override=None, target_fps_str: str = "2") -> tuple[bool, str]:
         diag = globals().get("diagnose_roi_ocr")
         if not callable(diag):
             try:
@@ -786,15 +810,24 @@ def render(ns):
         if not isinstance(rr, dict):
             return False, "recordResult fehlt"
         ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
-        rois, has_track = _wd_extract_ocr_rois(doc)
+        rois, _ = _wd_extract_ocr_rois(doc)
         if not rois:
             return False, "keine OCR-ROIs"
-        if not has_track:
-            return False, "track_minimap fehlt"
 
         out_video, _out_audio = _capture_media_paths(folder, base_override=base_override)
         if not out_video.exists() or out_video.stat().st_size <= 0:
-            return False, "video fehlt"
+            # Fallback: scan capture folder for any .avi or .mp4
+            cap_dir = out_video.parent
+            found = None
+            if cap_dir.is_dir():
+                for ext in ("*.avi", "*.mp4", "*.mkv"):
+                    candidates = sorted(cap_dir.glob(ext))
+                    if candidates:
+                        found = candidates[0]
+                        break
+            if found is None or found.stat().st_size <= 0:
+                return False, "video fehlt"
+            out_video = found
         cap = cv2.VideoCapture(str(out_video))
         if not cap.isOpened():
             return False, "video kann nicht geoeffnet werden"
@@ -808,36 +841,127 @@ def render(ns):
             dur = (fc / fps) if (fc > 0 and fps > 0) else float(((rr.get("metadata") or {}).get("duration") or 0.0))
             if dur <= 0:
                 dur = 1.0
-            sec_points = list(range(0, max(1, int(np.ceil(dur)))))
-            raw_rows = []
-            clean_rows = []
-            for sec in sec_points:
-                cap.set(cv2.CAP_PROP_POS_MSEC, float(sec) * 1000.0)
+            total_frames = int(fc) if fc > 0 else int(dur * fps)
+
+            # Frame step based on target fps
+            _tgt = str(target_fps_str or "2").strip().lower()
+            if _tgt == "max":
+                frame_step = 1
+            else:
+                try:
+                    _tgt_fps = float(_tgt)
+                except ValueError:
+                    _tgt_fps = 2.0
+                frame_step = max(1, int(round(fps / _tgt_fps))) if _tgt_fps > 0 else 1
+            total_processed = max(1, total_frames // frame_step)
+
+            # Columnar format: {"time_s": [...], "frame_idx": [...], "roi_a": [...], ...}
+            # Convert legacy array-of-objects to columnar if needed
+            def _to_columnar(tbl):
+                if not isinstance(tbl, list) or not tbl:
+                    return None
+                keys = list(tbl[0].keys()) if isinstance(tbl[0], dict) else []
+                if not keys:
+                    return None
+                return {k: [row.get(k, "") for row in tbl if isinstance(row, dict)] for k in keys}
+
+            existing_table = ocr.get("table")
+            existing_cleaned = ocr.get("cleaned")
+            if isinstance(existing_table, list) and existing_table:
+                existing_table = _to_columnar(existing_table)
+                existing_cleaned = _to_columnar(existing_cleaned)
+            _resuming = (
+                isinstance(existing_table, dict) and existing_table.get("frame_idx")
+                and isinstance(existing_cleaned, dict) and existing_cleaned.get("frame_idx")
+            )
+            if _resuming:
+                raw_cols = {k: list(v) for k, v in existing_table.items() if isinstance(v, list)}
+                clean_cols = {k: list(v) for k, v in existing_cleaned.items() if isinstance(v, list)}
+                # frame_idx stored as 1-based; last value = next 0-based index to process
+                frame_idx = int(raw_cols["frame_idx"][-1])
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                _resume_start = frame_idx
+            else:
+                roi_names = [str(r.get("name") or "").strip() or "roi" for r in rois]
+                raw_cols: dict[str, list] = {"time_s": [], "frame_idx": [], **{nm: [] for nm in roi_names}}
+                clean_cols: dict[str, list] = {"time_s": [], "frame_idx": [], **{nm: [] for nm in roi_names}}
+                frame_idx = 0
+                _resume_start = 0
+
+            with _YT_WATCHDOG_LOCK:
+                _stop_event = _YT_WATCHDOG.get("stop_event")
+
+            _json_path_lock = get_path_lock(str(json_path))
+
+            def _save_ocr_progress(partial: bool = False) -> None:
+                ocr["table"] = raw_cols
+                ocr["cleaned"] = clean_cols
+                ocr["created"] = datetime.now().isoformat(timespec="seconds")
+                ocr["sample_rate_hz"] = round(fps, 6)
+                _params = ocr.get("params") if isinstance(ocr.get("params"), dict) else {}
+                _params.setdefault("start_s", 0.0)
+                _params["end_s"] = round(dur, 6)
+                if partial:
+                    _params["partial"] = True
+                else:
+                    _params.pop("partial", None)
+                ocr["params"] = _params
+                rr["ocr"] = ocr
+                doc["recordResult"] = rr
+                with _json_path_lock:
+                    json_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            _n_rows = len(raw_cols.get("time_s", []))
+            _pct_log_every = max(1, total_processed // 10)  # log + checkpoint every ~10%
+            _processed_count = 0
+            _stopped_early = False
+            while True:
+                if _stop_event is not None and _stop_event.is_set():
+                    _stopped_early = True
+                    break
                 ok, frame_bgr = cap.read()
                 if (not ok) or frame_bgr is None:
-                    continue
+                    break
+                time_s = frame_idx / fps
                 frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 fh, fw = frame.shape[:2]
-                raw_row = {"time_s": float(sec)}
-                clean_row = {"time_s": float(sec)}
+                raw_cols.setdefault("time_s", []).append(round(time_s, 6))
+                raw_cols.setdefault("frame_idx", []).append(frame_idx + 1)
+                clean_cols.setdefault("time_s", []).append(round(time_s, 6))
+                clean_cols.setdefault("frame_idx", []).append(frame_idx + 1)
                 for roi_cfg in rois:
                     nm = str(roi_cfg.get("name") or "").strip() or "roi"
                     probe = diag(frame, roi_cfg, (int(fw), int(fh)), tmp_root=Path("logs") / "ocr_tmp")
-                    raw_row[nm] = str(probe.get("raw", "") or "")
-                    clean_row[nm] = str(probe.get("value", "") or "") if bool(probe.get("ok")) else ""
-                raw_rows.append(raw_row)
-                clean_rows.append(clean_row)
+                    raw_cols.setdefault(nm, []).append(str(probe.get("raw", "") or ""))
+                    clean_cols.setdefault(nm, []).append(str(probe.get("value", "") or "") if bool(probe.get("ok")) else "")
+                frame_idx += frame_step
+                _processed_count += 1
+                _n_rows += 1
+                # Skip frame_step-1 frames without decoding
+                for _ in range(frame_step - 1):
+                    if not cap.grab():
+                        break
+                pct = int(100 * frame_idx / max(1, total_frames))
+                _wd_set_current(f"OCR: {folder} – Frame {frame_idx}/{total_frames} ({pct}%)")
+                if _processed_count % _pct_log_every == 0:
+                    _wd_log(f"OCR {folder}: {pct}% (Frame {frame_idx}/{total_frames})")
+                    _save_ocr_progress(partial=True)
         finally:
             cap.release()
 
-        ocr["table"] = raw_rows
-        ocr["cleaned"] = clean_rows
-        ocr["created"] = datetime.now().isoformat(timespec="seconds")
-        ocr["sample_rate_hz"] = 1.0
-        rr["ocr"] = ocr
-        doc["recordResult"] = rr
-        json_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-        return True, f"OCR gespeichert ({len(clean_rows)} Zeilen)"
+        if _stopped_early:
+            if _n_rows > 0:
+                _save_ocr_progress(partial=True)
+                pct = int(100 * frame_idx / max(1, total_frames))
+                _wd_log(f"OCR {folder}: abgebrochen bei {pct}% – Zwischenstand gespeichert ({_n_rows} Zeilen)")
+                return False, f"abgebrochen bei {pct}% ({_n_rows} Zeilen gespeichert)"
+            return False, "abgebrochen (kein Fortschritt)"
+
+        _save_ocr_progress(partial=False)
+        new_frames = frame_idx - _resume_start
+        if _resuming:
+            return True, f"OCR fortgesetzt (+{new_frames} Frames, gesamt {_n_rows} Zeilen)"
+        return True, f"OCR gespeichert ({_n_rows} Zeilen)"
 
     def _wd_lite_missing(folder: str, json_path: str, target: str, base_override=None) -> bool:
         target_low = str(target or "local").strip().lower()
@@ -904,7 +1028,8 @@ def render(ns):
                     _YT_WATCHDOG.setdefault("mat_json_skip", set()).add(mat_path.name)
                 continue
             try:
-                json_path.write_bytes(bytes(out))
+                with get_path_lock(str(json_path)):
+                    json_path.write_bytes(bytes(out))
             except Exception as e:
                 return False, f"JSON write Fehler: {json_path.name}: {e}"
             return True, f"{mat_path.name} -> {json_path.name}"
@@ -939,6 +1064,8 @@ def render(ns):
         task_sync_lite = bool(tasks.get("sync_lite", True))
         task_ocr = bool(tasks.get("ocr", True))
 
+        _wd_log(f"Tick | Aufgaben: MAT-JSON={task_mat_json} Download={task_download} Sync={task_sync_lite} OCR={task_ocr}")
+
         if task_mat_json:
             _wd_set_current("MAT->JSON")
             ok_mj, msg_mj = _wd_convert_one_mat_to_json(base_override=base_override)
@@ -950,6 +1077,7 @@ def render(ns):
                 _wd_inc("errors")
                 _wd_log(f"MAT->JSON Fehler: {msg_mj}")
                 return True
+            _wd_log(f"MAT->JSON: {msg_mj}")
 
         if task_sync_lite:
             _wd_set_current("Sync Full->Lite")
@@ -963,8 +1091,14 @@ def render(ns):
                 _wd_inc("errors")
                 _wd_log(f"Sync Lite Fehler: {msg_sync}")
                 return True
+            _wd_log(f"Sync Lite: {msg_sync}")
 
         rows_now = _read_db()
+        _wd_log(f"DB: {len(rows_now)} Einträge geladen")
+
+        with _YT_WATCHDOG_LOCK:
+            ocr_skip_now: set = set(_YT_WATCHDOG.get("ocr_skip", set()))
+
         for row in rows_now:
             link = str(row.get("youtube_link") or "").strip()
             if not link:
@@ -978,6 +1112,12 @@ def render(ns):
             status = str(row.get("download_status") or "pending").strip().lower()
             json_path = str(row.get("json_path") or "").strip()
             json_file = Path(json_path) if json_path else _wd_json_path(folder, base_override=base_override)
+
+            if task_ocr and folder not in ocr_skip_now:
+                need_ocr, reason = _wd_ocr_pending(json_file)
+                if not need_ocr:
+                    _wd_log(f"OCR {folder}: {reason} – skip")
+
             if task_download and (not media_ok):
                 _wd_set_current(f"Download: {folder}")
                 _wd_log(f"Download gestartet: {folder}")
@@ -1079,19 +1219,33 @@ def render(ns):
                 _wd_update_row(link, patch)
                 return True
 
-            need_ocr, _reason = _wd_ocr_pending(json_file)
-            if task_ocr and need_ocr:
+            need_ocr, reason = _wd_ocr_pending(json_file)
+            if task_ocr and need_ocr and folder not in ocr_skip_now:
                 _wd_set_current(f"OCR: {folder}")
-                ok_ocr, msg_ocr = _wd_run_ocr(folder, json_file, base_override=base_override)
+                if "unvollständig" in reason:
+                    _wd_log(f"OCR fortsetzen: {folder} ({reason})")
+                else:
+                    _wd_log(f"OCR startet: {folder}")
+                ok_ocr, msg_ocr = _wd_run_ocr(folder, json_file, base_override=base_override, target_fps_str=str(cfg.get("ocr_fps", "2") or "2"))
                 if ok_ocr:
                     _wd_inc("ocr")
                     _wd_update_row(link, {"last_error": "", "ocr_status": str(msg_ocr)})
-                    _wd_log(f"OCR abgeschlossen: {folder}")
+                    _wd_log(f"OCR abgeschlossen: {folder} – {msg_ocr}")
+                    return True
+                elif "abgebrochen" in str(msg_ocr):
+                    # Stopped by stop_event — partial progress already saved, resume next time
+                    _wd_update_row(link, {"ocr_status": str(msg_ocr)})
+                    return True
                 else:
                     _wd_inc("errors")
                     _wd_update_row(link, {"last_error": f"OCR: {msg_ocr}"})
                     _wd_log(f"OCR Fehler: {folder} -> {msg_ocr}")
-                return True
+                    with _YT_WATCHDOG_LOCK:
+                        _YT_WATCHDOG.setdefault("ocr_skip", set()).add(folder)
+                    return True
+
+        _wd_log("Tick abgeschlossen: nichts zu tun")
+        _wd_set_current("")
         return False
 
     def _wd_loop(stop_event, cfg: dict) -> None:
@@ -1131,6 +1285,7 @@ def render(ns):
                 "open_new_window": bool(st.session_state.get("yt_open_new_window", True)),
                 "move_other_display": bool(st.session_state.get("yt_move_other_display", False)),
                 "tasks": tasks_cfg,
+                "ocr_fps": str(st.session_state.get("yt_watchdog_ocr_fps", "2") or "2").strip(),
             }
             th = threading.Thread(target=_wd_loop, args=(stop_event, cfg), daemon=True, name="yt-watchdog")
             _YT_WATCHDOG["running"] = True
@@ -1223,10 +1378,10 @@ def render(ns):
     stop_bg = b3.button("Download-Queue stoppen", width="stretch", key="yt_dl_stop_btn", disabled=not bool(st.session_state.get("yt_bg_active")))
 
     st.session_state.setdefault("yt_watchdog_cmd", "")
-    st.session_state.setdefault("yt_watchdog_interval_sec_cmd", 20)
-    st.session_state.setdefault("yt_watchdog_task_mat_json", True)
-    st.session_state.setdefault("yt_watchdog_task_download", True)
-    st.session_state.setdefault("yt_watchdog_task_sync_lite", True)
+    st.session_state.setdefault("yt_watchdog_interval_sec_cmd", 10)
+    st.session_state.setdefault("yt_watchdog_task_mat_json", False)
+    st.session_state.setdefault("yt_watchdog_task_download", False)
+    st.session_state.setdefault("yt_watchdog_task_sync_lite", False)
     st.session_state.setdefault("yt_watchdog_task_ocr", True)
     _wd_cmd = str(st.session_state.get("yt_watchdog_cmd") or "").strip().lower()
     if _wd_cmd == "start":

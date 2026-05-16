@@ -4342,8 +4342,12 @@ def _compute_mat_summary_remote(remote_key: str, client, prefix: str) -> dict:
             summary['framepack_expected'] = int(framepack_expected)
             summary['framepack_complete'] = bool(framepack_complete)
             summary['audio_proxy_present'] = bool(has_audio_proxy)
-            summary['video_file_exists'] = bool(has_full_or_proxy_video or framepack_complete)
-            summary['audio_file_exists'] = bool(has_audio_file or has_audio_proxy)
+            has_full_audio = any(
+                n.endswith(('.wav', '.mp3', '.m4a', '.aac', '.flac')) and n != AUDIO_PROXY_NAME.lower()
+                for n in lower_files
+            )
+            summary['video_file_exists'] = bool(has_full_or_proxy_video)
+            summary['audio_file_exists'] = bool(has_full_audio)
             if not framepack_complete and has_framepack:
                 summary['media_detail'] = f"Frames unvollstaendig ({framepack_count}/{framepack_expected or '?' })."
             elif not has_framepack:
@@ -4393,8 +4397,12 @@ def _compute_folder_only_summary(folder: str, client, prefix: str) -> dict:
 
     files = [n for n in items if not n.endswith("/")]
     lower_files = [n.lower() for n in files]
-    has_audio_file = any(n.endswith((".wav", ".mp3", ".m4a", ".aac", ".flac")) for n in lower_files)
+    has_full_video = any(n.endswith((".mp4", ".mov", ".avi", ".mkv")) for n in lower_files)
     has_audio_proxy = any(n == AUDIO_PROXY_NAME.lower() for n in lower_files)
+    has_full_audio = any(
+        n.endswith((".wav", ".mp3", ".m4a", ".aac", ".flac")) and n != AUDIO_PROXY_NAME.lower()
+        for n in lower_files
+    )
 
     has_framepack = "frames_1fps/" in items
     framepack_count = 0
@@ -4421,8 +4429,8 @@ def _compute_folder_only_summary(folder: str, client, prefix: str) -> dict:
                     pass
 
     framepack_complete = framepack_count > 0 and (framepack_expected <= 0 or framepack_count >= framepack_expected)
-    summary["video_file_exists"] = bool(framepack_complete)
-    summary["audio_file_exists"] = bool(has_audio_file or has_audio_proxy)
+    summary["video_file_exists"] = bool(has_full_video)
+    summary["audio_file_exists"] = bool(has_full_audio)
     if not framepack_complete and has_framepack:
         summary["media_detail"] = f"Frames unvollstaendig ({framepack_count}/{framepack_expected or '?'})."
     elif not has_framepack:
@@ -5016,17 +5024,20 @@ def _try_load_video_for_capture_folder_with_fallback(capture_folder: str, json_d
     if not cands:
         return False
     for folder in cands:
-        if st.session_state.get("r2_client") is not None and _load_framepack_from_r2(folder):
-            st.session_state.capture_folder = folder
-            st.session_state["_mat_last_video_capture_folder"] = folder
-            return True
+        # 1. Local full-fps video (preferred)
         local_video = _find_local_fullfps_video(folder)
         if local_video is not None and local_video.exists():
             _apply_video(str(local_video), local_video.name)
             st.session_state.capture_folder = folder
             st.session_state["_mat_last_video_capture_folder"] = folder
             return True
+        # 2. Full video from R2
         if st.session_state.get("r2_client") is not None and _load_full_video_from_r2(folder):
+            st.session_state.capture_folder = folder
+            st.session_state["_mat_last_video_capture_folder"] = folder
+            return True
+        # 3. Framepack (1fps proxy) as last resort
+        if st.session_state.get("r2_client") is not None and _load_framepack_from_r2(folder):
             st.session_state.capture_folder = folder
             st.session_state["_mat_last_video_capture_folder"] = folder
             return True
@@ -5473,60 +5484,78 @@ def _load_centerline_from_r2(remote_key: str, mat_name: str) -> None:
 # Audio / RPM helper functions
 # ==============================
 def _audio_load_current_capture() -> tuple[bool, str, int, np.ndarray, str]:
-    """Prefer cloud audio_proxy_1k.wav; local audio/video media is fallback."""
+    """Load full-quality audio. Priority: local audio file → local video → cloud proxy."""
     folder = str(st.session_state.get("capture_folder") or "").strip("/\\")
     if not folder:
         return False, "Kein capture_folder aktiv. Bitte zuerst MAT + Video laden.", 0, np.array([], dtype=np.float32), ""
-    # Cloud proxy first
-    if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
-        pfx = st.session_state.r2_prefix.strip("/")
-        key = f"{pfx}/captures/{folder}/{AUDIO_PROXY_NAME}" if pfx else f"captures/{folder}/{AUDIO_PROXY_NAME}"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav"); tmp.close()
-        ok, msg = st.session_state.r2_client.download_file(key, tmp.name)
-        if ok:
-            try:
-                fs, data = wavfile.read(tmp.name)
-                y = data.astype(np.float32, copy=False)
-                if y.ndim > 1:
-                    y = np.mean(y, axis=1)
-                if np.issubdtype(data.dtype, np.integer):
-                    y = y / max(1.0, float(np.iinfo(data.dtype).max))
-                return True, "", int(fs), np.asarray(y, dtype=np.float32).reshape(-1).copy(), f"cloud:{AUDIO_PROXY_NAME}"
-            except Exception as e:
-                return False, f"Cloud-Audio konnte nicht gelesen werden: {e}", 0, np.array([], dtype=np.float32), ""
-            finally:
-                try: Path(tmp.name).unlink(missing_ok=True)
-                except Exception: pass
-    # Local fallback: prefer a separate audio file, otherwise extract the audio
-    # track directly from the full-fps video file.
-    fp = _find_local_audio_file(folder)
-    source_kind = "audio"
-    if fp is None:
-        fp = _find_local_fullfps_video(folder)
-        source_kind = "video"
-    if fp is not None:
+
+    def _read_wav_direct(path: Path) -> tuple[bool, int, np.ndarray]:
+        fs, data = wavfile.read(str(path))
+        y = data.astype(np.float32, copy=False)
+        if y.ndim > 1:
+            y = np.mean(y, axis=1)
+        if np.issubdtype(data.dtype, np.integer):
+            y = y / max(1.0, float(np.iinfo(data.dtype).max))
+        return True, int(fs), np.asarray(y, dtype=np.float32).reshape(-1).copy()
+
+    def _read_via_ffmpeg(path: Path, label: str):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         tmp.close()
         tmp_path = Path(tmp.name)
         try:
-            ok, build_msg = _build_audio_proxy_wav(fp, tmp_path)
+            ok, build_msg = _build_audio_proxy_wav(path, tmp_path)
             if not ok:
-                return False, f"Lokale Audioquelle konnte nicht vorbereitet werden: {build_msg}", 0, np.array([], dtype=np.float32), ""
-            fs, data = wavfile.read(str(tmp_path))
-            y = data.astype(np.float32, copy=False)
-            if y.ndim > 1:
-                y = np.mean(y, axis=1)
-            if np.issubdtype(data.dtype, np.integer):
-                y = y / max(1.0, float(np.iinfo(data.dtype).max))
-            return True, "", int(fs), np.asarray(y, dtype=np.float32).reshape(-1).copy(), f"local-{source_kind}:{fp.name}"
+                return False, f"{label} konnte nicht vorbereitet werden: {build_msg}", 0, np.array([], dtype=np.float32), ""
+            _, fs, y = _read_wav_direct(tmp_path)
+            return True, "", fs, y, f"local-ffmpeg:{path.name}"
         except Exception as e:
-            return False, f"Lokale Audioquelle konnte nicht gelesen werden: {e}", 0, np.array([], dtype=np.float32), ""
+            return False, f"{label} konnte nicht gelesen werden: {e}", 0, np.array([], dtype=np.float32), ""
         finally:
             try:
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
-    return False, "Kein Audio gefunden (weder Cloud audio_proxy_1k.wav noch lokale Audio-/Videodatei).", 0, np.array([], dtype=np.float32), ""
+
+    # 1. Local full audio file (WAV: read directly; other formats: via ffmpeg)
+    fp_audio = _find_local_audio_file(folder)
+    if fp_audio is not None:
+        try:
+            if fp_audio.suffix.lower() == ".wav":
+                _, fs, y = _read_wav_direct(fp_audio)
+                return True, "", fs, y, f"local-audio:{fp_audio.name}"
+        except Exception:
+            pass
+        result = _read_via_ffmpeg(fp_audio, "Lokale Audiodatei")
+        if result[0]:
+            return result[0], result[1], result[2], result[3], f"local-audio:{fp_audio.name}"
+
+    # 2. Local full-fps video (extract audio track via ffmpeg)
+    fp_video = _find_local_fullfps_video(folder)
+    if fp_video is not None:
+        result = _read_via_ffmpeg(fp_video, "Lokales Vollvideo")
+        if result[0]:
+            return result[0], result[1], result[2], result[3], f"local-video:{fp_video.name}"
+
+    # 3. Cloud proxy as last resort
+    if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
+        pfx = st.session_state.r2_prefix.strip("/")
+        key = f"{pfx}/captures/{folder}/{AUDIO_PROXY_NAME}" if pfx else f"captures/{folder}/{AUDIO_PROXY_NAME}"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp.close()
+        ok, msg = st.session_state.r2_client.download_file(key, tmp.name)
+        if ok:
+            try:
+                _, fs, y = _read_wav_direct(Path(tmp.name))
+                return True, "", fs, y, f"cloud-proxy:{AUDIO_PROXY_NAME}"
+            except Exception as e:
+                return False, f"Cloud-Audio konnte nicht gelesen werden: {e}", 0, np.array([], dtype=np.float32), ""
+            finally:
+                try:
+                    Path(tmp.name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    return False, "Kein Audio gefunden (weder lokale Audio-/Videodatei noch Cloud-Proxy).", 0, np.array([], dtype=np.float32), ""
 
 
 def _audio_candidate_cylinders(cyl: int, mode: str) -> list[int]:
@@ -5909,6 +5938,17 @@ def _audio_live_server():
         def do_GET(self):
             try:
                 parsed = urlparse(self.path)
+                if parsed.path == "/watchdog-log":
+                    try:
+                        from app_tabs.youtube_tab import _YT_WATCHDOG, _YT_WATCHDOG_LOCK
+                        with _YT_WATCHDOG_LOCK:
+                            logs = list(_YT_WATCHDOG.get("logs") or [])
+                            current = str(_YT_WATCHDOG.get("current") or "")
+                            running = bool(_YT_WATCHDOG.get("running"))
+                        self._send_json({"ok": True, "logs": logs[-15:], "current": current, "running": running})
+                    except Exception as e:
+                        self._send_json({"ok": True, "logs": [], "current": "", "running": False})
+                    return
                 if parsed.path != "/audio":
                     self._send_json({"ok": False, "error": "not found"}, 404)
                     return
