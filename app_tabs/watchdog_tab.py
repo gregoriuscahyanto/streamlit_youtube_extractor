@@ -6,13 +6,13 @@ def render(ns):
     from app_tabs import youtube_tab as _yt
 
     st.markdown('<div class="section-title">Watchdog Dashboard</div>', unsafe_allow_html=True)
-    st.caption("Watchdog-Agent im Hintergrund: MAT->JSON, YouTube-Download, Sync Full/Lite und OCR (pro Task auswählbar).")
+    st.caption("Watchdog-Agent im Hintergrund: MAT->JSON, YouTube-Download und OCR (pro Task auswählbar).")
 
     snap = _yt.watchdog_snapshot()
     is_running = bool(snap.get("running"))
     interval_sec = int(snap.get("interval_sec", 10) or 10)
 
-    # ── Config form (no rerun on checkbox click) ───────────────────────────
+    # Config form (no rerun on checkbox click)
     with st.form("watchdog_config_form", border=False):
         st.markdown("**Aktive Aufgaben**")
         t1, t2 = st.columns(2)
@@ -26,8 +26,7 @@ def render(ns):
             value=bool(st.session_state.get("yt_watchdog_task_download", False)),
             disabled=is_running,
         )
-        t3, _t4 = st.columns(2)
-        task_ocr = t3.checkbox(
+        task_ocr = st.checkbox(
             "OCR Auswertung",
             value=bool(st.session_state.get("yt_watchdog_task_ocr", True)),
             disabled=is_running,
@@ -79,7 +78,7 @@ def render(ns):
         st.session_state.yt_watchdog_cmd = "stop"
         st.rerun()
 
-    # ── Status line ────────────────────────────────────────────────────────
+    # Status line
     _lamp_color = "#22c55e" if is_running else "#ef4444"
     _lamp = f'<span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:{_lamp_color};margin-right:6px;vertical-align:middle;"></span>'
     wd_state = "aktiv" if is_running else "inaktiv"
@@ -91,7 +90,8 @@ def render(ns):
         f"</span>",
         unsafe_allow_html=True,
     )
-    # ── Log (JS polling, zero Streamlit rerun) ────────────────────────────
+
+    # Log (JS polling, zero Streamlit rerun)
     try:
         lp = str(st.session_state.get("local_base_path") or "").strip()
         log_file = (Path(lp).expanduser().resolve() / "logs" / "watchdog.log") if lp else None

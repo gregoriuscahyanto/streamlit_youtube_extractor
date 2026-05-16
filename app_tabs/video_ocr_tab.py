@@ -11,6 +11,7 @@ def render(ns):
     st.session_state.setdefault("video_ocr_full_stop_requested", False)
     st.session_state.setdefault("video_ocr_full_progress", {})
     st.session_state.setdefault("video_ocr_full_live_rows", [])
+    st.session_state.setdefault("video_ocr_full_target_fps", "2")
 
     def _is_running() -> bool:
         fut = st.session_state.get("video_ocr_full_future")
@@ -56,6 +57,87 @@ def render(ns):
     elif wd_running:
         st.caption(f"Watchdog aktiv (anderer Task): {wd_current or '—'}")
 
+    def _watchdog_live_ocr_for_folder(folder: str, wd_cur: str) -> tuple[dict, list[dict], str]:
+        """Read live OCR progress/snapshots from results JSON while watchdog OCR runs."""
+        if not folder:
+            return {}, [], ""
+        base_lp = str(st.session_state.get("local_base_path") or "").strip()
+        base_dir = Path(base_lp).expanduser().resolve() if base_lp else Path.cwd()
+        json_candidates = [
+            base_dir / "results" / f"results_{folder}.json",
+            Path(str(st.session_state.get("mat_selected_key") or "").strip()),
+            Path("_temp") / f"results_{folder}.json",
+        ]
+        json_path = None
+        for cand in json_candidates:
+            try:
+                if cand and str(cand).strip() and cand.exists() and cand.is_file():
+                    json_path = cand
+                    break
+            except Exception:
+                continue
+        if json_path is None:
+            return {}, [], ""
+
+        try:
+            doc = json.loads(json_path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return {}, [], str(json_path)
+        rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+        if not isinstance(rr, dict):
+            return {}, [], str(json_path)
+        ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
+        tbl = ocr.get("table") if isinstance(ocr.get("table"), dict) else {}
+        if not isinstance(tbl, dict) or not tbl:
+            return {}, [], str(json_path)
+
+        time_col = list(tbl.get("time_s") or [])
+        frame_col = list(tbl.get("frame_idx") or [])
+        row_count = len(time_col) if time_col else len(frame_col)
+        if row_count <= 0:
+            return {}, [], str(json_path)
+
+        # Parse frame progress from watchdog current line: "... Frame X/Y (Z%)"
+        done_frame = total_frame = None
+        if "Frame " in str(wd_cur or "") and "/" in str(wd_cur or ""):
+            try:
+                tail = str(wd_cur).split("Frame ", 1)[1]
+                lhs = tail.split("(", 1)[0].strip()
+                a_str, b_str = lhs.split("/", 1)
+                done_frame = int(float(a_str.strip()))
+                total_frame = int(float(b_str.strip()))
+            except Exception:
+                done_frame = total_frame = None
+
+        # Build last snapshots (numbers table shown in UI)
+        keys = list(tbl.keys())
+        start_idx = max(0, row_count - 40)
+        live_rows: list[dict] = []
+        for i in range(start_idx, row_count):
+            row = {}
+            for k in keys:
+                v = tbl.get(k)
+                if isinstance(v, list) and i < len(v):
+                    row[k] = v[i]
+            if row:
+                live_rows.append(row)
+
+        last_t = 0.0
+        try:
+            if time_col:
+                last_t = float(time_col[-1])
+        except Exception:
+            last_t = 0.0
+
+        summary = {
+            "done": int(done_frame or row_count),
+            "total": int(total_frame or max(row_count, 1)),
+            "t_s": float(last_t),
+            "rows": int(row_count),
+            "partial": bool((ocr.get("params") or {}).get("partial")) if isinstance(ocr.get("params"), dict) else False,
+        }
+        return summary, live_rows, str(json_path)
+
     def _scalar(v, default: float = 0.0) -> float:
         if isinstance(v, (list, tuple)):
             v = v[0] if v else default
@@ -87,8 +169,23 @@ def render(ns):
     st.caption(f"Vollvideo: {str(full_video) if full_video is not None else '-'}")
     st.caption(f"OCR-ROI (ohne track_minimap): {len(ocr_rois)}")
 
-    can_run = bool(ocr_rois) and bool(capture_folder) and (full_video is not None) and not wd_ocr_active
     running = _is_running()
+
+    _fps_options = ["2", "1", "max"]
+    _fps_labels = {"2": "2 fps (Standard)", "1": "1 fps", "max": "max (native fps)"}
+    _fps_cur = str(st.session_state.get("video_ocr_full_target_fps", "2") or "2")
+    if _fps_cur not in _fps_options:
+        _fps_cur = "2"
+    fps_mode = st.selectbox(
+        "OCR Auflösung",
+        options=_fps_options,
+        index=_fps_options.index(_fps_cur),
+        format_func=lambda v: _fps_labels.get(v, v),
+        disabled=running or wd_ocr_active,
+        key="video_ocr_full_target_fps",
+    )
+
+    can_run = bool(ocr_rois) and bool(capture_folder) and (full_video is not None) and not wd_ocr_active
     stop_requested = bool(st.session_state.get("video_ocr_full_stop_requested"))
 
     c1, c2 = st.columns(2)
@@ -107,12 +204,28 @@ def render(ns):
     )
 
     if run_clicked and can_run and (not running):
+        rois_snapshot = [dict(r) for r in list(st.session_state.get("rois") or []) if isinstance(r, dict)]
+        capture_folder_snapshot = str(capture_folder or "").strip()
+        full_video_snapshot = str(full_video) if full_video is not None else ""
+        target_fps_snapshot = str(fps_mode or "2").strip() or "2"
+        # Snapshot all session state needed by the background thread — session state
+        # is not accessible from non-Streamlit threads, so capture here in the main thread.
+        track_params_snapshot = {
+            "moving_pt_color_range": dict(st.session_state.get("moving_pt_color_range") or {}),
+            "ref_track_img": st.session_state.get("ref_track_img"),
+            "minimap_pts": list(st.session_state.get("minimap_pts") or []),
+            "ref_track_pts": list(st.session_state.get("ref_track_pts") or []),
+            "centerline_px": list(st.session_state.get("centerline_px") or []),
+            "roi_global_scale": float(st.session_state.get("roi_global_scale", 1.2) or 1.2),
+            "progress_step_frames": int(st.session_state.get("video_ocr_live_progress_step_frames", 2) or 2),
+        }
         st.session_state.video_ocr_full_running = True
         st.session_state.roi_ocr_full_running = True
         st.session_state.video_ocr_full_stop_requested = False
         st.session_state.video_ocr_full_progress = {"done": 0, "total": 1, "t_s": 0.0}
         st.session_state.video_ocr_full_live_rows = []
         stop_event = threading.Event()
+        set_status("Video OCR gestartet (Hintergrund).", "info")
 
         progress_ref = st.session_state.video_ocr_full_progress
         rows_ref = st.session_state.video_ocr_full_live_rows
@@ -132,7 +245,15 @@ def render(ns):
             def _stop_cb() -> bool:
                 return bool(stop_event.is_set())
 
-            ok, msg, res = _run_video_ocr_fullvideo_framewise_now(progress_cb=_on_progress, stop_cb=_stop_cb)
+            ok, msg, res = _run_video_ocr_fullvideo_framewise_now(
+                progress_cb=_on_progress,
+                stop_cb=_stop_cb,
+                rois_override=rois_snapshot,
+                capture_folder_override=capture_folder_snapshot,
+                video_path_override=full_video_snapshot,
+                target_fps_str=target_fps_snapshot,
+                track_params_override=track_params_snapshot,
+            )
             return {"ok": bool(ok), "msg": str(msg or ""), "res": res}
 
         st.session_state.video_ocr_full_stop_event = stop_event
@@ -153,14 +274,30 @@ def render(ns):
     done_n = int(prog.get("done", 0) or 0)
     total_n = int(max(1, int(prog.get("total", 1) or 1)))
     t_s = float(prog.get("t_s", 0.0) or 0.0)
+    # If watchdog OCR is active for this folder, display watchdog live progress/values.
+    live_rows = list(st.session_state.get("video_ocr_full_live_rows") or [])
+    if wd_ocr_active and capture_folder:
+        wd_prog, wd_rows, wd_json = _watchdog_live_ocr_for_folder(capture_folder, wd_current)
+        if wd_prog:
+            done_n = int(wd_prog.get("done", done_n) or done_n)
+            total_n = int(max(1, int(wd_prog.get("total", total_n) or total_n)))
+            t_s = float(wd_prog.get("t_s", t_s) or t_s)
+            live_rows = wd_rows if wd_rows else live_rows
+            st.caption(
+                f"Watchdog OCR-Live: rows={int(wd_prog.get('rows', 0) or 0)} | "
+                f"partial={bool(wd_prog.get('partial'))} | json={wd_json or '-'}"
+            )
+
     st.progress(min(1.0, done_n / total_n), text=f"{done_n}/{total_n} Frames | t={t_s:.2f}s")
 
     st.caption("Live-Progress (OCR-Werte je Update, inkl. Track-Minimap wenn vorhanden):")
-    live_rows = list(st.session_state.get("video_ocr_full_live_rows") or [])
     if live_rows:
         st.dataframe(pd.DataFrame(live_rows), width="stretch", hide_index=True, height=320)
     else:
         st.dataframe(pd.DataFrame(columns=["frame_idx", "time_s"]), width="stretch", hide_index=True, height=220)
+
+    if running or _is_running():
+        st.info("Video OCR läuft im Hintergrund. Fortschritt und Werte werden live aktualisiert.", icon="⏳")
 
     last = st.session_state.get("video_ocr_full_result") or {}
     if isinstance(last, dict) and last:
@@ -173,6 +310,6 @@ def render(ns):
         else:
             st.caption(f"Letzter Lauf fehlgeschlagen: {str(last.get('error', ''))}")
 
-    if running or _is_running():
+    if running or _is_running() or wd_ocr_active:
         time.sleep(0.25)
         st.rerun()

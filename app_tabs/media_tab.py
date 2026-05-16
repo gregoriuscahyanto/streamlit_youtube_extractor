@@ -1,4 +1,4 @@
-"""Unified media library — replaces MAT Selection, MAT→JSON, YouTube Download tabs.
+﻿"""Unified media library — replaces MAT Selection, MAT→JSON, YouTube Download tabs.
 
 Data source: local results/*.json + results/*.mat + captures/ + logs/youtube_download_table.json
 No R2, no framepack, no audio proxy.
@@ -39,7 +39,16 @@ def _base() -> Path:
 
 
 def _lamp(ok: bool) -> str:
-    return "✅" if ok else "❌"
+    return "🟢" if ok else "🔴"
+
+
+def _lamp3(status: str) -> str:
+    """Green / yellow / red circle for three-state status fields."""
+    if status == "vollständig":
+        return "🟢"
+    if status == "unvollständig":
+        return "🟡"
+    return "🔴"
 
 
 def _read_json_detail(jp: Path) -> dict:
@@ -79,12 +88,75 @@ def _read_json_detail(jp: Path) -> dict:
     video_faulty = bool(ocr.get("video_faulty")) or bool(
         (meta.get("video_faulty") if isinstance(meta, dict) else False)
     )
+
+    # Determine if track_minimap ROI is present in roi_table.
+    roi_table = ocr.get("roi_table") or ocr.get("roi_table_raw")
+    has_track_minimap = False
+    if isinstance(roi_table, list):
+        for row in roi_table:
+            nm = str((row or {}).get("name_roi") or (row or {}).get("name") or "").strip().lower()
+            if nm == "track_minimap":
+                has_track_minimap = True
+                break
+    elif isinstance(roi_table, dict):
+        names = roi_table.get("name_roi") or roi_table.get("name") or []
+        if isinstance(names, list):
+            has_track_minimap = any(str(n or "").strip().lower() == "track_minimap" for n in names)
+        else:
+            has_track_minimap = str(names or "").strip().lower() == "track_minimap"
+    # Also check trkCalSlim.roi as a fallback indicator (OCRExtractor always writes it there).
+    trk_slim = ocr.get("trkCalSlim") if isinstance(ocr.get("trkCalSlim"), dict) else {}
+    if not has_track_minimap and isinstance(trk_slim, dict):
+        trk_roi = trk_slim.get("roi")
+        if isinstance(trk_roi, (list, tuple)) and len(trk_roi) >= 4:
+            try:
+                if float(trk_roi[2]) > 0 and float(trk_roi[3]) > 0:
+                    has_track_minimap = True
+            except Exception:
+                pass
+
+    # If track_minimap is present, check that all calibration params are saved.
+    roi_incomplete_track = False
+    if has_track_minimap:
+        def _pts_ok(v) -> bool:
+            return isinstance(v, list) and len(v) >= 4
+        def _color_ok(v) -> bool:
+            return isinstance(v, dict) and "h_lo" in v
+        def _cl_ok(v) -> bool:
+            if not isinstance(v, (list, tuple)) or len(v) < 2:
+                return False
+            try:
+                import numpy as _np
+                arr = _np.asarray(v, dtype=float)
+                return arr.ndim == 2 and arr.shape[0] >= 2 and arr.shape[1] >= 2
+            except Exception:
+                return False
+        missing = []
+        if not _pts_ok(trk_slim.get("minimap_pts")):
+            missing.append("minimap_pts")
+        if not _pts_ok(trk_slim.get("ref_pts")):
+            missing.append("ref_pts")
+        if not _color_ok(trk_slim.get("moving_pt_color_range")):
+            missing.append("color_range")
+        if not _cl_ok(trk_slim.get("centerline_px")):
+            missing.append("centerline_px")
+        roi_incomplete_track = bool(missing)
+
+    roi_exists = bool(ocr.get("roi_table"))
+    if roi_exists and has_track_minimap and roi_incomplete_track:
+        roi_status = "unvollständig"
+    elif roi_exists:
+        roi_status = "vollständig"
+    else:
+        roi_status = "nein"
+
     detail = {
         "title": str(meta.get("title") or meta.get("video_title") or ""),
         "youtube_link": str(meta.get("url") or meta.get("youtube_url") or meta.get("link") or ""),
         "upload_date": str(meta.get("pubDate") or meta.get("upload_date") or ""),
         "duration": float(meta.get("duration") or 0.0),
-        "roi": bool(ocr.get("roi_table")),
+        "roi": roi_exists,
+        "roi_status": roi_status,
         "ocr": ocr_st,
         "audio_config": bool(rr.get("audio_config")),
         "validierung": bool(rr.get("audio_validation")),
@@ -146,6 +218,7 @@ def _scan_rows(base: Path) -> list[dict]:
                 "downloaded_at": "",
                 "last_error": "",
                 "roi": detail.get("roi", False),
+                "roi_status": detail.get("roi_status", "nein"),
                 "ocr": detail.get("ocr", "nein"),
                 "audio_config": detail.get("audio_config", False),
                 "validierung": detail.get("validierung", False),
@@ -163,7 +236,8 @@ def _scan_rows(base: Path) -> list[dict]:
             "duration": 0.0, "json_exists": False, "mat_exists": True,
             "video_exists": False, "audio_exists": False,
             "download_status": "", "downloaded_at": "", "last_error": "",
-            "roi": False, "ocr": "nein", "audio_config": False, "validierung": False,
+            "roi": False, "roi_status": "nein", "ocr": "nein",
+            "audio_config": False, "validierung": False,
             "json_path": "", "mat_path": str(mp),
         })
 
@@ -213,7 +287,8 @@ def _scan_rows(base: Path) -> list[dict]:
             "download_status": str(db_row.get("download_status") or "pending"),
             "downloaded_at": str(db_row.get("downloaded_at") or ""),
             "last_error": str(db_row.get("last_error") or ""),
-            "roi": False, "ocr": "nein", "audio_config": False, "validierung": False,
+            "roi": False, "roi_status": "nein", "ocr": "nein",
+            "audio_config": False, "validierung": False,
             "json_path": str(db_row.get("json_path") or ""),
             "mat_path": "",
         })
@@ -223,8 +298,8 @@ def _scan_rows(base: Path) -> list[dict]:
 
 def _build_df(rows: list[dict]):
     import pandas as pd
-    OCR = {"vollständig": "✅", "teilweise": "⚠️", "nein": "❌"}
-    DL = {"downloaded": "✅", "downloading": "⏳", "error": "❌", "pending": "⏳", "": "-"}
+    OCR_MAP = {"vollständig": "🟢", "teilweise": "🟡", "nein": "🔴"}
+    DL = {"downloaded": "🟢", "downloading": "🟡", "error": "🔴", "pending": "🟡", "": "-"}
     return pd.DataFrame([{
         "Ordner": r["folder"],
         "Titel": r["title"],
@@ -233,8 +308,8 @@ def _build_df(rows: list[dict]):
         "MAT": _lamp(r["mat_exists"]),
         "Video": _lamp(r["video_exists"]),
         "Audio": _lamp(r["audio_exists"]),
-        "ROI": _lamp(r["roi"]),
-        "OCR": OCR.get(r["ocr"], r["ocr"]),
+        "ROI": _lamp3(r.get("roi_status", "nein" if not r["roi"] else "vollständig")),
+        "OCR": OCR_MAP.get(r["ocr"], r["ocr"]),
         "Audio-Konfig": _lamp(r["audio_config"]),
         "Validierung": _lamp(r["validierung"]),
         "Hochgeladen": r["upload_date"],
@@ -500,39 +575,65 @@ def render(ns: dict) -> None:
 
     def _parse_roi_table(roi_table) -> list[dict]:
         """Convert roi_table (list-of-dicts OR columnar dict) to list of normalized dicts."""
+        def _coords_from_any(v) -> list[float]:
+            if isinstance(v, (list, tuple)) and len(v) >= 4:
+                return [_scalar(v[0]), _scalar(v[1]), _scalar(v[2]), _scalar(v[3])]
+            txt = str(v or "").strip()
+            if not txt:
+                return [0.0, 0.0, 0.0, 0.0]
+            try:
+                nums = [float(x) for x in txt.replace(",", " ").replace(";", " ").split()]
+                if len(nums) >= 4:
+                    return [float(nums[0]), float(nums[1]), float(nums[2]), float(nums[3])]
+            except Exception:
+                pass
+            return [0.0, 0.0, 0.0, 0.0]
+
         out: list[dict] = []
         if isinstance(roi_table, list):
-            # Format A: [{"name":…,"x":…,"y":…,"w":…,"h":…}, …]
             for r in roi_table:
                 if not isinstance(r, dict):
                     continue
                 nr: dict = {}
                 for k, v in r.items():
                     nr[k] = v[0] if isinstance(v, (list, tuple)) and len(v) == 1 else v
-                for field in ("x", "y", "w", "h"):
-                    nr[field] = _scalar(nr.get(field), 0.0)
+                if all(f in nr for f in ("x", "y", "w", "h")):
+                    for field in ("x", "y", "w", "h"):
+                        nr[field] = _scalar(nr.get(field), 0.0)
+                else:
+                    cx, cy, cw, ch = _coords_from_any(nr.get("roi"))
+                    nr["x"], nr["y"], nr["w"], nr["h"] = cx, cy, cw, ch
+                if str(nr.get("name", "")).strip() == "":
+                    nr["name"] = str(nr.get("name_roi", "roi") or "roi")
                 nr.setdefault("name", "roi")
                 nr.setdefault("fmt", "any")
                 nr.setdefault("max_scale", 1.2)
                 out.append(nr)
 
         elif isinstance(roi_table, dict):
-            # Format B: columnar {"name_roi":[…], "roi":[[x,y,w,h],…], "fmt":[…], "max_scale":[…]}
             names = roi_table.get("name_roi") or roi_table.get("name") or []
             coords_list = roi_table.get("roi") or []
             fmts = roi_table.get("fmt") or []
             scales = roi_table.get("max_scale") or []
+            if isinstance(names, tuple):
+                names = list(names)
+            if isinstance(coords_list, tuple):
+                coords_list = list(coords_list)
+            if isinstance(fmts, tuple):
+                fmts = list(fmts)
+            if isinstance(scales, tuple):
+                scales = list(scales)
             if not isinstance(names, list):
-                names = []
+                names = [names] if names not in (None, "") else []
+            if not isinstance(coords_list, list):
+                coords_list = [coords_list] if coords_list not in (None, "") else []
+            if not isinstance(fmts, list):
+                fmts = [fmts] if fmts not in (None, "") else []
+            if not isinstance(scales, list):
+                scales = [scales] if scales not in (None, "") else []
             for i, name in enumerate(names):
                 coords = coords_list[i] if i < len(coords_list) else []
-                if isinstance(coords, (list, tuple)) and len(coords) >= 4:
-                    x = _scalar(coords[0])
-                    y = _scalar(coords[1])
-                    w = _scalar(coords[2])
-                    h = _scalar(coords[3])
-                else:
-                    x = y = w = h = 0.0
+                x, y, w, h = _coords_from_any(coords)
                 fmt_val = fmts[i] if i < len(fmts) else "any"
                 scale_val = _scalar(scales[i], 1.2) if i < len(scales) else 1.2
                 out.append({
@@ -542,45 +643,165 @@ def render(ns: dict) -> None:
                     "max_scale": scale_val,
                 })
         return out
-
     def _load_folder(folder: str, json_path_str: str) -> list[str]:
         """Load folder into session state (JSON + ROIs + video). Returns warnings."""
         msgs: list[str] = []
         st.session_state.capture_folder = folder
+        _pending_rois: list[dict] = []
+        _pending_t_start = None
+        _pending_t_end = None
+        _pending_ref_pts = None
+        _pending_minimap_pts = None
+        _pending_color_range = None
 
-        if json_path_str:
+        def _json_candidates_for_folder() -> list[Path]:
+            cands: list[Path] = []
+            seen: set[str] = set()
+
+            def _add(p: Path | None) -> None:
+                if p is None:
+                    return
+                sp = str(p)
+                if sp in seen:
+                    return
+                seen.add(sp)
+                cands.append(p)
+
+            if json_path_str:
+                _add(Path(json_path_str))
+            _add(_base() / "results" / f"results_{folder}.json")
+            return cands
+
+        def _read_json_doc(path: Path) -> dict:
             try:
-                raw_text = Path(json_path_str).read_text(encoding="utf-8", errors="ignore")
+                raw_text = path.read_text(encoding="utf-8", errors="ignore")
                 doc = json.loads(raw_text)
-            except Exception as e:
-                msgs.append(f"JSON lesen: {e}")
-                doc = {}
+                return doc if isinstance(doc, dict) else {}
+            except Exception:
+                return {}
 
-            try:
-                rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+        def _extract_roi_info(doc: dict) -> tuple[list[dict], int, int]:
+            rr = {}
+            if isinstance(doc, dict):
+                rr = doc.get("recordResult")
                 if not isinstance(rr, dict):
-                    rr = {}
-                ocr = rr.get("ocr") or {}
-                if not isinstance(ocr, dict):
-                    ocr = {}
+                    rr = doc.get("recordresult")
+            if not isinstance(rr, dict):
+                rr = {}
+            ocr = rr.get("ocr")
+            if not isinstance(ocr, dict):
+                ocr = rr.get("OCR")
+            if not isinstance(ocr, dict):
+                ocr = {}
+            if not isinstance(ocr, dict):
+                ocr = {}
+            roi_src = ocr.get("roi_table")
+            if not roi_src:
+                roi_src = ocr.get("roi_table_raw")
+            parsed_rois = _parse_roi_table(roi_src)
+            n_all = len(parsed_rois)
+            n_ocr = sum(
+                1
+                for r in parsed_rois
+                if str(r.get("name", "")).strip().lower() != "track_minimap"
+                and _scalar(r.get("w")) > 0
+                and _scalar(r.get("h")) > 0
+            )
+            return parsed_rois, n_ocr, n_all
 
-                roi_table = ocr.get("roi_table")
-                parsed = _parse_roi_table(roi_table)
-                if parsed:
-                    st.session_state.rois = parsed
-                else:
-                    msgs.append(f"roi_table: kein ROI gefunden (type={type(roi_table).__name__}, val={str(roi_table)[:80]})")
+        def _parse_pts(v) -> list[list[float]]:
+            if not isinstance(v, (list, tuple)):
+                return []
+            if v and isinstance(v[0], (list, tuple)) and len(v[0]) >= 2:
+                out = []
+                for p in v:
+                    try:
+                        out.append([float(p[0]), float(p[1])])
+                    except Exception:
+                        pass
+                return out
+            vals = []
+            for x in v:
+                try:
+                    vals.append(float(x))
+                except Exception:
+                    pass
+            out = []
+            for i in range(0, len(vals) - 1, 2):
+                out.append([vals[i], vals[i + 1]])
+            return out
 
-                params = ocr.get("params") or {}
-                if isinstance(params, dict):
-                    if "start_s" in params:
-                        st.session_state.t_start = _scalar(params.get("start_s", 0.0))
-                    if "end_s" in params:
-                        st.session_state.t_end = _scalar(params.get("end_s", 0.0))
+        best_doc: dict = {}
+        best_rois: list[dict] = []
+        best_path = ""
+        best_n_ocr = -1
+        best_n_all = -1
+        for cand in _json_candidates_for_folder():
+            if not cand.exists():
+                continue
+            doc = _read_json_doc(cand)
+            rois, n_ocr, n_all = _extract_roi_info(doc)
+            if (n_ocr > best_n_ocr) or (n_ocr == best_n_ocr and n_all > best_n_all):
+                best_doc = doc
+                best_rois = rois
+                best_path = str(cand)
+                best_n_ocr = n_ocr
+                best_n_all = n_all
+        doc = best_doc if isinstance(best_doc, dict) else {}
+        if best_path:
+            st.session_state["mat_selected_key"] = best_path
+        elif json_path_str:
+            msgs.append(f"JSON fehlt/nicht lesbar: {json_path_str}")
 
-                st.session_state["mat_selected_key"] = json_path_str
-            except Exception as e:
-                msgs.append(f"JSON verarbeiten: {e}")
+        try:
+            rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+            if not isinstance(rr, dict) and isinstance(doc, dict):
+                rr = doc.get("recordresult")
+            if not isinstance(rr, dict):
+                rr = {}
+            ocr = rr.get("ocr")
+            if not isinstance(ocr, dict):
+                ocr = rr.get("OCR")
+            if not isinstance(ocr, dict):
+                ocr = {}
+            if not isinstance(ocr, dict):
+                ocr = {}
+
+            if best_rois:
+                _pending_rois = list(best_rois)
+            elif best_path:
+                roi_table = ocr.get("roi_table") or ocr.get("roi_table_raw")
+                msgs.append(f"roi_table: kein ROI gefunden (type={type(roi_table).__name__}, val={str(roi_table)[:80]})")
+
+            params = ocr.get("params") or {}
+            if isinstance(params, dict):
+                if "start_s" in params:
+                    _pending_t_start = _scalar(params.get("start_s", 0.0))
+                if "end_s" in params:
+                    _pending_t_end = _scalar(params.get("end_s", 0.0))
+
+            trk = ocr.get("trkCalSlim") if isinstance(ocr.get("trkCalSlim"), dict) else {}
+            if isinstance(trk, dict):
+                _rp = _parse_pts((trk.get("ref_pts") if isinstance(trk.get("ref_pts"), (list, tuple)) else None) or trk.get("ptsRef"))
+                _mp = _parse_pts((trk.get("minimap_pts") if isinstance(trk.get("minimap_pts"), (list, tuple)) else None) or trk.get("ptsMini"))
+                if _rp:
+                    _pending_ref_pts = _rp
+                if _mp:
+                    _pending_minimap_pts = _mp
+                if isinstance(trk.get("moving_pt_color_range"), dict):
+                    _pending_color_range = dict(trk.get("moving_pt_color_range") or {})
+                elif trk.get("marker") is not None:
+                    marker_to_cr = globals().get("_marker_to_color_range")
+                    if callable(marker_to_cr):
+                        try:
+                            _cr = marker_to_cr(trk.get("marker"))
+                            if isinstance(_cr, dict) and _cr:
+                                _pending_color_range = _cr
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            msgs.append(f"JSON verarbeiten: {e}")
 
         try:
             load_vid = globals().get("_try_load_video_for_capture_folder_with_fallback")
@@ -595,6 +816,22 @@ def render(ns: dict) -> None:
                         apply_vid(str(vp), vp.name)
         except Exception as e:
             msgs.append(f"Video: {e}")
+
+        # Important: apply loaded OCR config AFTER video load.
+        # _apply_video() resets rois/t_start/t_end; writing here keeps loaded values.
+        if _pending_rois:
+            st.session_state.rois = _pending_rois
+        if _pending_t_start is not None:
+            st.session_state.t_start = float(_pending_t_start)
+        if _pending_t_end is not None:
+            st.session_state.t_end = float(_pending_t_end)
+        if isinstance(_pending_ref_pts, list) and _pending_ref_pts:
+            st.session_state.ref_track_pts = _pending_ref_pts
+        if isinstance(_pending_minimap_pts, list) and _pending_minimap_pts:
+            st.session_state.minimap_pts = _pending_minimap_pts
+            st.session_state.minimap_next_pt_idx = len(_pending_minimap_pts)
+        if isinstance(_pending_color_range, dict) and _pending_color_range:
+            st.session_state.moving_pt_color_range = _pending_color_range
 
         return msgs
 
@@ -644,3 +881,4 @@ def render(ns: dict) -> None:
         with st.expander("Details", expanded=False):
             display = {k: v for k, v in sel_row.items() if k not in ("duration",)}
             st.json(display)
+

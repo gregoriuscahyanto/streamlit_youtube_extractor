@@ -660,6 +660,7 @@ def render(ns):
             finally:
                 st.session_state.roi_save_running = False
                 _save_busy = False
+            st.rerun()
 
         _stamp_col1, _stamp_col2 = st.columns(2)
         if _stamp_col1.button("Kein ROI vorhanden", width="stretch", key="roi_mark_no_roi_btn",
@@ -679,6 +680,7 @@ def render(ns):
             finally:
                 st.session_state.roi_save_running = False
                 _save_busy = False
+            st.rerun()
 
         if _stamp_col2.button("Video fehlerhaft", width="stretch", key="roi_mark_video_faulty_btn",
                               disabled=(_save_busy or _ocr_probe_busy or _ocr_full_busy),
@@ -697,6 +699,7 @@ def render(ns):
             finally:
                 st.session_state.roi_save_running = False
                 _save_busy = False
+            st.rerun()
 
         _next_disabled = _ocr_probe_busy or _ocr_full_busy or bool(st.session_state.get("roi_next_load_running", False)) or (not bool(st.session_state.get("roi_saved_once", False)))
         if st.button("Nächste Datei laden", width="stretch", key="roi_load_next_missing_btn",

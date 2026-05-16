@@ -25,7 +25,6 @@ _YT_WATCHDOG: dict = {
     "tasks": {
         "mat_json": True,
         "download": True,
-        "sync_lite": True,
         "ocr": True,
     },
 }

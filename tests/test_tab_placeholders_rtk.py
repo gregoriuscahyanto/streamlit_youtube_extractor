@@ -10,10 +10,12 @@ def _read(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
 
 
-def test_setup_tab_has_placeholder_widgets_for_disconnected_cloud_root():
+def test_setup_tab_has_local_db_widgets():
     txt = _read("app_tabs/setup_tab.py")
-    assert "root_dd_placeholder" in txt
-    assert "refresh_root_placeholder" in txt
+    assert "Lokale DB" in txt
+    assert "Ordner waehlen (lokal)" in txt
+    assert 'key="local_pick_btn"' in txt
+    assert "Lokaler Basispfad:" in txt
 
 
 def test_sync_tab_uses_single_stable_table_widget_key():

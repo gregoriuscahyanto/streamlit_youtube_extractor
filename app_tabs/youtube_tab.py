@@ -36,14 +36,6 @@ def render(ns):
     st.caption("Rein Python: Download über scripts/record_youtube_cfr.py (kein MATLAB, kein yt-dlp im App-Flow).")
     st.session_state.setdefault("yt_open_new_window", True)
     st.session_state.setdefault("yt_move_other_display", False)
-    def _lite_target_mode() -> str:
-        mode = str(st.session_state.get("compressed_db_mode") or "local").strip().lower()
-        if mode not in {"local", "r2"}:
-            mode = "local"
-        st.session_state.yt_lite_storage_target = mode
-        return mode
-
-    lite_target_mode = _lite_target_mode()
     w1, w2 = st.columns(2)
     st.session_state.yt_open_new_window = bool(
         w1.checkbox("YouTube in neuem Fenster öffnen", value=bool(st.session_state.get("yt_open_new_window", True)))
@@ -80,13 +72,7 @@ def render(ns):
         return Path.cwd()
 
     st.caption(f"JSON-Zielpfad: {_capture_base() / 'results'}")
-    if lite_target_mode == "r2":
-        pfx = str(st.session_state.get("r2_prefix") or "").strip("/")
-        cap_dst = f"{pfx}/captures/<capture_folder>/" if pfx else "captures/<capture_folder>/"
-        res_dst = f"{pfx}/results/" if pfx else "results/"
-        st.caption(f"Lite-Ziel (R2): {cap_dst} + {res_dst}")
-    else:
-        st.caption(f"Lite-Ziel (lokal): {_capture_base() / 'captures' / '<capture_folder>'}")
+    st.caption(f"Video/Audio-Zielpfad: {_capture_base() / 'captures' / '<capture_folder>'}")
     st.session_state.setdefault("yt_last_meta_json_path", "")
 
     def _parse_result_lines(output: str) -> dict:
@@ -354,154 +340,6 @@ def render(ns):
             set_status(f"JSON gespeichert: {path}", "ok")
         return True, str(path)
 
-    def _local_framepack_1fps(folder: str, base_override=None) -> tuple[bool, str, int]:
-        out_video, _out_audio = _capture_media_paths(folder, base_override=base_override)
-        if (not out_video.exists()) or out_video.stat().st_size <= 0:
-            return False, "video fehlt", 0
-        cap = cv2.VideoCapture(str(out_video))
-        if not cap.isOpened():
-            return False, f"Video kann nicht geöffnet werden: {out_video.name}", 0
-        try:
-            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            if fps <= 0:
-                fps = 25.0
-            duration_s = (frame_count / fps) if frame_count > 0 else 0.0
-            seconds = max(1, int(np.ceil(duration_s)))
-            fp_dir = out_video.parent / "frames_1fps"
-            fp_dir.mkdir(parents=True, exist_ok=True)
-            max_w = int(globals().get("FRAMEPACK_MAX_WIDTH") or 0)
-            jpg_q = int(globals().get("FRAMEPACK_JPEG_QUALITY") or 70)
-            written = 0
-            frames = []
-            for sec in range(seconds):
-                cap.set(cv2.CAP_PROP_POS_MSEC, float(sec) * 1000.0)
-                ok, frame = cap.read()
-                if (not ok) or frame is None:
-                    continue
-                if max_w > 0:
-                    h0, w0 = frame.shape[:2]
-                    if w0 > max_w:
-                        nw = int(max_w)
-                        nh = max(1, int(round(h0 * (nw / float(w0)))))
-                        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
-                ok_enc, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpg_q)])
-                if not ok_enc:
-                    continue
-                fname = f"{sec:06d}.jpg"
-                fpath = fp_dir / fname
-                fpath.write_bytes(enc.tobytes())
-                written += 1
-                frames.append({"sec": int(sec), "file": fname, "bytes": int(len(enc))})
-            idx_payload = {
-                "type": "frame_pack",
-                "sample_rate_hz": 1.0,
-                "source_video": out_video.name,
-                "source_fps": float(fps),
-                "duration_s": float(duration_s),
-                "frame_count": int(written),
-                "frames": frames,
-                "created_at": datetime.utcnow().isoformat() + "Z",
-            }
-            (fp_dir / "index.json").write_text(json.dumps(idx_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            return True, "", int(written)
-        except Exception as e:
-            return False, str(e), 0
-        finally:
-            cap.release()
-
-    def _local_audio_proxy_1k(folder: str, base_override=None) -> tuple[bool, str, str]:
-        out_video, out_audio = _capture_media_paths(folder, base_override=base_override)
-        src = out_audio if out_audio.exists() and out_audio.stat().st_size > 0 else out_video
-        if (not src.exists()) or src.stat().st_size <= 0:
-            return False, "Audio/Video-Quelle fehlt", ""
-        out_proxy = out_video.parent / str(globals().get("AUDIO_PROXY_NAME") or "audio_proxy_1k.wav")
-        builder = globals().get("_build_audio_proxy_wav")
-        if callable(builder):
-            ok, msg = builder(src, out_proxy)
-            return bool(ok), str(msg or ""), str(out_proxy if ok else "")
-        try:
-            ffmpeg_exe = shutil.which("ffmpeg")
-        except Exception:
-            ffmpeg_exe = None
-        if not ffmpeg_exe:
-            return False, "ffmpeg nicht gefunden", ""
-        try:
-            low = int(globals().get("AUDIO_LOWPASS_HZ") or 1000)
-            sr = int(globals().get("AUDIO_TARGET_SR") or 4000)
-            cmd = [
-                ffmpeg_exe, "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", str(sr),
-                "-af", f"lowpass=f={low}", str(out_proxy),
-            ]
-            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if p.returncode == 0 and out_proxy.exists() and out_proxy.stat().st_size > 0:
-                return True, "", str(out_proxy)
-            return False, "AudioProxy-Erzeugung fehlgeschlagen", ""
-        except Exception as e:
-            return False, str(e), ""
-
-    def _copy_json_to_local_capture(folder: str, json_path: str, base_override=None) -> tuple[bool, str]:
-        src = Path(str(json_path or "").strip())
-        if not src.exists():
-            return False, f"JSON fehlt: {src}"
-        out_video, _out_audio = _capture_media_paths(folder, base_override=base_override)
-        dst = out_video.parent / src.name
-        dst.write_bytes(src.read_bytes())
-        return True, str(dst)
-
-    def _upload_json_copy_to_r2(folder: str, json_path: str) -> tuple[bool, str]:
-        client = st.session_state.get("r2_client")
-        if client is None or (not bool(st.session_state.get("r2_connected"))):
-            return False, "R2 nicht verbunden"
-        src = Path(str(json_path or "").strip())
-        if not src.exists():
-            return False, f"JSON fehlt: {src}"
-        payload = src.read_text(encoding="utf-8", errors="replace")
-        pfx = str(st.session_state.get("r2_prefix") or "").strip("/")
-        cap_key = f"{pfx}/captures/{folder}/{src.name}" if pfx else f"captures/{folder}/{src.name}"
-        res_key = f"{pfx}/results/{src.name}" if pfx else f"results/{src.name}"
-        ok1, msg1 = client.upload_string(payload, cap_key)
-        if not ok1:
-            return False, f"R2 JSON-Kopie fehlgeschlagen: {msg1}"
-        ok2, msg2 = client.upload_string(payload, res_key)
-        if not ok2:
-            return False, f"R2 results JSON fehlgeschlagen: {msg2}"
-        return True, f"{cap_key} + {res_key}"
-
-    def _postprocess_lite_assets(folder: str, json_path: str, *, target_override: str | None = None, base_override=None) -> tuple[bool, str]:
-        target = str(target_override if target_override is not None else _lite_target_mode()).strip().lower()
-        if target == "r2":
-            if (not bool(st.session_state.get("r2_connected"))) or st.session_state.get("r2_client") is None:
-                return False, "R2 gewählt, aber nicht verbunden"
-            out_video, _out_audio = _capture_media_paths(folder, base_override=base_override)
-            uploader = globals().get("_upload_framepack_1fps")
-            if not callable(uploader):
-                return False, "_upload_framepack_1fps nicht verfügbar"
-            ok_fp, msg_fp, n_fp, note_fp = uploader(out_video, folder, progress_cb=None)
-            if not ok_fp:
-                return False, f"Framepack R2 fehlgeschlagen: {msg_fp}"
-            up_audio = globals().get("_upload_audio_proxy_1k")
-            if not callable(up_audio):
-                return False, "_upload_audio_proxy_1k nicht verfügbar"
-            ok_a, msg_a = up_audio(folder)
-            if not ok_a:
-                return False, f"AudioProxy R2 fehlgeschlagen: {msg_a}"
-            ok_j, msg_j = _upload_json_copy_to_r2(folder, json_path)
-            if not ok_j:
-                return False, msg_j
-            return True, f"R2 gespeichert: frames={int(n_fp)}{str(note_fp or '')} | json={msg_j}"
-
-        ok_lf, msg_lf, n_lf = _local_framepack_1fps(folder, base_override=base_override)
-        if not ok_lf:
-            return False, f"Lokales Framepack fehlgeschlagen: {msg_lf}"
-        ok_la, msg_la, _proxy = _local_audio_proxy_1k(folder, base_override=base_override)
-        if not ok_la:
-            return False, f"Lokales AudioProxy fehlgeschlagen: {msg_la}"
-        ok_lj, msg_lj = _copy_json_to_local_capture(folder, json_path, base_override=base_override)
-        if not ok_lj:
-            return False, f"Lokale JSON-Kopie fehlgeschlagen: {msg_lj}"
-        return True, f"Lokal gespeichert: frames={int(n_lf)} | json={msg_lj}"
-
     def _ensure_audio_file(folder: str, base_override=None) -> tuple[bool, str]:
         out_video, out_audio = _capture_media_paths(folder, base_override=base_override)
         if out_audio.exists() and out_audio.stat().st_size > 0:
@@ -684,16 +522,49 @@ def render(ns):
             return [], False
         ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
         roi_table = ocr.get("roi_table") if isinstance(ocr, dict) else []
+
+        def _parse_rect(v):
+            if isinstance(v, (tuple, list)) and len(v) >= 4:
+                try:
+                    return [float(v[0]), float(v[1]), float(v[2]), float(v[3])]
+                except Exception:
+                    return None
+            txt = str(v or "").strip()
+            if not txt:
+                return None
+            try:
+                nums = [float(x) for x in txt.replace(",", " ").replace(";", " ").split()]
+                if len(nums) >= 4:
+                    return [float(nums[0]), float(nums[1]), float(nums[2]), float(nums[3])]
+            except Exception:
+                return None
+            return None
+
         if isinstance(roi_table, dict):
             cols = {str(k): v for k, v in roi_table.items() if isinstance(v, list)}
-            n = max((len(v) for v in cols.values()), default=0)
-            rows_tmp = []
-            for i in range(n):
-                row = {}
-                for k, vv in cols.items():
-                    row[k] = vv[i] if i < len(vv) else None
-                rows_tmp.append(row)
-            roi_table = rows_tmp
+            if cols:
+                n = max((len(v) for v in cols.values()), default=0)
+                rows_tmp = []
+                for i in range(n):
+                    row = {}
+                    for k, vv in cols.items():
+                        row[k] = vv[i] if i < len(vv) else None
+                    rows_tmp.append(row)
+                roi_table = rows_tmp
+            else:
+                # single-row dict variant (scalar strings instead of list-columns)
+                _nm = roi_table.get("name_roi", roi_table.get("name", ""))
+                _rv = roi_table.get("roi", "")
+                _fmt = roi_table.get("fmt", "any")
+                _pat = roi_table.get("pattern", "")
+                _msc = roi_table.get("max_scale", 1.2)
+                roi_table = [{
+                    "name_roi": _nm,
+                    "roi": _rv,
+                    "fmt": _fmt,
+                    "pattern": _pat,
+                    "max_scale": _msc,
+                }]
         elif not isinstance(roi_table, list):
             roi_table = []
 
@@ -703,28 +574,144 @@ def render(ns):
             if not isinstance(row, dict):
                 continue
             nm = str(row.get("name_roi") or row.get("name") or "").strip()
-            roi = row.get("roi")
-            if isinstance(roi, (tuple, list)) and len(roi) >= 4:
-                try:
-                    rect = [float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])]
-                except Exception:
-                    continue
-                if nm.lower() == "track_minimap":
-                    has_track = True
-                    continue
-                rows.append(
-                    {
-                        "name": nm or f"roi_{len(rows)}",
-                        "x": rect[0],
-                        "y": rect[1],
-                        "w": rect[2],
-                        "h": rect[3],
-                        "fmt": str(row.get("fmt") or "any"),
-                        "pattern": str(row.get("pattern") or ""),
-                        "max_scale": float(row.get("max_scale") or 1.2),
-                    }
-                )
+            rect = _parse_rect(row.get("roi"))
+            if not rect:
+                continue
+            if nm.lower() == "track_minimap":
+                has_track = True
+                continue
+            rows.append(
+                {
+                    "name": nm or f"roi_{len(rows)}",
+                    "x": rect[0],
+                    "y": rect[1],
+                    "w": rect[2],
+                    "h": rect[3],
+                    "fmt": str(row.get("fmt") or "any"),
+                    "pattern": str(row.get("pattern") or ""),
+                    "max_scale": float(row.get("max_scale") or 1.2),
+                }
+            )
         return rows, bool(has_track)
+
+    def _wd_extract_track_cfg(doc: dict) -> dict:
+        rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+        if not isinstance(rr, dict):
+            return {}
+        ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
+        if not isinstance(ocr, dict):
+            return {}
+
+        def _parse_rect(v):
+            if isinstance(v, (tuple, list)) and len(v) >= 4:
+                try:
+                    return [float(v[0]), float(v[1]), float(v[2]), float(v[3])]
+                except Exception:
+                    return None
+            txt = str(v or "").strip()
+            if not txt:
+                return None
+            try:
+                nums = [float(x) for x in txt.replace(",", " ").replace(";", " ").split()]
+                if len(nums) >= 4:
+                    return [float(nums[0]), float(nums[1]), float(nums[2]), float(nums[3])]
+            except Exception:
+                return None
+            return None
+
+        def _pts(v):
+            if not isinstance(v, (list, tuple)):
+                return []
+            if v and isinstance(v[0], (list, tuple)) and len(v[0]) >= 2:
+                out = []
+                for p in v:
+                    try:
+                        out.append([float(p[0]), float(p[1])])
+                    except Exception:
+                        pass
+                return out
+            vals = []
+            for x in v:
+                try:
+                    vals.append(float(x))
+                except Exception:
+                    pass
+            out = []
+            for i in range(0, len(vals) - 1, 2):
+                out.append([vals[i], vals[i + 1]])
+            return out
+
+        track_roi = None
+        roi_table = ocr.get("roi_table")
+        if isinstance(roi_table, dict):
+            names = roi_table.get("name_roi") or roi_table.get("name") or []
+            rois = roi_table.get("roi") or []
+            if isinstance(names, list) and isinstance(rois, list):
+                for i, nm in enumerate(names):
+                    if str(nm or "").strip().lower() != "track_minimap":
+                        continue
+                    if i < len(rois):
+                        track_roi = _parse_rect(rois[i])
+                        if track_roi:
+                            break
+            else:
+                if str(names or "").strip().lower() == "track_minimap":
+                    track_roi = _parse_rect(rois)
+        elif isinstance(roi_table, list):
+            for row in roi_table:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("name_roi") or row.get("name") or "").strip().lower() != "track_minimap":
+                    continue
+                track_roi = _parse_rect(row.get("roi"))
+                if track_roi:
+                    break
+
+        trk = ocr.get("trkCalSlim") if isinstance(ocr.get("trkCalSlim"), dict) else {}
+        if not track_roi and isinstance(trk, dict):
+            track_roi = _parse_rect(trk.get("roi"))
+        mini_pts = _pts((trk.get("minimap_pts") if isinstance(trk, dict) else None) or (trk.get("ptsMini") if isinstance(trk, dict) else None))
+        ref_pts = _pts((trk.get("ref_pts") if isinstance(trk, dict) else None) or (trk.get("ptsRef") if isinstance(trk, dict) else None))
+
+        color_range = trk.get("moving_pt_color_range") if isinstance(trk.get("moving_pt_color_range"), dict) else None
+        if not isinstance(color_range, dict):
+            marker_to_cr = globals().get("_marker_to_color_range")
+            if callable(marker_to_cr):
+                try:
+                    cr = marker_to_cr(trk.get("marker") if isinstance(trk, dict) else None)
+                    if isinstance(cr, dict) and cr:
+                        color_range = cr
+                except Exception:
+                    color_range = None
+        if not isinstance(color_range, dict):
+            color_range = dict(st.session_state.get("moving_pt_color_range") or {})
+
+        # centerline_px: pixel coords of track centerline saved when user stores ROI settings.
+        cl_px_raw = trk.get("centerline_px") if isinstance(trk, dict) else None
+        centerline_px = None
+        if isinstance(cl_px_raw, (list, tuple)) and cl_px_raw:
+            try:
+                _arr = np.asarray(cl_px_raw, dtype=float)
+                if _arr.ndim == 2 and _arr.shape[0] >= 2 and _arr.shape[1] >= 2:
+                    centerline_px = _arr
+            except Exception:
+                centerline_px = None
+
+        return {
+            "track_roi": track_roi,
+            "minimap_pts": mini_pts,
+            "ref_pts": ref_pts,
+            "moving_pt_color_range": color_range,
+            "centerline_px": centerline_px,
+        }
+
+    def _wd_expected_ocr_columns(doc: dict) -> tuple[list[str], list[str]]:
+        """Return expected OCR column names (roi columns, track columns)."""
+        rois, _has_track = _wd_extract_ocr_rois(doc)
+        roi_cols = [str(r.get("name") or "").strip() or f"roi_{i}" for i, r in enumerate(rois)]
+        track_cfg = _wd_extract_track_cfg(doc)
+        track_cols = ["track_minimap_found", "track_minimap_x", "track_minimap_y", "track_xy_x", "track_xy_y", "track_pct"] if track_cfg.get("track_roi") else []
+        return roi_cols, track_cols
 
     def _wd_ocr_pending(path: Path) -> tuple[bool, str]:
         if not path.exists():
@@ -734,8 +721,8 @@ def render(ns):
         if not isinstance(rr, dict):
             return False, "recordResult fehlt"
         ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
-        rois, _ = _wd_extract_ocr_rois(doc)
-        if not rois:
+        rois, has_track = _wd_extract_ocr_rois(doc)
+        if not rois and (not has_track):
             return False, "keine OCR-ROIs"
         cleaned = ocr.get("cleaned")
         table = ocr.get("table")
@@ -744,6 +731,13 @@ def render(ns):
         _cln_ok = isinstance(cleaned, dict) and len(cleaned.get("time_s") or []) > 0
         if not (_tbl_ok and _cln_ok):
             return True, "ausstehend"
+        exp_roi_cols, exp_track_cols = _wd_expected_ocr_columns(doc)
+        exp_cols = list(exp_roi_cols) + list(exp_track_cols)
+        miss_tbl = [k for k in exp_cols if k not in table]
+        miss_cln = [k for k in exp_cols if k not in cleaned]
+        if miss_tbl or miss_cln:
+            miss_info = ", ".join((miss_tbl + miss_cln)[:8])
+            return True, f"fehlende Spalten ({miss_info})"
         params = ocr.get("params") if isinstance(ocr.get("params"), dict) else {}
         # Partial flag: was interrupted mid-run
         if bool(params.get("partial")):
@@ -806,9 +800,11 @@ def render(ns):
         if not isinstance(rr, dict):
             return False, "recordResult fehlt"
         ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
-        rois, _ = _wd_extract_ocr_rois(doc)
-        if not rois:
-            return False, "keine OCR-ROIs"
+        rois, has_track = _wd_extract_ocr_rois(doc)
+        track_cfg = _wd_extract_track_cfg(doc)
+        track_roi = track_cfg.get("track_roi")
+        if not rois and (not track_roi):
+            return False, "keine OCR-ROIs/track_minimap"
 
         out_video, _out_audio = _capture_media_paths(folder, base_override=base_override)
         if not out_video.exists() or out_video.stat().st_size <= 0:
@@ -866,10 +862,21 @@ def render(ns):
             if isinstance(existing_table, list) and existing_table:
                 existing_table = _to_columnar(existing_table)
                 existing_cleaned = _to_columnar(existing_cleaned)
+            exp_roi_cols, exp_track_cols = _wd_expected_ocr_columns(doc)
+            exp_cols = list(exp_roi_cols) + list(exp_track_cols)
             _resuming = (
                 isinstance(existing_table, dict) and existing_table.get("frame_idx")
                 and isinstance(existing_cleaned, dict) and existing_cleaned.get("frame_idx")
             )
+            if _resuming:
+                _miss_tbl = [k for k in exp_cols if k not in existing_table]
+                _miss_cln = [k for k in exp_cols if k not in existing_cleaned]
+                if _miss_tbl or _miss_cln:
+                    _wd_log(
+                        f"OCR {folder}: fehlende Spalten erkannt -> kompletter Rebuild "
+                        f"(table:{','.join(_miss_tbl[:6])} cleaned:{','.join(_miss_cln[:6])})"
+                    )
+                    _resuming = False
             if _resuming:
                 raw_cols = {k: list(v) for k, v in existing_table.items() if isinstance(v, list)}
                 clean_cols = {k: list(v) for k, v in existing_cleaned.items() if isinstance(v, list)}
@@ -878,11 +885,75 @@ def render(ns):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 _resume_start = frame_idx
             else:
-                roi_names = [str(r.get("name") or "").strip() or "roi" for r in rois]
+                roi_names = list(exp_roi_cols)
                 raw_cols: dict[str, list] = {"time_s": [], "frame_idx": [], **{nm: [] for nm in roi_names}}
                 clean_cols: dict[str, list] = {"time_s": [], "frame_idx": [], **{nm: [] for nm in roi_names}}
                 frame_idx = 0
                 _resume_start = 0
+
+            # Track/minimap columns (positions) are always kept in table/cleaned when track ROI exists.
+            _track_cols = list(exp_track_cols)
+            for _k in _track_cols:
+                raw_cols.setdefault(_k, [])
+                clean_cols.setdefault(_k, [])
+
+            _extract_minimap_crop = globals().get("extract_minimap_crop")
+            _detect_moving_point = globals().get("detect_moving_point")
+            _compare_minimap = globals().get("compare_minimap_to_reference")
+            _project_h = globals().get("project_point_with_homography")
+            _has_track_tools = callable(_extract_minimap_crop) and callable(_detect_moving_point)
+            _mini_pts = list(track_cfg.get("minimap_pts") or [])
+            _ref_pts = list(track_cfg.get("ref_pts") or [])
+            _color_range = dict(track_cfg.get("moving_pt_color_range") or {})
+            # ref_track_img is not saved to JSON — session state access may return None in
+            # background threads. H_fallback (computed from minimap_pts + ref_pts) is used
+            # as the fallback projection method and does not require the reference image.
+            _ref_img = st.session_state.get("ref_track_img")
+            # centerline_px is now saved to trkCalSlim in JSON by _ensure_ocr_extractor_ocr_struct.
+            _centerline_px = track_cfg.get("centerline_px") or st.session_state.get("centerline_px")
+            _H_fallback = None
+            if len(_mini_pts) >= 4 and len(_ref_pts) >= 4:
+                try:
+                    _src = np.asarray(_mini_pts[:8], dtype=np.float32).reshape(-1, 2)
+                    _dst = np.asarray(_ref_pts[:8], dtype=np.float32).reshape(-1, 2)
+                    if _src.shape[0] >= 4 and _dst.shape[0] >= 4:
+                        _H_fallback, _mask = cv2.findHomography(_src, _dst, method=0)
+                except Exception:
+                    _H_fallback = None
+
+            def _centerline_progress_percent(ref_pt, centerline_px) -> float | None:
+                if ref_pt is None:
+                    return None
+                try:
+                    cl = np.asarray(centerline_px, dtype=float)
+                    if cl.ndim != 2 or cl.shape[0] < 2 or cl.shape[1] < 2:
+                        return None
+                    p = np.asarray(ref_pt, dtype=float).ravel()
+                    if p.size < 2 or not np.all(np.isfinite(p[:2])):
+                        return None
+                    p = p[:2]
+                    d = np.diff(cl[:, :2], axis=0)
+                    seg_len = np.sqrt(np.sum(d * d, axis=1))
+                    cum = np.concatenate(([0.0], np.cumsum(seg_len)))
+                    total = float(cum[-1])
+                    if total <= 1e-9:
+                        return None
+                    best_d2 = float("inf")
+                    best_s = 0.0
+                    for i in range(len(seg_len)):
+                        v = cl[i + 1, :2] - cl[i, :2]
+                        l2 = float(np.dot(v, v))
+                        if l2 <= 0:
+                            continue
+                        u = float(np.clip(np.dot(p - cl[i, :2], v) / l2, 0.0, 1.0))
+                        q = cl[i, :2] + u * v
+                        d2 = float(np.sum((p - q) ** 2))
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_s = float(cum[i] + u * seg_len[i])
+                    return float(np.clip(100.0 * best_s / total, 0.0, 100.0))
+                except Exception:
+                    return None
 
             with _YT_WATCHDOG_LOCK:
                 _stop_event = _YT_WATCHDOG.get("stop_event")
@@ -930,6 +1001,58 @@ def render(ns):
                     probe = diag(frame, roi_cfg, (int(fw), int(fh)), tmp_root=Path("logs") / "ocr_tmp")
                     raw_cols.setdefault(nm, []).append(str(probe.get("raw", "") or ""))
                     clean_cols.setdefault(nm, []).append(str(probe.get("value", "") or "") if bool(probe.get("ok")) else "")
+
+                if _track_cols:
+                    for _k in _track_cols:
+                        raw_cols[_k].append(0 if _k == "track_minimap_found" else "")
+                        clean_cols[_k].append(0 if _k == "track_minimap_found" else "")
+                    if _has_track_tools:
+                        try:
+                            _crop = _extract_minimap_crop(frame, track_roi, fw, fh)
+                        except Exception:
+                            _crop = None
+                        if _crop is not None:
+                            _mp = _detect_moving_point(_crop, _color_range)
+                            if isinstance(_mp, dict):
+                                raw_cols["track_minimap_found"][-1] = 1
+                                clean_cols["track_minimap_found"][-1] = 1
+                                try:
+                                    _x = float(_mp.get("x", 0.0) or 0.0)
+                                    _y = float(_mp.get("y", 0.0) or 0.0)
+                                    raw_cols["track_minimap_x"][-1] = _x
+                                    raw_cols["track_minimap_y"][-1] = _y
+                                    clean_cols["track_minimap_x"][-1] = _x
+                                    clean_cols["track_minimap_y"][-1] = _y
+                                except Exception:
+                                    _x = _y = None
+                                _ref_pt = None
+                                if (_x is not None) and (_y is not None):
+                                    if callable(_compare_minimap) and (_ref_img is not None) and len(_mini_pts) >= 4 and len(_ref_pts) >= 4:
+                                        try:
+                                            _cmp = _compare_minimap(_crop, _ref_img, _mini_pts, _ref_pts)
+                                            _H = _cmp.get("H") if isinstance(_cmp, dict) else None
+                                            if callable(_project_h) and _H is not None:
+                                                _ref_pt = _project_h((_x, _y), _H)
+                                        except Exception:
+                                            _ref_pt = None
+                                    if _ref_pt is None and _H_fallback is not None:
+                                        try:
+                                            _p = np.array([[[float(_x), float(_y)]]], dtype=np.float32)
+                                            _q = cv2.perspectiveTransform(_p, _H_fallback)
+                                            _ref_pt = [float(_q[0, 0, 0]), float(_q[0, 0, 1])]
+                                        except Exception:
+                                            _ref_pt = None
+                                if isinstance(_ref_pt, (list, tuple, np.ndarray)) and len(_ref_pt) >= 2:
+                                    _rx = float(_ref_pt[0])
+                                    _ry = float(_ref_pt[1])
+                                    raw_cols["track_xy_x"][-1] = _rx
+                                    raw_cols["track_xy_y"][-1] = _ry
+                                    clean_cols["track_xy_x"][-1] = _rx
+                                    clean_cols["track_xy_y"][-1] = _ry
+                                    _pct = _centerline_progress_percent(_ref_pt, _centerline_px)
+                                    if _pct is not None:
+                                        raw_cols["track_pct"][-1] = float(_pct)
+                                        clean_cols["track_pct"][-1] = float(_pct)
                 frame_idx += frame_step
                 _processed_count += 1
                 _n_rows += 1
@@ -1010,6 +1133,36 @@ def render(ns):
                 except Exception:
                     out = None
             if not out:
+                # Fallback: robust scipy/h5 loader path similar to MAT->JSON tab.
+                try:
+                    robust_loader = globals().get("_loadmat_audio_save_robust")
+                    mat_to_plain = globals().get("_mat_struct_to_plain")
+                    norm = globals().get("_normalize_sidecar_json_payload")
+                    data = None
+                    if callable(robust_loader):
+                        data, _note = robust_loader(str(mat_path))
+                    if isinstance(data, dict) and data:
+                        rr_obj = data.get("recordResult")
+                        if rr_obj is None:
+                            for k, v in data.items():
+                                if str(k).lower() == "recordresult":
+                                    rr_obj = v
+                                    break
+                        if rr_obj is not None:
+                            rr_plain = mat_to_plain(rr_obj) if callable(mat_to_plain) else rr_obj
+                            if isinstance(rr_plain, dict) and rr_plain:
+                                payload = {"recordResult": _mat_export_to_jsonable(rr_plain)}
+                                if callable(norm):
+                                    payload = norm(payload)
+                                out = json.dumps(
+                                    payload,
+                                    ensure_ascii=False,
+                                    indent=2,
+                                    default=lambda o: _mat_export_to_jsonable(o),
+                                ).encode("utf-8")
+                except Exception:
+                    out = None
+            if not out:
                 _wd_log(f"MAT->JSON übersprungen (nicht lesbar): {mat_path.name}")
                 with _YT_WATCHDOG_LOCK:
                     _YT_WATCHDOG.setdefault("mat_json_skip", set()).add(mat_path.name)
@@ -1018,10 +1171,12 @@ def render(ns):
                 with get_path_lock(str(json_path)):
                     json_path.write_bytes(bytes(out))
             except Exception as e:
-                return False, f"JSON write Fehler: {json_path.name}: {e}"
+                _wd_log(f"MAT->JSON write Fehler: {json_path.name}: {e}")
+                with _YT_WATCHDOG_LOCK:
+                    _YT_WATCHDOG.setdefault("mat_json_skip", set()).add(mat_path.name)
+                continue
             return True, f"{mat_path.name} -> {json_path.name}"
         return False, "nichts offen"
-
 
     def _wd_process_once(cfg: dict) -> bool:
         base_override = cfg.get("local_base_path")
@@ -1182,7 +1337,6 @@ def render(ns):
             cfg = {
                 "interval_sec": int(interval_sec),
                 "local_base_path": str(st.session_state.get("local_base_path") or "").strip(),
-                "lite_target": _lite_target_mode(),
                 "open_new_window": bool(st.session_state.get("yt_open_new_window", True)),
                 "move_other_display": bool(st.session_state.get("yt_move_other_display", False)),
                 "tasks": tasks_cfg,
@@ -1254,8 +1408,6 @@ def render(ns):
                     "download_status": "pending",
                     "last_error": "",
                     "downloaded_at": "",
-                    "lite_target": _lite_target_mode(),
-                    "lite_status": "",
                 }
             )
             st.session_state.yt_rows_cache = rows
@@ -1398,11 +1550,6 @@ def render(ns):
                 )
                 if _ok_meta:
                     rows[idx]["json_path"] = _meta_msg
-                    rows[idx]["lite_target"] = _lite_target_mode()
-                    _ok_lite, _msg_lite = _postprocess_lite_assets(folder, _meta_msg)
-                    rows[idx]["lite_status"] = str(_msg_lite or "")
-                    if (not _ok_lite) and (not str(rows[idx].get("last_error") or "").strip()):
-                        rows[idx]["last_error"] = f"Lite-Speicherung: {_msg_lite}"
                 else:
                     rows[idx]["last_error"] = f"metadata.json Fehler: {_meta_msg}"
                 q.pop(0)
@@ -1436,11 +1583,6 @@ def render(ns):
                     )
                     if _ok_meta:
                         rows[idx]["json_path"] = _meta_msg
-                        rows[idx]["lite_target"] = _lite_target_mode()
-                        _ok_lite, _msg_lite = _postprocess_lite_assets(folder, _meta_msg)
-                        rows[idx]["lite_status"] = str(_msg_lite or "")
-                        if (not _ok_lite) and (not str(rows[idx].get("last_error") or "").strip()):
-                            rows[idx]["last_error"] = f"Lite-Speicherung: {_msg_lite}"
                     q.pop(0)
                     st.session_state.yt_bg_queue = q
                     st.session_state.yt_bg_done = int(st.session_state.get("yt_bg_done", 0) or 0) + 1
@@ -1508,8 +1650,6 @@ def render(ns):
             )
             if _ok_init_json:
                 rows[idx]["json_path"] = _init_json_msg
-                rows[idx]["lite_target"] = _lite_target_mode()
-                rows[idx]["lite_status"] = "Vormerkung: wird nach Abschluss gespeichert"
             st.session_state.yt_rows_cache = rows
             _write_db(rows)
             return
@@ -1549,11 +1689,6 @@ def render(ns):
                 )
                 if _ok_meta:
                     rows[idx]["json_path"] = _meta_msg
-                    rows[idx]["lite_target"] = _lite_target_mode()
-                    _ok_lite, _msg_lite = _postprocess_lite_assets(folder_now, _meta_msg)
-                    rows[idx]["lite_status"] = str(_msg_lite or "")
-                    if (not _ok_lite) and (not str(rows[idx].get("last_error") or "").strip()):
-                        rows[idx]["last_error"] = f"Lite-Speicherung: {_msg_lite}"
                 else:
                     rows[idx]["last_error"] = f"metadata.json Fehler: {_meta_msg}"
             else:
@@ -1577,9 +1712,6 @@ def render(ns):
                 )
                 if _ok_meta_err:
                     rows[idx]["json_path"] = _meta_err_msg
-                    rows[idx]["lite_target"] = _lite_target_mode()
-                    _ok_lite, _msg_lite = _postprocess_lite_assets(folder_now, _meta_err_msg)
-                    rows[idx]["lite_status"] = str(_msg_lite or "")
         q = list(st.session_state.get("yt_bg_queue") or [])
         if q:
             q.pop(0)
@@ -1641,8 +1773,6 @@ def render(ns):
                 "datum des uploads": df.get("upload_date", "").astype(str),
                 "status heruntergeladen": df["download_status"].map(_status_lamp),
                 "capture_folder": df.get("capture_folder", "").astype(str),
-                "speicherziel lite/json": (df["lite_target"] if "lite_target" in df.columns else pd.Series(["local"] * len(df), index=df.index)).astype(str),
-                "lite status": (df["lite_status"] if "lite_status" in df.columns else pd.Series([""] * len(df), index=df.index)).astype(str),
                 "json path": (df["json_path"] if "json_path" in df.columns else pd.Series([""] * len(df), index=df.index)).astype(str),
                 "letzter fehler": df.get("last_error", "").astype(str),
             }
@@ -1677,7 +1807,7 @@ def render(ns):
             st.rerun()
     else:
         st.dataframe(
-            pd.DataFrame(columns=["youtube link", "titel", "datum des uploads", "status heruntergeladen", "capture_folder", "speicherziel lite/json", "lite status", "letzter fehler"]),
+            pd.DataFrame(columns=["youtube link", "titel", "datum des uploads", "status heruntergeladen", "capture_folder", "json path", "letzter fehler"]),
             width="stretch",
             hide_index=True,
             height=260,
@@ -1686,4 +1816,3 @@ def render(ns):
     _last_meta_json_path = str(st.session_state.get("yt_last_meta_json_path") or "").strip()
     if _last_meta_json_path:
         st.caption(f"Zuletzt geschriebene JSON: {_last_meta_json_path}")
-

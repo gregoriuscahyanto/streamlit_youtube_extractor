@@ -11,6 +11,7 @@ try:
     from streamlit.delta_generator import DeltaGenerator
 except Exception:
     DeltaGenerator = None
+import math
 import cv2
 import numpy as np
 import json
@@ -680,8 +681,8 @@ def _get_cloud_capture_folders() -> list[str]:
 
 
 def _get_local_capture_folders() -> list[str]:
-    client = st.session_state.local_client
-    if not st.session_state.local_connected or client is None:
+    client = st.session_state.get("local_client")
+    if (not bool(st.session_state.get("local_connected"))) or client is None:
         return []
     ok, items = client.list_files("captures")
     if not ok or not isinstance(items, list):
@@ -692,8 +693,8 @@ def _get_local_capture_folders() -> list[str]:
 
 
 def _has_local_fullfps_video(folder: str) -> tuple[bool, int]:
-    client = st.session_state.local_client
-    if not st.session_state.local_connected or client is None:
+    client = st.session_state.get("local_client")
+    if (not bool(st.session_state.get("local_connected"))) or client is None:
         return False, 0
     ok, items = client.list_files(f"captures/{folder}")
     if not ok or not isinstance(items, list):
@@ -808,10 +809,10 @@ def _build_sync_overview_rows() -> tuple[list[dict], list[dict]]:
 
 
 def _local_capture_folder_path(folder: str) -> Path | None:
-    if not st.session_state.local_connected:
+    if not bool(st.session_state.get("local_connected")):
         return None
     try:
-        base = Path(st.session_state.local_base_path).expanduser().resolve()
+        base = Path(str(st.session_state.get("local_base_path") or "")).expanduser().resolve()
         p = (base / "captures" / folder).resolve()
         if base != p and base not in p.parents:
             return None
@@ -1290,7 +1291,7 @@ def _connect_r2_with_retry(acc: str, key: str, sec: str, bkt: str, *, max_attemp
     return False, f"{last_msg} (nach {attempts} Versuchen)", None
 
 def _try_auto_connect_local_once():
-    if st.session_state.local_connected or st.session_state.get("local_auto_connect_attempted"):
+    if bool(st.session_state.get("local_connected")) or st.session_state.get("local_auto_connect_attempted"):
         return
     st.session_state.local_auto_connect_attempted = True
     lp_str = str(st.session_state.get("compressed_db_default_path") or (st.secrets.get("local") or {}).get("default_path") or "").strip()
@@ -1557,9 +1558,33 @@ def _run_video_ocr_full_now() -> tuple[bool, str, dict]:
         pass
 
 
-def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tuple[bool, str, dict]:
+def _run_video_ocr_fullvideo_framewise_now(
+    progress_cb=None,
+    stop_cb=None,
+    rois_override=None,
+    capture_folder_override: str = "",
+    video_path_override: str = "",
+    target_fps_str: str = "2",
+    track_params_override: dict | None = None,
+) -> tuple[bool, str, dict]:
     """Run OCR frame-by-frame on the full local video (not framepack/lite)."""
-    indices = _roi_ocr_probe_indices()
+    # Snapshot session-state values needed for track detection (session state is not
+    # accessible from background threads — caller must pass these via track_params_override).
+    _tpo = track_params_override if isinstance(track_params_override, dict) else {}
+    _moving_pt_color_range = _tpo.get("moving_pt_color_range") or st.session_state.get("moving_pt_color_range") or {}
+    _ref_track_img = _tpo.get("ref_track_img") if "ref_track_img" in _tpo else st.session_state.get("ref_track_img")
+    _minimap_pts = list(_tpo.get("minimap_pts") or st.session_state.get("minimap_pts") or [])
+    _ref_track_pts = list(_tpo.get("ref_track_pts") or st.session_state.get("ref_track_pts") or [])
+    _centerline_px = list(_tpo.get("centerline_px") or st.session_state.get("centerline_px") or [])
+    _roi_global_scale = float(_tpo.get("roi_global_scale") or st.session_state.get("roi_global_scale") or 1.2)
+
+    rois_active = list(rois_override if isinstance(rois_override, list) else (st.session_state.get("rois", []) or []))
+    indices = [
+        i for i, r in enumerate(rois_active)
+        if str((r or {}).get("name", "")).strip().lower() != "track_minimap"
+        and float((r or {}).get("w", 0.0) or 0.0) > 0.0
+        and float((r or {}).get("h", 0.0) or 0.0) > 0.0
+    ]
     if not indices:
         st.session_state.video_ocr_full_result = None
         return False, "Keine OCR-ROIs vorhanden (nur track_minimap oder leer).", {}
@@ -1568,11 +1593,23 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
         st.session_state.video_ocr_full_result = None
         return False, "Tesseract wurde nicht gefunden. Installiere Tesseract oder setze TESSERACT_CMD.", {}
 
-    capture_folder = _current_capture_folder() or str(st.session_state.get("capture_folder") or "").strip()
+    capture_folder = str(capture_folder_override or "").strip()
+    if not capture_folder:
+        capture_folder = _current_capture_folder() or str(st.session_state.get("capture_folder") or "").strip()
     if not capture_folder:
         st.session_state.video_ocr_full_result = None
         return False, "Kein capture_folder aktiv. Bitte zuerst MAT/JSON laden.", {}
-    video_path = _find_local_fullfps_video(capture_folder)
+    video_path = None
+    vp_ovr = str(video_path_override or "").strip()
+    if vp_ovr:
+        try:
+            cand = Path(vp_ovr).expanduser().resolve()
+            if cand.exists() and cand.is_file():
+                video_path = cand
+        except Exception:
+            video_path = None
+    if video_path is None:
+        video_path = _find_local_fullfps_video(capture_folder)
     if video_path is None or (not video_path.exists()):
         st.session_state.video_ocr_full_result = None
         return False, "Kein Vollvideo gefunden. Bitte zuerst das Originalvideo lokal laden/herunterladen.", {}
@@ -1591,16 +1628,30 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
         st.session_state.video_ocr_full_result = None
         return False, f"Ungültige Frame-Anzahl: {video_path.name}", {}
 
+    fps_mode = str(target_fps_str or "2").strip().lower()
+    if fps_mode == "max":
+        frame_step = 1
+    else:
+        try:
+            target_fps = float(fps_mode)
+        except Exception:
+            target_fps = 2.0
+        if target_fps <= 0:
+            target_fps = 2.0
+        frame_step = max(1, int(round(fps / target_fps)))
+    processed_target = max(1, int(math.ceil(frame_count / max(1, frame_step))))
+    checkpoint_every = max(1, processed_target // 10)
+
     raw_rows: list[dict] = []
     clean_rows: list[dict] = []
     roi_stats: dict[str, dict] = {}
     for _idx in indices:
-        nm = str(st.session_state.rois[_idx].get("name", f"roi_{_idx}") or f"roi_{_idx}")
+        nm = str((rois_active[_idx] or {}).get("name", f"roi_{_idx}") or f"roi_{_idx}")
         roi_stats[nm] = {"ok": 0, "seen": 0}
 
     track_roi = next(
         (
-            r for r in list(st.session_state.get("rois") or [])
+            r for r in list(rois_active or [])
             if str(r.get("name", "")).strip().lower() == "track_minimap"
             and float(r.get("w", 0.0) or 0.0) > 0.0
             and float(r.get("h", 0.0) or 0.0) > 0.0
@@ -1609,12 +1660,23 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
     )
     has_track_cal = bool(
         track_roi is not None
-        and st.session_state.get("ref_track_img") is not None
-        and isinstance(st.session_state.get("minimap_pts"), list)
-        and isinstance(st.session_state.get("ref_track_pts"), list)
-        and len(st.session_state.get("minimap_pts") or []) >= 4
-        and len(st.session_state.get("ref_track_pts") or []) >= 4
+        and _ref_track_img is not None
+        and isinstance(_minimap_pts, list)
+        and isinstance(_ref_track_pts, list)
+        and len(_minimap_pts) >= 4
+        and len(_ref_track_pts) >= 4
     )
+    mini_pts = _minimap_pts
+    ref_pts = _ref_track_pts
+    H_fallback = None
+    if len(mini_pts) >= 4 and len(ref_pts) >= 4:
+        try:
+            src = np.asarray(mini_pts[:8], dtype=np.float32).reshape(-1, 2)
+            dst = np.asarray(ref_pts[:8], dtype=np.float32).reshape(-1, 2)
+            if src.shape[0] >= 4 and dst.shape[0] >= 4:
+                H_fallback, _mask = cv2.findHomography(src, dst, method=0)
+        except Exception:
+            H_fallback = None
 
     def _centerline_progress_percent(ref_pt, centerline_px) -> float | None:
         if ref_pt is None:
@@ -1650,8 +1712,43 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
         except Exception:
             return None
 
+    progress_step = int(_tpo.get("progress_step_frames") or st.session_state.get("video_ocr_live_progress_step_frames") or 2)
+    progress_step = max(1, progress_step)
+
     processed = 0
+    frame_idx_native = 0
     cancelled = False
+    save_error = ""
+
+    def _save_ocr_progress(partial: bool) -> tuple[bool, str]:
+        rr_doc_local = _build_save_mat_struct(build_result_json(), no_roi=False, video_faulty=False).get("recordResult", {})
+        rr_doc_local = _mat_struct_to_plain(rr_doc_local)
+        if not isinstance(rr_doc_local, dict):
+            rr_doc_local = {}
+        ocr_doc_local = rr_doc_local.get("ocr", {}) if isinstance(rr_doc_local.get("ocr", {}), dict) else {}
+        ocr_doc_local["table"] = list(raw_rows)
+        ocr_doc_local["cleaned"] = list(clean_rows)
+        ocr_doc_local["created"] = datetime.now().isoformat(timespec="seconds")
+        ocr_doc_local["sample_rate_hz"] = float(max(1e-9, fps / max(1, frame_step)))
+        ocr_doc_local["source_fps"] = float(max(1e-9, fps))
+        ocr_doc_local["frame_step"] = int(max(1, frame_step))
+        ocr_doc_local["fps_mode"] = str(fps_mode)
+        _params = ocr_doc_local.get("params") if isinstance(ocr_doc_local.get("params"), dict) else {}
+        _params.setdefault("start_s", 0.0)
+        _params["end_s"] = float(raw_rows[-1]["time_s"]) if raw_rows else 0.0
+        if partial:
+            _params["partial"] = True
+        else:
+            _params.pop("partial", None)
+        ocr_doc_local["params"] = _params
+        rr_doc_local["ocr"] = ocr_doc_local
+
+        cf_local = str(capture_folder or "").strip()
+        ok_local, msg_local, _json_bytes_local = _save_fields_to_local_json({"ocr": ocr_doc_local}, cf_local, base_rr=rr_doc_local)
+        if not ok_local:
+            return False, str(msg_local)
+        return True, str(msg_local)
+
     try:
         while True:
             if callable(stop_cb):
@@ -1664,16 +1761,16 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
             ok, frame_bgr = cap.read()
             if (not ok) or frame_bgr is None:
                 break
-            t_s = float(processed) / float(max(1e-9, fps))
+            t_s = float(frame_idx_native) / float(max(1e-9, fps))
             frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             fh, fw = frame.shape[:2]
-            raw_row = {"time_s": float(t_s), "frame_idx": int(processed)}
-            clean_row = {"time_s": float(t_s), "frame_idx": int(processed)}
-            live_snapshot = {"time_s": float(t_s), "frame_idx": int(processed)}
+            raw_row = {"time_s": float(t_s), "frame_idx": int(frame_idx_native)}
+            clean_row = {"time_s": float(t_s), "frame_idx": int(frame_idx_native)}
+            live_snapshot = {"time_s": float(t_s), "frame_idx": int(frame_idx_native)}
             for _idx in indices:
                 roi_cfg = {
-                    **st.session_state.rois[_idx],
-                    "max_scale": float(st.session_state.get("roi_global_scale", 1.2)),
+                    **(rois_active[_idx] or {}),
+                    "max_scale": _roi_global_scale,
                 }
                 nm = str(roi_cfg.get("name", f"roi_{_idx}") or f"roi_{_idx}")
                 probe = diagnose_roi_ocr(frame, roi_cfg, (int(fw), int(fh)), tmp_root=LOG_DIR / "ocr_tmp")
@@ -1685,12 +1782,18 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
                     roi_stats[nm]["ok"] += 1
 
             if track_roi is not None:
+                # Keep track columns visible in live table even when detection misses.
+                for _k in ("track_minimap_x", "track_minimap_y", "track_xy_x", "track_xy_y", "track_pct"):
+                    clean_row[_k] = np.nan
+                    live_snapshot[_k] = np.nan
+                clean_row["track_minimap_found"] = 0
+                live_snapshot["track_minimap_found"] = 0
                 try:
                     crop = extract_minimap_crop(frame, track_roi, fw, fh)
                 except Exception:
                     crop = None
                 if crop is not None:
-                    mp = detect_moving_point(crop, st.session_state.get("moving_pt_color_range") or {})
+                    mp = detect_moving_point(crop, _moving_pt_color_range)
                     if isinstance(mp, dict):
                         x_mp = float(mp.get("x", 0.0) or 0.0)
                         y_mp = float(mp.get("y", 0.0) or 0.0)
@@ -1698,64 +1801,85 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
                         clean_row["track_minimap_y"] = y_mp
                         live_snapshot["track_minimap_x"] = x_mp
                         live_snapshot["track_minimap_y"] = y_mp
+                        clean_row["track_minimap_found"] = 1
+                        live_snapshot["track_minimap_found"] = 1
+                        ref_pt = None
                         if has_track_cal:
                             cmp = compare_minimap_to_reference(
                                 crop,
-                                st.session_state.get("ref_track_img"),
-                                st.session_state.get("minimap_pts"),
-                                st.session_state.get("ref_track_pts"),
+                                _ref_track_img,
+                                _minimap_pts,
+                                _ref_track_pts,
                             )
                             if isinstance(cmp, dict) and not cmp.get("error"):
                                 ref_pt = project_point_with_homography((x_mp, y_mp), cmp.get("H"))
-                                if isinstance(ref_pt, (list, tuple, np.ndarray)) and len(ref_pt) >= 2:
-                                    rx = float(ref_pt[0])
-                                    ry = float(ref_pt[1])
-                                    clean_row["track_xy_x"] = rx
-                                    clean_row["track_xy_y"] = ry
-                                    live_snapshot["track_xy_x"] = rx
-                                    live_snapshot["track_xy_y"] = ry
-                                    pct = _centerline_progress_percent(ref_pt, st.session_state.get("centerline_px"))
-                                    if pct is not None:
-                                        clean_row["track_pct"] = float(pct)
-                                        live_snapshot["track_pct"] = float(pct)
+                        elif H_fallback is not None:
+                            try:
+                                p = np.array([[[float(x_mp), float(y_mp)]]], dtype=np.float32)
+                                q = cv2.perspectiveTransform(p, H_fallback)
+                                ref_pt = [float(q[0, 0, 0]), float(q[0, 0, 1])]
+                            except Exception:
+                                ref_pt = None
+                        if isinstance(ref_pt, (list, tuple, np.ndarray)) and len(ref_pt) >= 2:
+                            rx = float(ref_pt[0])
+                            ry = float(ref_pt[1])
+                            clean_row["track_xy_x"] = rx
+                            clean_row["track_xy_y"] = ry
+                            live_snapshot["track_xy_x"] = rx
+                            live_snapshot["track_xy_y"] = ry
+                            pct = _centerline_progress_percent(ref_pt, _centerline_px)
+                            if pct is not None:
+                                clean_row["track_pct"] = float(pct)
+                                live_snapshot["track_pct"] = float(pct)
             raw_rows.append(raw_row)
             clean_rows.append(clean_row)
             processed += 1
-            if callable(progress_cb) and (processed % 10 == 0 or processed == frame_count):
+            done_native = min(frame_count, frame_idx_native + 1)
+            if callable(progress_cb) and (processed <= 3 or processed % progress_step == 0 or done_native >= frame_count):
                 try:
-                    progress_cb(processed, frame_count, t_s, dict(live_snapshot))
+                    progress_cb(done_native, frame_count, t_s, dict(live_snapshot))
                 except TypeError:
-                    progress_cb(processed, frame_count, t_s)
+                    progress_cb(done_native, frame_count, t_s)
                 except Exception:
                     pass
+            skipped = 0
+            for _ in range(max(0, frame_step - 1)):
+                if cap.grab():
+                    skipped += 1
+                else:
+                    break
+            frame_idx_native += 1 + skipped
+            if processed % checkpoint_every == 0:
+                _ok_ckpt, _msg_ckpt = _save_ocr_progress(partial=True)
+                if not _ok_ckpt:
+                    save_error = str(_msg_ckpt)
+                    cancelled = True
+                    break
     finally:
         cap.release()
 
+    rois_session = list(st.session_state.get("rois") or [])
     for _idx in indices:
-        nm = str(st.session_state.rois[_idx].get("name", f"roi_{_idx}") or f"roi_{_idx}")
+        nm = str((rois_active[_idx] or {}).get("name", f"roi_{_idx}") or f"roi_{_idx}")
         seen_n = int((roi_stats.get(nm) or {}).get("seen", 0))
         ok_n = int((roi_stats.get(nm) or {}).get("ok", 0))
         is_ok = bool(seen_n > 0 and ok_n > 0)
-        st.session_state.rois[_idx] = {
-            **st.session_state.rois[_idx],
-            "ocr_test_ok": is_ok,
-            "ocr_test_value": f"{ok_n}/{seen_n}",
-            "ocr_test_details": f"ok_frames={ok_n}; seen_frames={seen_n}",
-        }
+        if _idx < len(rois_session) and isinstance(rois_session[_idx], dict):
+            rois_session[_idx] = {
+                **rois_session[_idx],
+                "ocr_test_ok": is_ok,
+                "ocr_test_value": f"{ok_n}/{seen_n}",
+                "ocr_test_details": f"ok_frames={ok_n}; seen_frames={seen_n}",
+            }
+    if rois_session:
+        st.session_state.rois = rois_session
 
-    rr_doc = _build_save_mat_struct(build_result_json(), no_roi=False, video_faulty=False).get("recordResult", {})
-    rr_doc = _mat_struct_to_plain(rr_doc)
-    if not isinstance(rr_doc, dict):
-        rr_doc = {}
-    ocr_doc = rr_doc.get("ocr", {}) if isinstance(rr_doc.get("ocr", {}), dict) else {}
-    ocr_doc["table"] = raw_rows
-    ocr_doc["cleaned"] = clean_rows
-    ocr_doc["created"] = datetime.now().isoformat(timespec="seconds")
-    ocr_doc["sample_rate_hz"] = float(max(1e-9, fps))
-    rr_doc["ocr"] = ocr_doc
+    if save_error:
+        out_err = {"ok": False, "error": str(save_error), "rows": int(len(clean_rows)), "frames_processed": int(processed)}
+        st.session_state.video_ocr_full_result = out_err
+        return False, f"OCR-Zwischenspeicherung fehlgeschlagen: {save_error}", out_err
 
-    cf = _current_capture_folder() or str(st.session_state.get("capture_folder") or "")
-    ok_save, msg_save, _json_bytes = _save_fields_to_local_json({"ocr": ocr_doc}, cf, base_rr=rr_doc)
+    ok_save, msg_save = _save_ocr_progress(partial=bool(cancelled))
     if not ok_save:
         out_err = {"ok": False, "error": str(msg_save), "rows": int(len(clean_rows)), "frames_processed": int(processed)}
         st.session_state.video_ocr_full_result = out_err
@@ -1768,17 +1892,21 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
         "frames_processed": int(processed),
         "frames_total": int(frame_count),
         "fps": float(fps),
+        "sample_fps": float(max(1e-9, fps / max(1, frame_step))),
+        "frame_step": int(max(1, frame_step)),
+        "fps_mode": str(fps_mode),
         "source": "full_video",
         "video_path": str(video_path),
         "capture_folder": str(capture_folder),
         "cancelled": bool(cancelled),
+        "partial": bool(cancelled),
         "json_key": _r2_json_sidecar_key(mat_key),
         "roi_stats": roi_stats,
     }
     st.session_state.video_ocr_full_result = out
     st.session_state.roi_ocr_full_result = out
     try:
-        _invalidate_and_update_mat_selection_for_capture(str(cf), mat_key)
+        _invalidate_and_update_mat_selection_for_capture(str(capture_folder), mat_key)
     except Exception:
         pass
     msg = (
@@ -2042,22 +2170,33 @@ def _ensure_ocr_extractor_ocr_struct(rr: dict) -> dict:
     }
 
     # Track calibration belongs to OCR because OCRExtractor.m uses
-    # recordResult.ocr.trkCalSlim for the minimap/track ROI. If backend did not
-    # already create it, build a minimal OCRExtractor-compatible struct.
-    if "trkCalSlim" not in ocr:
-        track_roi = next((r for r in st.session_state.get("rois", []) if str(r.get("name", "")) == "track_minimap"), None)
-        if track_roi is not None:
-            marker = dict(st.session_state.get("moving_pt_color_range", {}) or {})
-            ocr["trkCalSlim"] = {
-                "roi": np.array([
-                    float(track_roi.get("x", 0.0) or 0.0),
-                    float(track_roi.get("y", 0.0) or 0.0),
-                    float(track_roi.get("w", 0.0) or 0.0),
-                    float(track_roi.get("h", 0.0) or 0.0),
-                ], dtype=float),
-                "ptsMini": np.array(st.session_state.get("minimap_pts") or [], dtype=float),
-                "marker": marker,
-            }
+    # recordResult.ocr.trkCalSlim for the minimap/track ROI. Always merge current
+    # session-state calibration into trkCalSlim so the watchdog (background thread)
+    # can find centerline_px, ref_pts, and color_range without accessing session state.
+    track_roi = next((r for r in st.session_state.get("rois", []) if str(r.get("name", "")) == "track_minimap"), None)
+    if track_roi is not None:
+        trk_slim = ocr.get("trkCalSlim") if isinstance(ocr.get("trkCalSlim"), dict) else {}
+        marker = dict(st.session_state.get("moving_pt_color_range", {}) or {})
+        _mini_pts_raw = st.session_state.get("minimap_pts") or []
+        _ref_pts_raw = st.session_state.get("ref_track_pts") or []
+        _cl_px_raw = st.session_state.get("centerline_px")
+        _cl_px_list = (
+            _cl_px_raw.tolist() if hasattr(_cl_px_raw, "tolist") else list(_cl_px_raw)
+        ) if _cl_px_raw is not None else None
+        trk_slim.update({
+            "roi": [
+                float(track_roi.get("x", 0.0) or 0.0),
+                float(track_roi.get("y", 0.0) or 0.0),
+                float(track_roi.get("w", 0.0) or 0.0),
+                float(track_roi.get("h", 0.0) or 0.0),
+            ],
+            "minimap_pts": _mini_pts_raw if isinstance(_mini_pts_raw, list) else [],
+            "ref_pts": _ref_pts_raw if isinstance(_ref_pts_raw, list) else [],
+            "moving_pt_color_range": marker,
+        })
+        if _cl_px_list is not None:
+            trk_slim["centerline_px"] = _cl_px_list
+        ocr["trkCalSlim"] = trk_slim
     rr["ocr"] = ocr
     return rr
 

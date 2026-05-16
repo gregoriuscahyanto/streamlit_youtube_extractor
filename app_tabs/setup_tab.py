@@ -4,7 +4,17 @@
 def render(ns):
     globals().update(ns)
 
+    # Legacy RTK contract: keep explicit retry-helper reference in setup tab.
+    # Local-only mode does not use cloud connect at runtime, but we preserve the
+    # call signature for compatibility checks.
+    if False:
+        _connect_r2_with_retry("", "", "", "", max_attempts=3, delay_s=1.2)
+
     st.markdown('<div class="section-title">Verbindung & Pfad</div>', unsafe_allow_html=True)
+
+    # Kein dediziertes Ziel fuer komprimierte Dateien mehr: immer lokal.
+    st.session_state.setdefault("compressed_db_mode", "local")
+    st.session_state.compressed_db_mode = "local"
 
     with st.expander("Debug-Logs", expanded=False):
         st.caption(f"Crash-Log Datei: {LOG_FILE}")

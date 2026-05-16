@@ -1,4 +1,4 @@
-"""RTK checks for compressed database selector in setup tab."""
+﻿"""RTK checks for compressed storage mode handling in setup tab."""
 
 from pathlib import Path
 
@@ -10,12 +10,11 @@ def _read(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
 
 
-def test_setup_tab_has_compressed_db_dropdown_at_top():
+def test_setup_tab_forces_local_compressed_mode_without_dropdown():
     txt = _read("app_tabs/setup_tab.py")
-    assert 'st.selectbox(' in txt
-    assert '"Datenbank für komprimierte Dateien"' in txt
-    assert '["Lokale Database (bevorzugt)", "R2 Database"]' in txt
-    assert 'st.session_state.compressed_db_mode = new_mode' in txt
+    assert "Datenbank für komprimierte Dateien" not in txt
+    assert "setup_compressed_db_mode" not in txt
+    assert 'st.session_state.compressed_db_mode = "local"' in txt
 
 
 def test_app_has_compressed_storage_binding_helper():
