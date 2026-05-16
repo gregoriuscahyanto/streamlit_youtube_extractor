@@ -89,12 +89,12 @@ from core.track_analysis import (
     extract_minimap_crop,
     project_point_with_homography,
 )
-from app_tabs import audio_tab, mat_selection_tab, mat_to_json_tab, roi_setup_tab, setup_tab, sync_tab, video_ocr_tab, watchdog_tab, youtube_tab
+from app_tabs import audio_tab, mat_to_json_tab, media_tab, roi_setup_tab, setup_tab, video_ocr_tab, watchdog_tab, youtube_tab
 try:
     # Streamlit reruns app.py in the same Python process. Reload extracted tab modules
     # so changes in app_tabs/*.py are visible without a full server restart.
     import importlib
-    for _tab_module in (audio_tab, mat_selection_tab, mat_to_json_tab, roi_setup_tab, setup_tab, sync_tab, video_ocr_tab, watchdog_tab, youtube_tab):
+    for _tab_module in (audio_tab, mat_to_json_tab, media_tab, roi_setup_tab, setup_tab, video_ocr_tab, watchdog_tab, youtube_tab):
         importlib.reload(_tab_module)
 except Exception:
     pass
@@ -395,12 +395,7 @@ MAT_OVERVIEW_COLCFG = {
 MAT_TABLE_HEIGHT = 430
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv")
 AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".aac", ".flac")
-FRAMEPACK_JPEG_QUALITY = 15
-FRAMEPACK_MAX_WIDTH = 0  # keep original resolution; 0 disables resize
-AUDIO_PROXY_ENABLED = True
-AUDIO_LOWPASS_HZ = 1000
-AUDIO_TARGET_SR = 4000
-AUDIO_PROXY_NAME = "audio_proxy_1k.wav"
+AUDIO_PROXY_NAME = "audio_proxy_1k.wav"  # kept for backwards-compat exclusion checks
 LAMP_GREEN = "\U0001F7E2"
 LAMP_RED = "\U0001F534"
 MOJIBAKE_GREEN = "\u00f0\u0178\u0178\u00a2"
@@ -511,10 +506,7 @@ def init_state():
         capture_folder="",
         # Video / ROI
         video_path=None, video_name="",
-        media_source="none",
-        framepack_remote_prefix="",
-        framepack_files=[],
-        framepack_cache={},
+        media_source="video",
         vid_duration=0.0, vid_fps=25.0, vid_width=0, vid_height=0,
         t_start=0.0, t_end=0.0, t_current=0.0,
         rois=[], selected_roi=None,
@@ -1482,21 +1474,14 @@ def _run_video_ocr_full_now() -> tuple[bool, str, dict]:
         st.session_state.roi_ocr_full_result = None
         return False, "Ungueltiges Start/Ende-Zeitfenster.", {}
 
-    src = str(st.session_state.get("media_source") or "none")
-    times: list[float] = []
-    if src == "framepack":
-        t0 = int(max(0, np.floor(start_s)))
-        t1 = int(max(t0, np.ceil(end_s)))
-        times = [float(t) for t in range(t0, t1 + 1)]
-    else:
-        fps = float(st.session_state.get("vid_fps", 1.0) or 1.0)
-        fps = max(1.0, fps)
-        step = 1.0 / fps
-        n = int(np.floor((end_s - start_s) / step)) + 1
-        if n > 120000:
-            st.session_state.roi_ocr_full_result = None
-            return False, f"OCR-Zeitfenster zu gross ({n} Frames). Bitte Zeitfenster verkuerzen.", {}
-        times = [float(start_s + i * step) for i in range(max(1, n))]
+    fps = float(st.session_state.get("vid_fps", 1.0) or 1.0)
+    fps = max(1.0, fps)
+    step = 1.0 / fps
+    n = int(np.floor((end_s - start_s) / step)) + 1
+    if n > 120000:
+        st.session_state.roi_ocr_full_result = None
+        return False, f"OCR-Zeitfenster zu gross ({n} Frames). Bitte Zeitfenster verkuerzen.", {}
+    times: list[float] = [float(start_s + i * step) for i in range(max(1, n))]
 
     raw_rows: list[dict] = []
     clean_rows: list[dict] = []
@@ -1550,16 +1535,7 @@ def _run_video_ocr_full_now() -> tuple[bool, str, dict]:
     rr_doc["ocr"] = ocr_doc
 
     cf = _current_capture_folder() or str(st.session_state.get("capture_folder") or "")
-    safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(cf)).strip("._") or "output"
-    res_dir = _results_dir_key().strip("/")
-    mat_key = f"{res_dir}/results_{safe_cf}.mat" if res_dir else f"results_{safe_cf}.mat"
-    ok_save, msg_save, _mat_bytes, _json_bytes = _save_recordresult_fields_to_r2_mat(
-        replace_fields={"ocr": ocr_doc},
-        force=True,
-        target_key=mat_key,
-        allow_missing=True,
-        base_record_result=rr_doc,
-    )
+    ok_save, msg_save, _json_bytes = _save_fields_to_local_json({"ocr": ocr_doc}, cf, base_rr=rr_doc)
     if not ok_save:
         st.session_state.roi_ocr_full_result = {"ok": False, "error": str(msg_save), "rows": int(len(clean_rows))}
         return False, f"OCR-Auswertung abgeschlossen, Speichern fehlgeschlagen: {msg_save}", st.session_state.roi_ocr_full_result
@@ -1779,16 +1755,7 @@ def _run_video_ocr_fullvideo_framewise_now(progress_cb=None, stop_cb=None) -> tu
     rr_doc["ocr"] = ocr_doc
 
     cf = _current_capture_folder() or str(st.session_state.get("capture_folder") or "")
-    safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(cf)).strip("._") or "output"
-    res_dir = _results_dir_key().strip("/")
-    mat_key = f"{res_dir}/results_{safe_cf}.mat" if res_dir else f"results_{safe_cf}.mat"
-    ok_save, msg_save, _mat_bytes, _json_bytes = _save_recordresult_fields_to_r2_mat(
-        replace_fields={"ocr": ocr_doc},
-        force=True,
-        target_key=mat_key,
-        allow_missing=True,
-        base_record_result=rr_doc,
-    )
+    ok_save, msg_save, _json_bytes = _save_fields_to_local_json({"ocr": ocr_doc}, cf, base_rr=rr_doc)
     if not ok_save:
         out_err = {"ok": False, "error": str(msg_save), "rows": int(len(clean_rows)), "frames_processed": int(processed)}
         st.session_state.video_ocr_full_result = out_err
@@ -2241,9 +2208,83 @@ def _server_results_dir() -> Path:
     return (Path.cwd() / "results").resolve()
 
 
+def _save_fields_to_local_json(
+    replace_fields: dict,
+    capture_folder: str,
+    base_rr: dict | None = None,
+) -> tuple[bool, str, bytes]:
+    """Merge replace_fields into local results JSON, preserving all other sections.
+
+    Same format as MAT-to-JSON conversion: _normalize_sidecar_json_payload + indent=2.
+    Returns (ok, message, json_bytes).
+    """
+    from core.watchdog_state import get_path_lock, _JSON_ROW_CACHE
+
+    safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(capture_folder)).strip("._") or "output"
+    json_name = f"results_{safe_cf}.json"
+    res_dir = _server_results_dir()
+    res_dir.mkdir(parents=True, exist_ok=True)
+    json_path = res_dir / json_name
+
+    doc: dict = {}
+    if json_path.exists():
+        try:
+            doc = json.loads(json_path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+
+    rr = doc.get("recordResult") if isinstance(doc.get("recordResult"), dict) else {}
+    rr = dict(rr)
+
+    if isinstance(base_rr, dict):
+        for k, v in base_rr.items():
+            if k not in rr or rr[k] is None:
+                rr[k] = _mat_export_to_jsonable(v)
+
+    for field, value in replace_fields.items():
+        exported = _mat_export_to_jsonable(value)
+        if field == "metadata" and isinstance(exported, dict) and isinstance(rr.get("metadata"), dict):
+            for mk, mv in exported.items():
+                rr["metadata"][mk] = mv
+        else:
+            rr[field] = exported
+
+    doc["recordResult"] = rr
+
+    norm_fn = globals().get("_normalize_sidecar_json_payload")
+    if callable(norm_fn):
+        try:
+            doc = norm_fn(doc)
+        except Exception:
+            pass
+
+    json_bytes = json.dumps(
+        doc, ensure_ascii=False, indent=2,
+        default=lambda o: _mat_export_to_jsonable(o),
+    ).encode("utf-8")
+
+    try:
+        with get_path_lock(str(json_path)):
+            json_path.write_bytes(json_bytes)
+    except Exception as e:
+        return False, f"Schreiben fehlgeschlagen: {e}", json_bytes
+
+    _JSON_ROW_CACHE.pop(str(json_path), None)
+    try:
+        from app_tabs.media_tab import _DETAIL_CACHE
+        _DETAIL_CACHE.pop(str(json_path), None)
+    except Exception:
+        pass
+
+    return True, str(json_path), json_bytes
+
+
 def _save_result_json_and_mat(no_roi: bool = False, video_faulty: bool = False) -> tuple[bool, str, dict]:
     cf = st.session_state.capture_folder or Path(str(st.session_state.video_name or "output")).stem or "output"
     safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(cf)).strip("._") or "output"
+
     if no_roi or video_faulty:
         result = build_result_payload(
             t_start=st.session_state.t_start,
@@ -2255,55 +2296,34 @@ def _save_result_json_and_mat(no_roi: bool = False, video_faulty: bool = False) 
                 "fps": st.session_state.vid_fps,
                 "duration": st.session_state.vid_duration,
             },
-            track={
-                "ref_pts": None,
-                "minimap_pts": None,
-                "moving_pt_color_range": {},
-            },
+            track={"ref_pts": None, "minimap_pts": None, "moving_pt_color_range": {}},
         )
     else:
         result = build_result_json()
+
     mat_struct_for_save = _build_save_mat_struct(result, no_roi=no_roi, video_faulty=video_faulty)
     json_name = f"results_{safe_cf}.json"
-    saved_targets = []
-    saved_mat_key = ""
-    if not (st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None):
-        json_payload = _mat_export_to_jsonable(mat_struct_for_save)
-        json_bytes = json.dumps(json_payload, indent=2, ensure_ascii=False, default=lambda o: _mat_export_to_jsonable(o)).encode("utf-8")
-        payload = dict(json_name=json_name, mat_name="", json_bytes=json_bytes, mat_bytes=b"", targets=["R2 nicht verbunden: nicht gespeichert"], mat_key="")
-        return False, "R2 nicht verbunden. ROI Setup wird ausschliesslich in R2 gespeichert.", payload
 
-    # ROI Setup updates only recordResult.ocr plus metadata status/title fields.
-    # Existing sections such as audio_config, audio_rpm and validation remain intact.
+    # Only ocr + metadata are updated; all other sections (audio_config, validation, …) are preserved.
     rr_for_save = _mat_struct_to_plain(mat_struct_for_save.get("recordResult", {}))
     if not isinstance(rr_for_save, dict):
         rr_for_save = {}
-    replace_fields = {"ocr": rr_for_save.get("ocr", {})}
+    replace_fields: dict = {"ocr": _mat_export_to_jsonable(rr_for_save.get("ocr", {}))}
     if isinstance(rr_for_save.get("metadata"), dict):
-        replace_fields["metadata"] = rr_for_save["metadata"]
+        replace_fields["metadata"] = _mat_export_to_jsonable(rr_for_save["metadata"])
 
-    res_dir = _results_dir_key().strip("/")
-    mat_key = f"{res_dir}/results_{safe_cf}.mat" if res_dir else f"results_{safe_cf}.mat"
-    ok_save, msg_save, mat_bytes, json_bytes = _save_recordresult_fields_to_r2_mat(
-        replace_fields,
-        force=True,
-        target_key=mat_key,
-        allow_missing=True,
-        base_record_result=rr_for_save,
-    )
-    if ok_save:
-        saved_mat_key = mat_key
-        saved_targets.append(f"R2: {res_dir or '/'}")
-        _invalidate_and_update_mat_selection_for_capture(str(cf), saved_mat_key, no_roi=no_roi, video_faulty=video_faulty)
-    else:
-        saved_targets.append(f"R2 results fehlgeschlagen: {msg_save}")
-    payload = dict(json_name=json_name, mat_name="", json_bytes=json_bytes, mat_bytes=b"", targets=saved_targets, mat_key=saved_mat_key)
+    ok_save, msg_save, json_bytes = _save_fields_to_local_json(replace_fields, cf, base_rr=rr_for_save)
+    saved_targets = [f"Lokal: {msg_save}" if ok_save else f"Fehler: {msg_save}"]
+    payload = dict(json_name=json_name, mat_name="", json_bytes=json_bytes,
+                   mat_bytes=b"", targets=saved_targets, mat_key="")
+    if not ok_save:
+        return False, f"Speichern fehlgeschlagen: {msg_save}", payload
     if video_faulty:
         msg_prefix = "Video fehlerhaft abgestempelt"
     elif no_roi:
         msg_prefix = "Kein ROI vorhanden abgestempelt"
     else:
-        msg_prefix = "Gespeichert"
+        msg_prefix = "ROI gespeichert"
     return True, f"{msg_prefix}: {json_name}", payload
 
 
@@ -2438,43 +2458,9 @@ def _load_framepack_from_r2(capture_folder: str) -> bool:
 
 
 def _get_media_frame(time_s: float):
-    src = str(st.session_state.media_source or "none")
-    if src == "video" and st.session_state.video_path:
+    if st.session_state.video_path:
         return get_frame(st.session_state.video_path, time_s)
-    if src != "framepack":
-        return None
-    files = st.session_state.framepack_files or []
-    if not files:
-        return None
-    idx = int(max(0, min(len(files) - 1, np.floor(float(time_s)))))
-    cache = st.session_state.framepack_cache or {}
-    if idx in cache:
-        return cache[idx]
-    remote_prefix = st.session_state.framepack_remote_prefix
-    key = f"{remote_prefix}/{files[idx]}"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(files[idx]).suffix or ".jpg")
-    tmp.close()
-    ok, msg = st.session_state.r2_client.download_file(key, tmp.name)
-    if not ok:
-        set_status(f"Frame-Pack Download: {msg}", "warn")
-        return None
-    try:
-        frame = np.array(Image.open(tmp.name).convert("RGB"))
-    except Exception as e:
-        set_status(f"Frame-Pack Parse: {e}", "warn")
-        return None
-    finally:
-        try:
-            Path(tmp.name).unlink(missing_ok=True)
-        except Exception:
-            pass
-    cache[idx] = frame
-    if len(cache) > 20:
-        oldest = sorted(cache.keys())[:-20]
-        for k in oldest:
-            cache.pop(k, None)
-    st.session_state.framepack_cache = cache
-    return frame
+    return None
 
 def r2_list(prefix):
     """Lists objects under prefix. Returns [{"name", "path", "is_dir"}]."""
@@ -5024,20 +5010,9 @@ def _try_load_video_for_capture_folder_with_fallback(capture_folder: str, json_d
     if not cands:
         return False
     for folder in cands:
-        # 1. Local full-fps video (preferred)
         local_video = _find_local_fullfps_video(folder)
         if local_video is not None and local_video.exists():
             _apply_video(str(local_video), local_video.name)
-            st.session_state.capture_folder = folder
-            st.session_state["_mat_last_video_capture_folder"] = folder
-            return True
-        # 2. Full video from R2
-        if st.session_state.get("r2_client") is not None and _load_full_video_from_r2(folder):
-            st.session_state.capture_folder = folder
-            st.session_state["_mat_last_video_capture_folder"] = folder
-            return True
-        # 3. Framepack (1fps proxy) as last resort
-        if st.session_state.get("r2_client") is not None and _load_framepack_from_r2(folder):
             st.session_state.capture_folder = folder
             st.session_state["_mat_last_video_capture_folder"] = folder
             return True
@@ -7497,10 +7472,7 @@ st.markdown(
 # components are initialized and visible from app startup.
 _tab_labels = [
     "Cloud Connection & Root",
-    "Sync",
-    "MAT Selection",
-    "MAT to JSON",
-    "YouTube Download",
+    "Medienbibliothek",
     "Watchdog",
     "ROI Setup",
     "Video OCR Full",
@@ -7510,19 +7482,18 @@ _tabs = st.tabs(_tab_labels)
 with _tabs[0]:
     setup_tab.render(globals())
 with _tabs[1]:
-    sync_tab.render(globals())
+    media_tab.render(globals())
+    # youtube_tab renders hidden: processes watchdog commands + populates globals.
+    # Streamlit renders all tab contents on every rerun regardless of active tab,
+    # so this runs even when the user is on a different tab.
+    with st.expander("YouTube Download (erweitert)", expanded=False):
+        youtube_tab.render(globals())
 with _tabs[2]:
-    mat_selection_tab.render(globals())
-with _tabs[3]:
-    mat_to_json_tab.render(globals())
-with _tabs[4]:
-    youtube_tab.render(globals())
-with _tabs[5]:
     watchdog_tab.render(globals())
-with _tabs[6]:
+with _tabs[3]:
     roi_setup_tab.render(globals())
-with _tabs[7]:
+with _tabs[4]:
     video_ocr_tab.render(globals())
-with _tabs[8]:
+with _tabs[5]:
     audio_tab.render(globals())
 

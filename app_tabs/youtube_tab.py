@@ -22,8 +22,6 @@ def watchdog_snapshot() -> dict:
             "last_tick": str(_YT_WATCHDOG.get("last_tick") or ""),
             "current": str(_YT_WATCHDOG.get("current") or ""),
             "downloads": int(_YT_WATCHDOG.get("downloads", 0) or 0),
-            "lite": int(_YT_WATCHDOG.get("lite", 0) or 0),
-            "sync_lite": int(_YT_WATCHDOG.get("sync_lite", 0) or 0),
             "ocr": int(_YT_WATCHDOG.get("ocr", 0) or 0),
             "mat_json": int(_YT_WATCHDOG.get("mat_json", 0) or 0),
             "errors": int(_YT_WATCHDOG.get("errors", 0) or 0),
@@ -254,8 +252,6 @@ def render(ns):
                 "download_status": dl_status,
                 "last_error": "" if dl_status != "error" else "audio fehlt",
                 "downloaded_at": str(meta.get("created_at") or ""),
-                "lite_target": _lite_target_mode(),
-                "lite_status": "",
                 "json_path": str(jp),
             }
             _JSON_ROW_CACHE[cache_key] = (mtime, row)
@@ -963,15 +959,6 @@ def render(ns):
             return True, f"OCR fortgesetzt (+{new_frames} Frames, gesamt {_n_rows} Zeilen)"
         return True, f"OCR gespeichert ({_n_rows} Zeilen)"
 
-    def _wd_lite_missing(folder: str, json_path: str, target: str, base_override=None) -> bool:
-        target_low = str(target or "local").strip().lower()
-        if target_low == "r2":
-            return not bool(str(json_path or "").strip())
-        out_video, _out_audio = _capture_media_paths(folder, base_override=base_override)
-        fp_ok = (out_video.parent / "frames_1fps" / "index.json").exists()
-        ap_ok = (out_video.parent / str(globals().get("AUDIO_PROXY_NAME") or "audio_proxy_1k.wav")).exists()
-        jp_ok = bool(str(json_path or "").strip()) and (out_video.parent / Path(str(json_path)).name).exists()
-        return not (fp_ok and ap_ok and jp_ok)
 
     def _wd_convert_one_mat_to_json(base_override=None) -> tuple[bool, str]:
         base = _capture_base(base_override=base_override)
@@ -1035,36 +1022,15 @@ def render(ns):
             return True, f"{mat_path.name} -> {json_path.name}"
         return False, "nichts offen"
 
-    def _wd_sync_one_folder_lite(base_override=None) -> tuple[bool, str]:
-        folders = sorted(set(_get_local_capture_folders()))
-        for folder in folders:
-            out_video = _find_local_fullfps_video(folder)
-            if out_video is None or (not out_video.exists()) or out_video.stat().st_size <= 0:
-                continue
-            ok_fp = (out_video.parent / "frames_1fps" / "index.json").exists()
-            ok_ap = (out_video.parent / str(globals().get("AUDIO_PROXY_NAME") or "audio_proxy_1k.wav")).exists()
-            if ok_fp and ok_ap:
-                continue
-            ok, msg = _postprocess_lite_assets(
-                folder,
-                str(_wd_json_path(folder, base_override=base_override)),
-                target_override="local",
-                base_override=base_override,
-            )
-            if ok:
-                return True, f"{folder}: {msg}"
-            return False, f"{folder}: {msg}"
-        return False, "nichts offen"
 
     def _wd_process_once(cfg: dict) -> bool:
         base_override = cfg.get("local_base_path")
         tasks = dict(cfg.get("tasks") or {})
         task_mat_json = bool(tasks.get("mat_json", False))
         task_download = bool(tasks.get("download", True))
-        task_sync_lite = bool(tasks.get("sync_lite", True))
         task_ocr = bool(tasks.get("ocr", True))
 
-        _wd_log(f"Tick | Aufgaben: MAT-JSON={task_mat_json} Download={task_download} Sync={task_sync_lite} OCR={task_ocr}")
+        _wd_log(f"Tick | Aufgaben: MAT-JSON={task_mat_json} Download={task_download} OCR={task_ocr}")
 
         if task_mat_json:
             _wd_set_current("MAT->JSON")
@@ -1078,20 +1044,6 @@ def render(ns):
                 _wd_log(f"MAT->JSON Fehler: {msg_mj}")
                 return True
             _wd_log(f"MAT->JSON: {msg_mj}")
-
-        if task_sync_lite:
-            _wd_set_current("Sync Full->Lite")
-            ok_sync, msg_sync = _wd_sync_one_folder_lite(base_override=base_override)
-            if ok_sync:
-                _wd_inc("sync_lite")
-                _wd_inc("lite")
-                _wd_log(f"Sync Lite: {msg_sync}")
-                return True
-            if "nichts offen" not in str(msg_sync).lower():
-                _wd_inc("errors")
-                _wd_log(f"Sync Lite Fehler: {msg_sync}")
-                return True
-            _wd_log(f"Sync Lite: {msg_sync}")
 
         rows_now = _read_db()
         _wd_log(f"DB: {len(rows_now)} Einträge geladen")
@@ -1169,56 +1121,6 @@ def render(ns):
             if status != "downloaded":
                 _wd_update_row(link, {"download_status": "downloaded", "last_error": ""})
 
-            if task_sync_lite and (not json_file.exists()):
-                _wd_set_current(f"Metadata-JSON: {folder}")
-                meta_url = _fetch_metadata_for_url(link)
-                ok_meta, msg_meta = _write_capture_metadata_json(
-                    folder,
-                    {
-                        "youtube_url": link,
-                        "video_title": str(row.get("title") or meta_url.get("title") or ""),
-                        "video_name": str(folder),
-                        "upload_date": str(row.get("upload_date") or meta_url.get("pubDate") or ""),
-                        "desc": str(meta_url.get("desc") or ""),
-                        "channel_name": str(meta_url.get("chanName") or ""),
-                        "downloaded_at": str(row.get("downloaded_at") or ""),
-                    },
-                    base_override=base_override,
-                    quiet=True,
-                )
-                if ok_meta:
-                    _wd_update_row(link, {"json_path": msg_meta, "last_error": ""})
-                    json_file = Path(msg_meta)
-                    _wd_log(f"Metadata-JSON gespeichert: {folder}")
-                else:
-                    _wd_update_row(link, {"last_error": f"metadata.json Fehler: {msg_meta}"})
-                    _wd_inc("errors")
-                    _wd_log(f"Metadata-JSON Fehler: {folder} -> {msg_meta}")
-                return True
-
-            target = str(row.get("lite_target") or cfg.get("lite_target") or "local")
-            if str(target).strip().lower() == "r2":
-                target = "local"
-            if task_sync_lite and _wd_lite_missing(folder, str(json_file), target, base_override=base_override):
-                _wd_set_current(f"Lite-Assets: {folder}")
-                ok_lite, msg_lite = _postprocess_lite_assets(
-                    folder,
-                    str(json_file),
-                    target_override=target,
-                    base_override=base_override,
-                )
-                patch = {"lite_target": target, "lite_status": str(msg_lite or "")}
-                if not ok_lite:
-                    patch["last_error"] = f"Lite-Speicherung: {msg_lite}"
-                    _wd_inc("errors")
-                    _wd_log(f"Lite Fehler: {folder} -> {msg_lite}")
-                else:
-                    patch["last_error"] = ""
-                    _wd_inc("lite")
-                    _wd_log(f"Lite gespeichert: {folder}")
-                _wd_update_row(link, patch)
-                return True
-
             need_ocr, reason = _wd_ocr_pending(json_file)
             if task_ocr and need_ocr and folder not in ocr_skip_now:
                 _wd_set_current(f"OCR: {folder}")
@@ -1273,9 +1175,8 @@ def render(ns):
                 return
             stop_event = threading.Event()
             tasks_cfg = {
-                "mat_json": bool(st.session_state.get("yt_watchdog_task_mat_json", True)),
-                "download": bool(st.session_state.get("yt_watchdog_task_download", True)),
-                "sync_lite": bool(st.session_state.get("yt_watchdog_task_sync_lite", True)),
+                "mat_json": bool(st.session_state.get("yt_watchdog_task_mat_json", False)),
+                "download": bool(st.session_state.get("yt_watchdog_task_download", False)),
                 "ocr": bool(st.session_state.get("yt_watchdog_task_ocr", True)),
             }
             cfg = {
@@ -1381,7 +1282,6 @@ def render(ns):
     st.session_state.setdefault("yt_watchdog_interval_sec_cmd", 10)
     st.session_state.setdefault("yt_watchdog_task_mat_json", False)
     st.session_state.setdefault("yt_watchdog_task_download", False)
-    st.session_state.setdefault("yt_watchdog_task_sync_lite", False)
     st.session_state.setdefault("yt_watchdog_task_ocr", True)
     _wd_cmd = str(st.session_state.get("yt_watchdog_cmd") or "").strip().lower()
     if _wd_cmd == "start":

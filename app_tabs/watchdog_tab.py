@@ -26,13 +26,8 @@ def render(ns):
             value=bool(st.session_state.get("yt_watchdog_task_download", False)),
             disabled=is_running,
         )
-        t3, t4 = st.columns(2)
-        task_sync = t3.checkbox(
-            "Sync Voll <-> Lite",
-            value=bool(st.session_state.get("yt_watchdog_task_sync_lite", False)),
-            disabled=is_running,
-        )
-        task_ocr = t4.checkbox(
+        t3, _t4 = st.columns(2)
+        task_ocr = t3.checkbox(
             "OCR Auswertung",
             value=bool(st.session_state.get("yt_watchdog_task_ocr", True)),
             disabled=is_running,
@@ -75,7 +70,6 @@ def render(ns):
     if start_clicked:
         st.session_state.yt_watchdog_task_mat_json = bool(task_mat_json)
         st.session_state.yt_watchdog_task_download = bool(task_download)
-        st.session_state.yt_watchdog_task_sync_lite = bool(task_sync)
         st.session_state.yt_watchdog_task_ocr = bool(task_ocr)
         st.session_state.yt_watchdog_ocr_fps = str(ocr_fps)
         st.session_state.yt_watchdog_interval_sec_cmd = int(wd_interval)
@@ -93,7 +87,6 @@ def render(ns):
         f'{_lamp}<span style="font-size:0.85em;color:#aaa;">'
         f"Watchdog: <b>{wd_state}</b> | MAT->JSON={int(snap.get('mat_json', 0))} | "
         f"Downloads={int(snap.get('downloads', 0))} | "
-        f"Sync/Lite={int(snap.get('sync_lite', snap.get('lite', 0)))} | "
         f"OCR={int(snap.get('ocr', 0))} | Fehler={int(snap.get('errors', 0))}"
         f"</span>",
         unsafe_allow_html=True,

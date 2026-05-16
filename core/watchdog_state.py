@@ -19,8 +19,6 @@ _YT_WATCHDOG: dict = {
     "logs": [],
     "errors": 0,
     "downloads": 0,
-    "lite": 0,
-    "sync_lite": 0,
     "ocr": 0,
     "mat_json": 0,
     "mat_json_skip": set(),
