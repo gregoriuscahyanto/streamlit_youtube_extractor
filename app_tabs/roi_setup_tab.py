@@ -993,7 +993,7 @@ def _render_track_analysis_section():
         st.markdown('</div>',unsafe_allow_html=True)
 
     def _centerline_progress_percent(ref_pt, centerline_px) -> float | None:
-        if ref_pt is None or not centerline_px:
+        if ref_pt is None or centerline_px is None or (hasattr(centerline_px, "__len__") and len(centerline_px) < 2):
             return None
         try:
             p = np.array(ref_pt, dtype=float).reshape(2)

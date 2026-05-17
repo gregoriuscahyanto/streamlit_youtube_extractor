@@ -215,7 +215,7 @@ def render(ns):
             "ref_track_img": st.session_state.get("ref_track_img"),
             "minimap_pts": list(st.session_state.get("minimap_pts") or []),
             "ref_track_pts": list(st.session_state.get("ref_track_pts") or []),
-            "centerline_px": list(st.session_state.get("centerline_px") or []),
+            "centerline_px": (lambda _c: _c.tolist() if hasattr(_c, "tolist") else (list(_c) if _c is not None else []))(st.session_state.get("centerline_px")),
             "roi_global_scale": float(st.session_state.get("roi_global_scale", 1.2) or 1.2),
             "progress_step_frames": int(st.session_state.get("video_ocr_live_progress_step_frames", 2) or 2),
         }
@@ -290,14 +290,77 @@ def render(ns):
 
     st.progress(min(1.0, done_n / total_n), text=f"{done_n}/{total_n} Frames | t={t_s:.2f}s")
 
-    st.caption("Live-Progress (OCR-Werte je Update, inkl. Track-Minimap wenn vorhanden):")
-    if live_rows:
-        st.dataframe(pd.DataFrame(live_rows), width="stretch", hide_index=True, height=320)
-    else:
-        st.dataframe(pd.DataFrame(columns=["frame_idx", "time_s"]), width="stretch", hide_index=True, height=220)
-
     if running or _is_running():
         st.info("Video OCR läuft im Hintergrund. Fortschritt und Werte werden live aktualisiert.", icon="⏳")
+    if wd_ocr_active:
+        st.info(
+            "**Watchdog steuert OCR.** Ergebnisse werden direkt aus dem JSON gelesen.",
+            icon="🤖",
+        )
+
+    # ── Live-Progress Tabelle ─────────────────────────────────────────────────
+    st.caption("Live-Progress (OCR-Werte je Update):")
+    if live_rows:
+        live_df = pd.DataFrame(live_rows)
+        st.dataframe(live_df, use_container_width=True, hide_index=True, height=260)
+    else:
+        live_df = pd.DataFrame(columns=["frame_idx", "time_s"])
+        st.dataframe(live_df, use_container_width=True, hide_index=True, height=120)
+
+    # ── Live-Scope Diagramm ───────────────────────────────────────────────────
+    st.caption("Live-Scope: Diagramm der OCR-Werte")
+    _avail_cols = list(live_df.columns) if not live_df.empty else []
+    _numeric_cols = [
+        c for c in _avail_cols
+        if live_df[c].dtype.kind in "iufcb"  # int, uint, float, complex, bool
+    ] if not live_df.empty else []
+
+    if _avail_cols:
+        _sc1, _sc2 = st.columns([2, 3])
+        _x_default = "time_s" if "time_s" in _numeric_cols else (_numeric_cols[0] if _numeric_cols else _avail_cols[0])
+        _x_idx = _numeric_cols.index(_x_default) if _x_default in _numeric_cols else 0
+        _scope_x = _sc1.selectbox(
+            "X-Achse",
+            options=_numeric_cols or _avail_cols,
+            index=_x_idx,
+            key="ocr_scope_x",
+        )
+        _y_default = [c for c in _numeric_cols if c not in ("frame_idx", "time_s", "track_minimap_found")]
+        _scope_y = _sc2.multiselect(
+            "Y-Achse (mehrere möglich)",
+            options=[c for c in _numeric_cols if c != _scope_x],
+            default=[c for c in (_y_default or _numeric_cols) if c != _scope_x][:3],
+            key="ocr_scope_y",
+        )
+        if _scope_x and _scope_y and not live_df.empty:
+            try:
+                import plotly.graph_objects as go
+                _fig = go.Figure()
+                for _yc in _scope_y:
+                    _fig.add_trace(go.Scatter(
+                        x=live_df[_scope_x],
+                        y=live_df[_yc],
+                        mode="lines+markers",
+                        name=_yc,
+                        marker=dict(size=4),
+                    ))
+                _fig.update_layout(
+                    margin=dict(l=40, r=20, t=30, b=40),
+                    height=320,
+                    xaxis_title=_scope_x,
+                    yaxis_title="Wert",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    template="plotly_dark",
+                )
+                st.plotly_chart(_fig, use_container_width=True)
+            except Exception as _pe:
+                st.caption(f"Diagramm nicht verfügbar: {_pe}")
+        elif not _scope_y:
+            st.caption("Mindestens eine Y-Achse auswählen.")
+        else:
+            st.caption("Warte auf Daten ...")
+    else:
+        st.caption("Noch keine Daten — Diagramm erscheint sobald OCR läuft.")
 
     last = st.session_state.get("video_ocr_full_result") or {}
     if isinstance(last, dict) and last:

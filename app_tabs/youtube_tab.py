@@ -713,6 +713,63 @@ def render(ns):
         track_cols = ["track_minimap_found", "track_minimap_x", "track_minimap_y", "track_xy_x", "track_xy_y", "track_pct"] if track_cfg.get("track_roi") else []
         return roi_cols, track_cols
 
+    def _wd_roi_status(doc: dict) -> str:
+        """Return 'vollständig' / 'unvollständig' / 'nein' — mirrors media_tab logic."""
+        rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+        if not isinstance(rr, dict):
+            return "nein"
+        ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
+        if not isinstance(ocr, dict):
+            return "nein"
+        roi_table = ocr.get("roi_table") or ocr.get("roi_table_raw")
+        if not roi_table:
+            return "nein"
+        # Detect track_minimap presence
+        has_track = False
+        if isinstance(roi_table, list):
+            has_track = any(
+                str((r or {}).get("name_roi") or (r or {}).get("name") or "").strip().lower() == "track_minimap"
+                for r in roi_table if isinstance(r, dict)
+            )
+        elif isinstance(roi_table, dict):
+            names = roi_table.get("name_roi") or roi_table.get("name") or []
+            if isinstance(names, list):
+                has_track = any(str(n or "").strip().lower() == "track_minimap" for n in names)
+            else:
+                has_track = str(names or "").strip().lower() == "track_minimap"
+        trk = ocr.get("trkCalSlim") if isinstance(ocr.get("trkCalSlim"), dict) else {}
+        if not has_track and isinstance(trk, dict):
+            roi_raw = trk.get("roi")
+            if isinstance(roi_raw, (list, tuple)) and len(roi_raw) >= 4:
+                try:
+                    if float(roi_raw[2]) > 0 and float(roi_raw[3]) > 0:
+                        has_track = True
+                except Exception:
+                    pass
+        if not has_track:
+            return "vollständig"
+        # Track present → check calibration params
+        def _pts_ok(v) -> bool:
+            return isinstance(v, list) and len(v) >= 4
+        def _color_ok(v) -> bool:
+            return isinstance(v, dict) and "h_lo" in v
+        def _cl_ok(v) -> bool:
+            if not isinstance(v, (list, tuple)) or len(v) < 2:
+                return False
+            try:
+                arr = np.asarray(v, dtype=float)
+                return arr.ndim == 2 and arr.shape[0] >= 2 and arr.shape[1] >= 2
+            except Exception:
+                return False
+        if (
+            _pts_ok(trk.get("minimap_pts"))
+            and _pts_ok(trk.get("ref_pts"))
+            and _color_ok(trk.get("moving_pt_color_range"))
+            and _cl_ok(trk.get("centerline_px"))
+        ):
+            return "vollständig"
+        return "unvollständig"
+
     def _wd_ocr_pending(path: Path) -> tuple[bool, str]:
         if not path.exists():
             return False, "json fehlt"
@@ -724,6 +781,9 @@ def render(ns):
         rois, has_track = _wd_extract_ocr_rois(doc)
         if not rois and (not has_track):
             return False, "keine OCR-ROIs"
+        roi_st = _wd_roi_status(doc)
+        if roi_st != "vollständig":
+            return False, f"ROI {roi_st} (track-Kalibrierung unvollständig)"
         cleaned = ocr.get("cleaned")
         table = ocr.get("table")
         # Columnar format: {"time_s": [...], "frame_idx": [...], ...}
@@ -910,7 +970,8 @@ def render(ns):
             # as the fallback projection method and does not require the reference image.
             _ref_img = st.session_state.get("ref_track_img")
             # centerline_px is now saved to trkCalSlim in JSON by _ensure_ocr_extractor_ocr_struct.
-            _centerline_px = track_cfg.get("centerline_px") or st.session_state.get("centerline_px")
+            _centerline_px_cfg = track_cfg.get("centerline_px")
+            _centerline_px = _centerline_px_cfg if _centerline_px_cfg is not None else st.session_state.get("centerline_px")
             _H_fallback = None
             if len(_mini_pts) >= 4 and len(_ref_pts) >= 4:
                 try:

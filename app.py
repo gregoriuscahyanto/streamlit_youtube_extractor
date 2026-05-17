@@ -1575,7 +1575,8 @@ def _run_video_ocr_fullvideo_framewise_now(
     _ref_track_img = _tpo.get("ref_track_img") if "ref_track_img" in _tpo else st.session_state.get("ref_track_img")
     _minimap_pts = list(_tpo.get("minimap_pts") or st.session_state.get("minimap_pts") or [])
     _ref_track_pts = list(_tpo.get("ref_track_pts") or st.session_state.get("ref_track_pts") or [])
-    _centerline_px = list(_tpo.get("centerline_px") or st.session_state.get("centerline_px") or [])
+    _cl_raw = _tpo.get("centerline_px") if _tpo.get("centerline_px") is not None else st.session_state.get("centerline_px")
+    _centerline_px = (_cl_raw.tolist() if hasattr(_cl_raw, "tolist") else list(_cl_raw)) if _cl_raw is not None else []
     _roi_global_scale = float(_tpo.get("roi_global_scale") or st.session_state.get("roi_global_scale") or 1.2)
 
     rois_active = list(rois_override if isinstance(rois_override, list) else (st.session_state.get("rois", []) or []))
