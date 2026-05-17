@@ -17,3 +17,4 @@ mss>=9.0.1
 requests>=2.32.0
 plotly
 openpyxl
+optuna

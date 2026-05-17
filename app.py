@@ -90,12 +90,12 @@ from core.track_analysis import (
     extract_minimap_crop,
     project_point_with_homography,
 )
-from app_tabs import audio_tab, compare_tab, mat_to_json_tab, media_tab, plausibility_filter, roi_catalog_tab, roi_setup_tab, setup_tab, track_geoplot, video_ocr_tab, watchdog_tab, youtube_tab
+from app_tabs import audio_sweep, audio_tab, compare_tab, mat_to_json_tab, media_tab, plausibility_filter, roi_catalog_tab, roi_setup_tab, setup_tab, track_geoplot, video_ocr_tab, watchdog_tab, youtube_tab
 try:
     # Streamlit reruns app.py in the same Python process. Reload extracted tab modules
     # so changes in app_tabs/*.py are visible without a full server restart.
     import importlib
-    for _tab_module in (audio_tab, compare_tab, mat_to_json_tab, media_tab, plausibility_filter, roi_catalog_tab, roi_setup_tab, setup_tab, track_geoplot, video_ocr_tab, watchdog_tab, youtube_tab):
+    for _tab_module in (audio_sweep, audio_tab, compare_tab, mat_to_json_tab, media_tab, plausibility_filter, roi_catalog_tab, roi_setup_tab, setup_tab, track_geoplot, video_ocr_tab, watchdog_tab, youtube_tab):
         importlib.reload(_tab_module)
 except Exception:
     pass
