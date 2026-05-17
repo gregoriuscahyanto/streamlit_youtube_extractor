@@ -1,4 +1,4 @@
-"""Audio parameter sweep — find the best RPM-extraction parameters against a reference."""
+﻿"""Audio parameter sweep â€” find the best RPM-extraction parameters against a reference."""
 from __future__ import annotations
 import math
 import threading
@@ -6,7 +6,24 @@ from pathlib import Path
 from typing import Callable
 
 
-# ── Physical plausibility check ───────────────────────────────────────────────
+def _extract_t_rpm(ret):
+    """Accept legacy tuple return and newer dict return from extractor."""
+    if isinstance(ret, dict):
+        t_audio = ret.get("t")
+        rpm_audio = ret.get("rpm")
+        if t_audio is None or rpm_audio is None:
+            raise ValueError("extractor-dict ohne 't'/'rpm'")
+        return t_audio, rpm_audio, ret
+    if isinstance(ret, (list, tuple)):
+        if len(ret) < 2:
+            raise ValueError("extractor-tuple zu kurz")
+        t_audio = ret[0]
+        rpm_audio = ret[1]
+        extra = ret[2] if len(ret) >= 3 else {}
+        return t_audio, rpm_audio, extra
+    raise TypeError(f"Unerwarteter Extractor-Rueckgabewert: {type(ret).__name__}")
+
+# â”€â”€ Physical plausibility check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _fundamental_hz(rpm_val: float, cyl: int, order: float, takt: int) -> float:
     """Fundamental firing frequency in Hz."""
@@ -20,12 +37,12 @@ def _combo_plausible(cyl: int, order: float, takt: int, fmax: float,
     f_hi = _fundamental_hz(rpm_max, cyl, order, takt)
     if f_hi < 20.0:      # below audio range
         return False
-    if f_lo > fmax:      # fundamental above fmax → nothing visible
+    if f_lo > fmax:      # fundamental above fmax â†’ nothing visible
         return False
     return True
 
 
-# ── Reference file parsing ────────────────────────────────────────────────────
+# â”€â”€ Reference file parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def parse_ref_file(data: bytes, filename: str) -> dict:
     """
@@ -100,7 +117,7 @@ def load_ref_from_doc(doc: dict) -> dict | None:
     }
 
 
-# ── Cross-correlation offset search ───────────────────────────────────────────
+# â”€â”€ Cross-correlation offset search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def cross_corr_offset(t_audio, rpm_audio, t_ref, rpm_ref,
                       search_lo: float = -10.0, search_hi: float = 10.0,
@@ -148,7 +165,7 @@ def cross_corr_offset(t_audio, rpm_audio, t_ref, rpm_ref,
     return best_offset
 
 
-# ── Agreement scoring ──────────────────────────────────────────────────────────
+# â”€â”€ Agreement scoring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
                     offset_s: float,
@@ -158,7 +175,7 @@ def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
     """
     Compute agreement between rpm_audio and rpm_ref (shifted by offset_s).
     Returns dict with within_pct, rmse, mae, n, pearson_r.
-    Pure audio-based — no OCR speed influence.
+    Pure audio-based â€” no OCR speed influence.
     """
     import numpy as np
 
@@ -173,7 +190,7 @@ def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
     t_lo = max(t_a[0], t_r[0])
     t_hi = min(t_a[-1], t_r[-1])
     if t_hi - t_lo < 0.1:
-        return {"ok": False, "error": "keine Überlappung"}
+        return {"ok": False, "error": "keine Ãœberlappung"}
 
     n_pts = min(2000, max(50, int((t_hi - t_lo) * 4)))
     t_common = np.linspace(t_lo, t_hi, n_pts)
@@ -226,9 +243,9 @@ def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
     }
 
 
-# ── Parameter grid ─────────────────────────────────────────────────────────────
+# â”€â”€ Parameter grid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-# Valid cylinder counts (skip 7, 9, 11, 13, 14, 15 — physically uncommon)
+# Valid cylinder counts (skip 7, 9, 11, 13, 14, 15 â€” physically uncommon)
 CYL_OPTIONS = ["any", 1, 2, 3, 4, 5, 6, 8, 10, 12, 16]
 CYL_SWEEP_VALUES = [3, 4, 5, 6, 8, 10, 12]  # used when cyl="any"
 TAKT_OPTIONS = ["any", 2, 4]
@@ -339,7 +356,7 @@ def build_param_grid(cfg: dict) -> list[dict]:
     return grid
 
 
-# ── Sweep runner ──────────────────────────────────────────────────────────────
+# â”€â”€ Sweep runner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _eval_single_params(
     params: dict,
@@ -394,16 +411,17 @@ def _eval_single_params(
             "hybrid_smooth":   params.get("hybrid_smooth", 9),
             "fast_mode": True,
         }
-        t_audio, rpm_audio, _extra = extract_rpm_fn(
+        _ret = extract_rpm_fn(
             y=y, fs=fs, start_s=start_s, end_s=end_s, offset_s=0.0,
             nfft=params["nfft"], overlap_pct=params["overlap_pct"],
             fmax=params["fmax"], cyl=params["cyl"], takt=params["takt"],
             order=params["order"], rpm_min=params["rpm_min"], rpm_max=params["rpm_max"],
             method=params["method"],
-            cyl_mode="Fest auswählen", harmonic_mode="Fest auswählen",
-            drive_type="Verbrenner/Hybrid", stft_mode="Fest auswählen",
+            cyl_mode="Fest auswÃ¤hlen", harmonic_mode="Fest auswÃ¤hlen",
+            drive_type="Verbrenner/Hybrid", stft_mode="Fest auswÃ¤hlen",
             method_params=method_params,
         )
+        t_audio, rpm_audio, _extra = _extract_t_rpm(_ret)
     except Exception as e:
         return _failed("extraction_error", str(e))
 
@@ -479,9 +497,9 @@ def run_sweep(
     Run the parameter sweep.
 
     For each grid entry:
-      1. Extract RPM with given params (no OCR speed — cyl_mode='Fest auswählen',
-         harmonic_mode='Fest auswählen', use_ocr_v=False)
-      2. Find best offset via cross-corr around offset_base ± offset_range
+      1. Extract RPM with given params (no OCR speed â€” cyl_mode='Fest auswÃ¤hlen',
+         harmonic_mode='Fest auswÃ¤hlen', use_ocr_v=False)
+      2. Find best offset via cross-corr around offset_base Â± offset_range
       3. Score with tolerance metric
     Returns top_n results sorted by combined_score descending.
     """
@@ -539,7 +557,7 @@ def run_sweep_random(
     sampled = full_grid[:n_trials]
 
     return run_sweep(
-        sampled, y, fs, start_s, end_s, t_ref, rpm_ref,
+        y=y, fs=fs, start_s=start_s, end_s=end_s, t_ref=t_ref, rpm_ref=rpm_ref, grid=sampled,
         tol_abs_rpm=tol_abs_rpm, tol_pct=tol_pct, tol_logic=tol_logic,
         offset_base=offset_base, offset_range=offset_range, offset_step=offset_step,
         progress_cb=progress_cb, stop_event=stop_event,
@@ -564,7 +582,7 @@ def run_sweep_optuna(
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except ImportError:
         raise ImportError(
-            "optuna nicht installiert. Bitte 'pip install optuna' ausführen."
+            "optuna nicht installiert. Bitte 'pip install optuna' ausfÃ¼hren."
         )
 
     methods  = cfg.get("methods")  or ["Hybrid"]
@@ -643,7 +661,7 @@ def run_sweep_optuna(
     return _sort_and_rank(results_all, top_n)
 
 
-# ── Persist sweep results ─────────────────────────────────────────────────────
+# â”€â”€ Persist sweep results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def save_sweep_results(json_path: str, results: list[dict]) -> None:
     """Write top sweep results to recordResult.audio_sweep in the result JSON."""
@@ -678,3 +696,5 @@ def load_sweep_results(json_path: str) -> list[dict]:
         return list(sweep.get("results") or [])
     except Exception:
         return []
+
+

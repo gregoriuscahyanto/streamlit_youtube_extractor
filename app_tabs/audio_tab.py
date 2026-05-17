@@ -1,4 +1,4 @@
-"""Renderer for the Streamlit tab extracted from app.py.
+﻿"""Renderer for the Streamlit tab extracted from app.py.
 
 The renderer receives app.py globals so existing helper functions and
 session-state conventions remain shared during the incremental split.
@@ -6,9 +6,9 @@ session-state conventions remain shared during the incremental split.
 
 def render(ns):
     globals().update(ns)
-    _legacy_status_token = "Start bestätigt: Audioanalyse läuft im Hintergrund"
+    _legacy_status_token = "Start bestÃ¤tigt: Audioanalyse lÃ¤uft im Hintergrund"
     st.divider()
-    st.subheader("Audio Auswertung · robuste RPM-Extraktion")
+    st.subheader("Audio Auswertung Â· robuste RPM-Extraktion")
     title_txt = _audio_get_vehicle_title()
     if title_txt:
         st.info(f"Datensatz / Fahrzeug aus Metadata: {title_txt}")
@@ -31,7 +31,7 @@ def render(ns):
         st.info("Lade zuerst eine MAT+Video-Datei im Tab 'MAT-Auswahl und Analyse'.")
         return
 
-    # ── Modus-Auswahl (ganz oben) ──────────────────────────────────────────────
+    # â”€â”€ Modus-Auswahl (ganz oben) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     _aud_mode = st.radio(
         "Analyse-Modus",
         ["Standard-Analyse", "Sweep mit Messdatei"],
@@ -39,15 +39,15 @@ def render(ns):
         horizontal=True,
         key="aud_mode_radio",
         help="Standard: mehrere Methoden, beste interne Bewertung. "
-             "Sweep: Parameter systematisch variieren bis beste Übereinstimmung mit Referenz-RPM.",
+             "Sweep: Parameter systematisch variieren bis beste Ãœbereinstimmung mit Referenz-RPM.",
     )
     st.session_state.aud_mode_idx = 0 if _aud_mode == "Standard-Analyse" else 1
     _mode_standard = (_aud_mode == "Standard-Analyse")
     _mode_sweep    = not _mode_standard
 
-    # ── Signal / STFT und Methoden-Parameter: nur in Standard-Analyse relevant ──
-    # Standardwerte für Sweep-Modus (nicht angezeigt, werden im Sweep variiert)
-    aud_stft_mode = "Fest auswählen"
+    # â”€â”€ Signal / STFT und Methoden-Parameter: nur in Standard-Analyse relevant â”€â”€
+    # Standardwerte fÃ¼r Sweep-Modus (nicht angezeigt, werden im Sweep variiert)
+    aud_stft_mode = "Fest auswÃ¤hlen"
     aud_nfft = 2048
     aud_ov   = 75.0
     aud_fmax = 1000.0
@@ -62,7 +62,7 @@ def render(ns):
     if _mode_standard:
         with st.expander("Signal / STFT", expanded=True):
             c0 = st.columns(4)
-            aud_stft_mode = c0[0].selectbox("NFFT/Overlap", ["Fest auswählen", "Auto Schnell", "Auto Breit"], key="aud_stft_mode_new")
+            aud_stft_mode = c0[0].selectbox("NFFT/Overlap", ["Fest auswÃ¤hlen", "Auto Schnell", "Auto Breit"], key="aud_stft_mode_new")
             stft_auto = str(aud_stft_mode).startswith("Auto")
             aud_nfft = int(c0[1].number_input("NFFT", 64, 65536, 4096, step=64, key="aud_nfft_new", disabled=stft_auto))
             aud_ov   = float(c0[2].number_input("Overlap [%]", 0.0, 98.0, 75.0, step=1.0, key="aud_ov_new", disabled=stft_auto))
@@ -74,14 +74,14 @@ def render(ns):
         with st.expander("Methoden-Parameter", expanded=True):
             st.caption("Diese Parameter wirken nur auf die passenden Methoden; Hybrid nutzt sie beim Fusionieren der Teilmethoden.")
             m0 = st.columns(4)
-            ridge_smooth     = int(m0[0].number_input("Ridge Glättung", 3, 51, 7, step=2, key="aud_ridge_smooth"))
+            ridge_smooth     = int(m0[0].number_input("Ridge GlÃ¤ttung", 3, 51, 7, step=2, key="aud_ridge_smooth"))
             ridge_jump_frac  = float(m0[1].number_input("Ridge max Sprung [% Band]", 1.0, 50.0, 8.0, step=1.0, key="aud_ridge_jump_pct")) / 100.0
             viterbi_jump_hz  = float(m0[2].number_input("Viterbi max Sprung [Hz/Frame]", 1.0, 300.0, 25.0, step=1.0, key="aud_viterbi_jump_hz"))
             viterbi_penalty  = float(m0[3].number_input("Viterbi Sprung-Strafe", 0.0, 10.0, 1.2, step=0.1, key="aud_viterbi_penalty"))
             m1 = st.columns(3)
-            viterbi_smooth   = int(m1[0].number_input("Viterbi Glättung", 3, 51, 5, step=2, key="aud_viterbi_smooth"))
+            viterbi_smooth   = int(m1[0].number_input("Viterbi GlÃ¤ttung", 3, 51, 5, step=2, key="aud_viterbi_smooth"))
             comb_harmonics   = int(m1[1].number_input("Comb/HPS Anzahl Harmonische", 1, 10, 4, step=1, key="aud_comb_harmonics"))
-            hybrid_smooth    = int(m1[2].number_input("Hybrid Glättung", 3, 51, 9, step=2, key="aud_hybrid_smooth"))
+            hybrid_smooth    = int(m1[2].number_input("Hybrid GlÃ¤ttung", 3, 51, 9, step=2, key="aud_hybrid_smooth"))
             method_params = dict(
                 ridge_smooth=ridge_smooth, ridge_jump_frac=ridge_jump_frac,
                 viterbi_jump_hz=viterbi_jump_hz, viterbi_penalty=viterbi_penalty,
@@ -102,9 +102,9 @@ def render(ns):
             index=4,
             key="aud_cyl_sel",
             disabled=_is_elekt,
-            help="'any' = im Parameter-Sweep variieren. Sonst fixer Wert für Analyse.",
+            help="'any' = im Parameter-Sweep variieren. Sonst fixer Wert fÃ¼r Analyse.",
         )
-        cyl_mode = "Auto variieren" if _cyl_sel == "any" else "Fest auswählen"
+        cyl_mode = "Auto variieren" if _cyl_sel == "any" else "Fest auswÃ¤hlen"
         aud_cyl = 4 if (_cyl_sel == "any" or _is_elekt) else int(_cyl_sel)
 
         _takt_sel = c0[2].selectbox(
@@ -123,17 +123,17 @@ def render(ns):
             disabled=_is_elekt,
             help="'any' = im Sweep variieren. 0.5 = halbe Grundordnung (4-Takt-Grundton).",
         )
-        harm_mode = "Auto variieren" if _ord_sel == "any" else "Fest auswählen"
+        harm_mode = "Auto variieren" if _ord_sel == "any" else "Fest auswÃ¤hlen"
         aud_order = 1.0 if (_ord_sel == "any" or _is_elekt) else float(_ord_sel)
         c1 = st.columns(2)
         aud_rpm_min = float(c1[0].number_input("RPM min", 100.0, 30000.0, 800.0, step=100.0, key="aud_rpm_min_new"))
         aud_rpm_max = float(c1[1].number_input("RPM max", 500.0, 30000.0, 7500.0, step=100.0, key="aud_rpm_max_new"))
         st.caption(
-            "'any' Zylinder / Takt / Ordnung → im Sweep variiert; Standard-Analyse nutzt Fallback-Werte. "
+            "'any' Zylinder / Takt / Ordnung â†’ im Sweep variiert; Standard-Analyse nutzt Fallback-Werte. "
             "Bei Elektro: Frequenz direkt als Motor-Frequenz."
         )
 
-    # ── Getriebe / Offset: nur Standard-Analyse ────────────────────────────────
+    # â”€â”€ Getriebe / Offset: nur Standard-Analyse â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     aud_offset = 0.0
     use_ocr_v  = False
     r_dyn      = 0.35
@@ -150,8 +150,8 @@ def render(ns):
             r_dyn       = float(c[2].number_input("r dyn [m]", 0.05, 2.0, 0.35, step=0.01, key="aud_rdyn_new"))
             tol_pct     = float(c[3].number_input("Toleranz [%]", 0.0, 100.0, 6.0, step=0.5, key="aud_tol_new"))
             c2 = st.columns(3)
-            axle_ratio  = float(c2[0].number_input("Achsübersetzung i", 0.1, 20.0, 3.15, step=0.01, key="aud_axle_ratio"))
-            gear_text   = c2[1].text_input("Gänge i (Komma-getrennt)", value="5.25, 3.36, 2.17, 1.72, 1.32, 1.00, 0.82, 0.64", key="aud_gears_text")
+            axle_ratio  = float(c2[0].number_input("AchsÃ¼bersetzung i", 0.1, 20.0, 3.15, step=0.01, key="aud_axle_ratio"))
+            gear_text   = c2[1].text_input("GÃ¤nge i (Komma-getrennt)", value="5.25, 3.36, 2.17, 1.72, 1.32, 1.00, 0.82, 0.64", key="aud_gears_text")
             prefer_low  = bool(c2[2].checkbox("niedrigster Gang bevorzugt", value=False, key="aud_prefer_low"))
             try:
                 gear_ratios = [float(x.strip()) for x in str(gear_text).replace(";", ",").split(",") if x.strip()]
@@ -159,7 +159,7 @@ def render(ns):
                 gear_ratios = []
             st.caption("Getriebe wird nur genutzt, wenn nutzbare Geschwindigkeit/OCR-v vorhanden ist.")
 
-    # ── Mode A: Standard-Analyse ───────────────────────────────────────────────
+    # â”€â”€ Mode A: Standard-Analyse â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if _mode_standard:
         current_audio_config = _build_audio_config_from_values({
             "stft_mode": aud_stft_mode,
@@ -273,7 +273,7 @@ def render(ns):
             with st.expander("Live-Debug Audioanalyse", expanded=expanded):
                 st.caption("Quelle, Segment, STFT-Kandidaten, Job-Fortschritt, Laufzeit und finale Auswahl.")
                 if fut_live is not None:
-                    st.info("Audioanalyse wurde gestartet und läuft im Hintergrund.")
+                    st.info("Audioanalyse wurde gestartet und lÃ¤uft im Hintergrund.")
 
                 if isinstance(prog_state, dict) and prog_state:
                     done  = int(prog_state.get("done", 0) or 0)
@@ -336,7 +336,7 @@ def render(ns):
                 if isinstance(live_prog_run, dict) and live_prog_run:
                     st.session_state.audio_bg_progress = dict(live_prog_run)
                 elapsed = time.perf_counter() - float(st.session_state.get("audio_bg_started", time.perf_counter()) or time.perf_counter())
-                st.caption(f"Audioanalyse läuft seit {elapsed:.1f}s. Live-Status ist im Expander sichtbar.")
+                st.caption(f"Audioanalyse lÃ¤uft seit {elapsed:.1f}s. Live-Status ist im Expander sichtbar.")
 
         running_bg = st.session_state.get("audio_bg_future") is not None
         audio_started_this_run = False
@@ -388,7 +388,7 @@ def render(ns):
                 st.session_state.audio_fs_raw = float(fs)
                 audio_started_this_run = True
                 set_status("Audioanalyse im Hintergrund gestartet.", "info")
-                st.success("Start bestätigt: Audioanalyse läuft im Hintergrund. Live-Debug und Progressbar erscheinen direkt darunter.")
+                st.success("Start bestÃ¤tigt: Audioanalyse lÃ¤uft im Hintergrund. Live-Debug und Progressbar erscheinen direkt darunter.")
                 st.toast("Audioanalyse gestartet. Live-Debug aktiv.")
 
         def _audio_native_live_refresh_panel():
@@ -412,7 +412,7 @@ def render(ns):
         if isinstance(res, dict) and res.get("t") is not None:
             p = res.get('params', {})
             zyl_txt = "EV" if p.get('cyl') == 0 else p.get('cyl')
-            st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} · Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz · NFFT: {p.get('nfft')} · Overlap: {p.get('overlap_pct')}%")
+            st.caption(f"Quelle: {res.get('source','')} Â· Methode: {res.get('selected_method','')} Â· Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} Â· Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz Â· NFFT: {p.get('nfft')} Â· Overlap: {p.get('overlap_pct')}%")
             if res.get('candidate_table'):
                 with st.expander("Kandidatenbewertung", expanded=False):
                     st.dataframe(pd.DataFrame(res['candidate_table']), width="stretch", hide_index=True)
@@ -429,7 +429,7 @@ def render(ns):
                     a = np.asarray(res.get('freq_lines', {}).get(nm, []), dtype=float)
                     if a.size == t.size:
                         fig.add_trace(go.Scatter(x=t, y=a, mode="lines", name=nm, line=dict(width=2)))
-                fig.update_layout(title="Spektrogramm f [Hz] über t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
+                fig.update_layout(title="Spektrogramm f [Hz] Ã¼ber t [s]", xaxis_title="t [s]", yaxis_title="f [Hz]", height=520, template="plotly_dark")
                 st.plotly_chart(fig, width="stretch")
                 fig2 = go.Figure()
                 fig2.add_trace(go.Scatter(x=t, y=np.asarray(res['rpm'], dtype=float), mode="lines", name="RPM"))
@@ -473,17 +473,17 @@ def render(ns):
             if save_mat_disabled:
                 st.caption("Zum Speichern zuerst in MAT Selection eine MAT-Datei mit MAT + Video laden.")
 
-    # ── Mode B: Sweep mit Messdatei ────────────────────────────────────────────
+    # â”€â”€ Mode B: Sweep mit Messdatei â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if _mode_sweep:
         st.divider()
         st.subheader("Sweep mit Messdatei")
         st.caption(
-            "Was muss festgelegt werden: **Messdatei** (Excel/CSV/MAT, Zeit- und RPM-Spalte auswählen) "
-            "und optional **Motor-Parameter** oben (Zylinder, Takt, Ordnung — 'any' = alle variieren). "
+            "Was muss festgelegt werden: **Messdatei** (Excel/CSV/MAT, Zeit- und RPM-Spalte auswÃ¤hlen) "
+            "und optional **Motor-Parameter** oben (Zylinder, Takt, Ordnung â€” 'any' = alle variieren). "
             "Alles andere (Methoden, NFFT, Overlap, Fmax, Offset) wird automatisch durchsucht."
         )
 
-        # ── Helpers ───────────────────────────────────────────────────────────
+        # â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         import numpy as np
         from app_tabs.audio_sweep import parse_ref_file, embed_ref_in_doc, load_ref_from_doc
 
@@ -510,25 +510,25 @@ def render(ns):
         if _cur_doc is not None:
             _linked_ref = load_ref_from_doc(_cur_doc)
 
-        # ── Referenzdatei ─────────────────────────────────────────────────────
+        # â”€â”€ Referenzdatei â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         st.markdown("#### Referenzdatei / Messdatei")
         _ref_col1, _ref_col2 = st.columns([3, 1])
         with _ref_col1:
             if _linked_ref is not None:
                 st.success(
-                    f"Verknüpft: **{_linked_ref['source_file']}** "
+                    f"VerknÃ¼pft: **{_linked_ref['source_file']}** "
                     f"({len(_linked_ref['t_s'])} Punkte, seit {_linked_ref['linked_at'][:10]})"
                 )
             val_file = st.file_uploader(
                 "Messdatei laden (Excel, CSV, MAT)",
                 type=["mat", "csv", "xlsx", "xls"],
                 key="aud_validation_file",
-                help="Datei hochladen, dann Zeit- und RPM-Spalte wählen, dann 'Verknüpfen' klicken. "
-                     "Die Referenz wird in der result-JSON gespeichert und beim nächsten Laden auto-geladen.",
+                help="Datei hochladen, dann Zeit- und RPM-Spalte wÃ¤hlen, dann 'VerknÃ¼pfen' klicken. "
+                     "Die Referenz wird in der result-JSON gespeichert und beim nÃ¤chsten Laden auto-geladen.",
             )
         with _ref_col2:
             if _linked_ref is not None:
-                if st.button("Verknüpfung aufheben", key="aud_unlink_ref"):
+                if st.button("VerknÃ¼pfung aufheben", key="aud_unlink_ref"):
                     import json as _j
                     _p = _cur_result_json()
                     if _p is not None:
@@ -537,7 +537,7 @@ def render(ns):
                             _d.get("recordResult", {}).pop("audio_ref", None)
                             from app_tabs.plausibility_filter import _atomic_write
                             _atomic_write(_p, _d)
-                            st.success("Verknüpfung entfernt.")
+                            st.success("VerknÃ¼pfung entfernt.")
                             st.rerun()
                         except Exception as _ue:
                             st.error(f"Fehler: {_ue}")
@@ -577,10 +577,10 @@ def render(ns):
                 time_col = _col_c1.selectbox("Zeitspalte [s]", numeric_cols, index=_t_def, key="aud_val_time_col")
                 rpm_col  = _col_c2.selectbox("RPM-Spalte", numeric_cols, index=_r_def, key="aud_val_rpm_col")
                 if _val_source == "upload" and val_file is not None:
-                    if _col_c3.button("Mit aktueller Datei verknüpfen", key="aud_link_ref"):
+                    if _col_c3.button("Mit aktueller Datei verknÃ¼pfen", key="aud_link_ref"):
                         _p = _cur_result_json()
                         if _p is None:
-                            st.warning("Keine result-JSON geladen — zuerst eine MAT/Video-Datei auswählen.")
+                            st.warning("Keine result-JSON geladen â€” zuerst eine MAT/Video-Datei auswÃ¤hlen.")
                         else:
                             try:
                                 import json as _j
@@ -590,16 +590,16 @@ def render(ns):
                                 embed_ref_in_doc(_d, _t_arr, _r_arr, val_file.name, time_col, rpm_col)
                                 from app_tabs.plausibility_filter import _atomic_write
                                 _atomic_write(_p, _d)
-                                st.success(f"Referenz '{val_file.name}' verknüpft.")
+                                st.success(f"Referenz '{val_file.name}' verknÃ¼pft.")
                                 st.rerun()
                             except Exception as _le:
-                                st.error(f"Verknüpfen fehlgeschlagen: {_le}")
+                                st.error(f"VerknÃ¼pfen fehlgeschlagen: {_le}")
             else:
                 st.info("Die Referenzdatei braucht mindestens zwei numerische Spalten.")
         else:
-            st.caption("Noch keine Referenzdatei geladen oder verknüpft.")
+            st.caption("Noch keine Referenzdatei geladen oder verknÃ¼pft.")
 
-        # ── Parameter-Sweep ───────────────────────────────────────────────────
+        # â”€â”€ Parameter-Sweep â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         st.divider()
         st.markdown("#### Parameter-Sweep")
 
@@ -612,9 +612,9 @@ def render(ns):
             _ref_for_sweep = pd.DataFrame({"t_s": _linked_ref["t_s"], "rpm": _linked_ref["rpm"]})
 
         if _ref_for_sweep is None:
-            st.info("Messdatei laden und verknüpfen um den Sweep zu aktivieren.")
+            st.info("Messdatei laden und verknÃ¼pfen um den Sweep zu aktivieren.")
         else:
-            # ── Sweep-Einstellungen ───────────────────────────────────────────
+            # â”€â”€ Sweep-Einstellungen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _sw1, _sw2 = st.columns(2)
             with _sw1:
                 st.markdown("**Audio-Parameter (werden variiert)**")
@@ -640,14 +640,14 @@ def render(ns):
                 st.markdown("**Suchmethode**")
                 _sw_strategy = st.selectbox(
                     "Strategie",
-                    ["Optuna (Bayesian)", "Zufällige Suche", "Vollfaktoriell"],
+                    ["Optuna (Bayesian)", "ZufÃ¤llige Suche", "Vollfaktoriell"],
                     index=0, key="sw_strategy",
-                    help="Optuna (TPE): lernt aus bisherigen Ergebnissen — am effizientesten. "
-                         "Zufällige Suche: schnelle Stichproben aus dem Grid. "
+                    help="Optuna (TPE): lernt aus bisherigen Ergebnissen â€” am effizientesten. "
+                         "ZufÃ¤llige Suche: schnelle Stichproben aus dem Grid. "
                          "Vollfaktoriell: alle Kombinationen systematisch.",
                 )
                 _sw_use_optuna   = _sw_strategy == "Optuna (Bayesian)"
-                _sw_use_random   = _sw_strategy == "Zufällige Suche"
+                _sw_use_random   = _sw_strategy == "ZufÃ¤llige Suche"
                 _sw_use_factorial = _sw_strategy == "Vollfaktoriell"
                 if not _sw_use_factorial:
                     _sw_n_trials = int(st.number_input(
@@ -655,7 +655,7 @@ def render(ns):
                         min_value=10, max_value=2000,
                         value=80 if _sw_use_optuna else 200,
                         step=10, key="sw_n_trials",
-                        help="Optuna: 50–100 reichen meist. Zufällige Suche: 150–300 empfohlen.",
+                        help="Optuna: 50â€“100 reichen meist. ZufÃ¤llige Suche: 150â€“300 empfohlen.",
                     ))
                 else:
                     _sw_n_trials = 0
@@ -663,12 +663,12 @@ def render(ns):
                 _sw_fmax_headroom = float(st.number_input(
                     "Headroom-Faktor", 1.0, 5.0, 1.5, step=0.1, format="%.1f",
                     key="sw_fmax_headroom",
-                    help="fmax = rpm_max × cyl × order / (takt × 60) × Faktor. "
-                         "1.5 = 50% Puffer über der Grundfrequenz.",
+                    help="fmax = rpm_max Ã— cyl Ã— order / (takt Ã— 60) Ã— Faktor. "
+                         "1.5 = 50% Puffer Ã¼ber der Grundfrequenz.",
                 ))
                 st.markdown("**Offset-Suche (Kreuzkorrelation automatisch)**")
                 _sw_off_range = float(st.number_input(
-                    "Suchbereich ±Δ [s]", 0.0, 300.0, 10.0, step=1.0, key="sw_off_range",
+                    "Suchbereich Â±Î” [s]", 0.0, 300.0, 10.0, step=1.0, key="sw_off_range",
                     help="Kreuzkorrelation sucht automatisch das beste Offset in diesem Bereich um 0s.",
                 ))
                 _sw_off_step = float(st.number_input(
@@ -684,13 +684,13 @@ def render(ns):
                 _sw_tol_logic = st.selectbox("Toleranz-Logik", ["ODER", "UND"], key="sw_tol_logic")
                 _sw_top_n = int(st.number_input("Top-N Ergebnisse", 5, 50, 20, step=5, key="sw_top_n"))
 
-            # ── Methoden-spezifische Parameter (optional) ─────────────────────
+            # â”€â”€ Methoden-spezifische Parameter (optional) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             with st.expander("Methoden-spezifische Parameter (optional)", expanded=False):
                 _ms1, _ms2 = st.columns(2)
                 with _ms1:
                     _sw_ridge = st.checkbox("Ridge-Parameter variieren", key="sw_ridge")
                     if _sw_ridge:
-                        _sw_ridge_smooth = st.multiselect("Ridge Glättung", [3, 7, 11, 21], default=[7], key="sw_rs")
+                        _sw_ridge_smooth = st.multiselect("Ridge GlÃ¤ttung", [3, 7, 11, 21], default=[7], key="sw_rs")
                         _sw_ridge_jump   = st.multiselect("Ridge max Sprung [%]", [4, 8, 15], default=[8], key="sw_rj")
                     else:
                         _sw_ridge_smooth = [7]; _sw_ridge_jump = [8]
@@ -704,16 +704,16 @@ def render(ns):
                     if _sw_viterbi:
                         _sw_vj = st.multiselect("Viterbi max Sprung [Hz]", [10.0, 25.0, 50.0], default=[25.0], key="sw_vj")
                         _sw_vp = st.multiselect("Viterbi Strafe", [0.5, 1.2, 2.5], default=[1.2], key="sw_vp")
-                        _sw_vs = st.multiselect("Viterbi Glättung", [3, 5, 11], default=[5], key="sw_vs")
+                        _sw_vs = st.multiselect("Viterbi GlÃ¤ttung", [3, 5, 11], default=[5], key="sw_vs")
                     else:
                         _sw_vj = [25.0]; _sw_vp = [1.2]; _sw_vs = [5]
-                    _sw_hybrid = st.checkbox("Hybrid-Glättung variieren", key="sw_hybrid")
+                    _sw_hybrid = st.checkbox("Hybrid-GlÃ¤ttung variieren", key="sw_hybrid")
                     if _sw_hybrid:
-                        _sw_hs = st.multiselect("Hybrid Glättung", [5, 9, 15, 25], default=[9], key="sw_hs")
+                        _sw_hs = st.multiselect("Hybrid GlÃ¤ttung", [5, 9, 15, 25], default=[9], key="sw_hs")
                     else:
                         _sw_hs = [9]
 
-            # ── Kombinationen schätzen ────────────────────────────────────────
+            # â”€â”€ Kombinationen schÃ¤tzen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             from app_tabs.audio_sweep import build_param_grid, load_sweep_results
             _sw_cfg_preview = {
                 "sweep_method": True, "method": None,
@@ -737,15 +737,15 @@ def render(ns):
             )
             if _sw_use_factorial:
                 _est_total = _est_factorial
-                st.caption(f"Geschätzte Kombinationen: **{_est_total}** (Vollfaktoriell)")
+                st.caption(f"GeschÃ¤tzte Kombinationen: **{_est_total}** (Vollfaktoriell)")
             else:
                 _est_total = _sw_n_trials
                 st.caption(
-                    f"Trials: **{_sw_n_trials}** · Gesamtgrid wäre: {_est_factorial} "
-                    f"({'Optuna lernt aus Ergebnissen' if _sw_use_optuna else 'zufällige Stichprobe'})"
+                    f"Trials: **{_sw_n_trials}** Â· Gesamtgrid wÃ¤re: {_est_factorial} "
+                    f"({'Optuna lernt aus Ergebnissen' if _sw_use_optuna else 'zufÃ¤llige Stichprobe'})"
                 )
 
-            # ── Start / Stop / Status ─────────────────────────────────────────
+            # â”€â”€ Start / Stop / Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _sw_running = bool(st.session_state.get("audio_sweep_running"))
             _sw_fut = st.session_state.get("audio_sweep_future")
             if _sw_fut is not None and hasattr(_sw_fut, "done") and _sw_fut.done():
@@ -781,7 +781,7 @@ def render(ns):
                 _seg_end   = float(st.session_state.get("t_end")   or 0.0)
 
                 if _y is None or _fs <= 0:
-                    # Audio noch nicht geladen — jetzt direkt laden
+                    # Audio noch nicht geladen â€” jetzt direkt laden
                     _ok_ld, _msg_ld, _fs_ld, _y_ld, _src_ld = _audio_load_current_capture()
                     if _ok_ld and len(_y_ld) > 0:
                         st.session_state.audio_y_raw  = _y_ld
@@ -806,8 +806,8 @@ def render(ns):
                     _n_label = f"{_sw_n_trials} Trials" if not _sw_use_factorial else f"{len(_full_grid)} Kombinationen"
                     _sweep_log = [
                         f"Sweep gestartet [{_sw_strategy}]: {_n_label}, Methoden: {', '.join(_sw_methods)}",
-                        f"NFFT: {_sw_nfft} · Overlap: {_sw_overlap}% · Fmax-Headroom: ×{_sw_fmax_headroom} · Ordnung: {_sw_order}",
-                        f"Cyl: {_cyl_sel} · Takt: {_takt_sel} · Offset ±{_sw_off_range}s Schritt {_sw_off_step}s",
+                        f"NFFT: {_sw_nfft} Â· Overlap: {_sw_overlap}% Â· Fmax-Headroom: Ã—{_sw_fmax_headroom} Â· Ordnung: {_sw_order}",
+                        f"Cyl: {_cyl_sel} Â· Takt: {_takt_sel} Â· Offset Â±{_sw_off_range}s Schritt {_sw_off_step}s",
                     ]
                     _sweep_errors: list = []
                     st.session_state.audio_sweep_stop_event = _stop_ev
@@ -852,13 +852,13 @@ def render(ns):
                     _n_trials_snap = _sw_n_trials
                     _cfg_snap      = dict(_sw_cfg_preview)
                     _cfg_snap["methods"] = list(_sw_methods)
-
                     def _sweep_worker():
                         from app_tabs.audio_sweep import (
                             run_sweep as _rs,
                             run_sweep_random as _rr,
                             run_sweep_optuna as _ro,
                         )
+                        _best_seen = {"score": float("-inf"), "within": 0.0, "rmse": float("inf")}
 
                         def _pcb(i, total, params, result=None):
                             _prog_ref["done"]    = i
@@ -871,27 +871,36 @@ def render(ns):
                                 f"Ord={params.get('order','')}"
                             )
                             _prog_ref["current"] = _cfg_str
-                            # Score summary
                             if result is not None:
                                 _score = result.get("combined_score", 0.0)
                                 _within = result.get("within_pct", 0.0)
                                 _rmse = result.get("rmse", float("inf"))
-                                _rmse_str = "—" if _rmse == float("inf") else f"{_rmse:.0f}"
+                                _rmse_str = "-" if _rmse == float("inf") else f"{_rmse:.0f}"
                                 _err = result.get("score_error", "")
+                                if (not _err) and isinstance(_score, (int, float)) and _score > _best_seen["score"]:
+                                    _best_seen["score"] = float(_score)
+                                    _best_seen["within"] = float(_within if isinstance(_within, (int, float)) else 0.0)
+                                    _best_seen["rmse"] = float(_rmse if isinstance(_rmse, (int, float)) else float("inf"))
+                                _best_rmse_str = "-" if _best_seen["rmse"] == float("inf") else f"{_best_seen['rmse']:.0f}"
+                                _best_str = (
+                                    f"Best bisher: Score={_best_seen['score']:.1f} "
+                                    f"Within={_best_seen['within']:.1f}% RMSE={_best_rmse_str}"
+                                    if _best_seen["score"] > float("-inf")
+                                    else "Best bisher: -"
+                                )
                                 _score_str = (
-                                    f"Score={_score:.1f} Within={_within:.1f}% RMSE={_rmse_str}"
-                                    if not _err else f"⚠ {_err}"
+                                    f"Score={_score:.1f} Within={_within:.1f}% RMSE={_rmse_str} | {_best_str}"
+                                    if not _err else f"WARN {_err} | {_best_str}"
                                 )
                             else:
                                 _score_str = ""
                             _sweep_log.append(
                                 f"[{i}/{total}] {_cfg_str}"
-                                + (f" → {_score_str}" if _score_str else "")
+                                + (f" -> {_score_str}" if _score_str else "")
                             )
 
                         def _do_extract(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode, method_params):
-                            t_a, r_a, _extra = _extract_fn(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode=stft_mode, method_params=method_params)
-                            return t_a, r_a, _extra
+                            return _extract_fn(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode=stft_mode, method_params=method_params)
 
                         _shared = dict(
                             y=_y, fs=_fs, start_s=_seg_start, end_s=_seg_end,
@@ -909,13 +918,13 @@ def render(ns):
                         try:
                             if _strategy_snap == "Optuna (Bayesian)":
                                 res = _ro(cfg=_cfg_snap, n_trials=_n_trials_snap, **_shared)
-                            elif _strategy_snap == "Zufällige Suche":
+                            elif _strategy_snap == "ZufÃ¤llige Suche":
                                 res = _rr(cfg=_cfg_snap, n_trials=_n_trials_snap, **_shared)
                             else:  # Vollfaktoriell
                                 res = _rs(grid=_full_grid, **_shared)
                             _sweep_log.append(
                                 f"Sweep abgeschlossen ({_strategy_snap}): "
-                                f"{len(res)} Ergebnisse, {len(_sweep_errors)} übersprungen."
+                                f"{len(res)} Ergebnisse, {len(_sweep_errors)} Ã¼bersprungen."
                             )
                             return res
                         except Exception as _e:
@@ -931,7 +940,7 @@ def render(ns):
                     st.session_state.audio_sweep_future = _pool.submit(_sweep_worker)
                     st.rerun()
 
-            # ── Live-Log Panel (kein Full-Page-Rerun) ────────────────────────
+            # â”€â”€ Live-Log Panel (kein Full-Page-Rerun) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def _sweep_live_panel():
                 _sw_fut_live = st.session_state.get("audio_sweep_future")
                 _prog_live   = st.session_state.get("audio_sweep_progress") or {}
@@ -945,7 +954,7 @@ def render(ns):
                     return
                 if _running_l or (isinstance(_log_live, list) and _log_live):
                     st.progress(min(1.0, _done_l / _tot_l),
-                                text=f"Sweep: {_done_l}/{_tot_l} — {_cur_l}")
+                                text=f"Sweep: {_done_l}/{_tot_l} â€” {_cur_l}")
                     if isinstance(_log_live, list) and _log_live:
                         st.code("\n".join(str(x) for x in _log_live[-15:]), language="text")
             _sw_live_every = 1.0 if st.session_state.get("audio_sweep_running") else None
@@ -966,25 +975,25 @@ def render(ns):
             if st.session_state.get("audio_sweep_error"):
                 st.error(f"Sweep-Fehler: {st.session_state.audio_sweep_error}")
 
-            # ── Ergebnis-Tabelle ──────────────────────────────────────────────
+            # â”€â”€ Ergebnis-Tabelle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _sw_results = st.session_state.get("audio_sweep_results") or []
             _sw_errs    = st.session_state.get("audio_sweep_errors_ref") or []
             if not _sw_results and _sw_errs and not _sw_running:
-                st.warning(f"Kein Ergebnis — alle {len(_sw_errs)} Kombinationen übersprungen.")
+                st.warning(f"Kein Ergebnis â€” alle {len(_sw_errs)} Kombinationen Ã¼bersprungen.")
                 _err_df = pd.DataFrame(_sw_errs)
                 _reason_counts = _err_df["reason"].value_counts().to_dict() if "reason" in _err_df.columns else {}
-                st.caption("Häufigste Fehlerursachen: " + ", ".join(f"{r}: {n}×" for r, n in _reason_counts.items()))
+                st.caption("HÃ¤ufigste Fehlerursachen: " + ", ".join(f"{r}: {n}Ã—" for r, n in _reason_counts.items()))
                 with st.expander("Details (letzte 20 Fehler)", expanded=True):
                     _show_cols = [c for c in ["method", "nfft", "fmax", "cyl", "takt", "order", "reason", "detail"] if c in _err_df.columns]
                     st.dataframe(_err_df.tail(20)[_show_cols], use_container_width=True, hide_index=True)
             if _sw_results:
                 st.markdown(f"#### Top-{len(_sw_results)} Ergebnisse")
                 _res_df = pd.DataFrame(_sw_results)
-                # Format RMSE: replace inf with "—"
+                # Format RMSE: replace inf with "â€”"
                 if "rmse" in _res_df.columns:
                     import math as _math
                     _res_df["rmse"] = _res_df["rmse"].apply(
-                        lambda v: "—" if (v is None or (isinstance(v, float) and not _math.isfinite(v))) else round(float(v), 1)
+                        lambda v: "â€”" if (v is None or (isinstance(v, float) and not _math.isfinite(v))) else round(float(v), 1)
                     )
                 _display_cols = ["rank", "combined_score", "within_pct", "rmse", "pearson_r",
                                  "method", "nfft", "overlap_pct", "fmax", "cyl", "takt", "order", "offset_s", "score_error"]
@@ -1006,19 +1015,19 @@ def render(ns):
                     },
                 )
 
-                st.markdown("**Bestes Ergebnis übernehmen:**")
+                st.markdown("**Bestes Ergebnis Ã¼bernehmen:**")
                 _top = _sw_results[0]
                 st.caption(
-                    f"Rang 1: **{_top.get('method','')}** · "
-                    f"NFFT={_top.get('nfft','')} · Overlap={_top.get('overlap_pct','')}% · "
-                    f"Fmax={_top.get('fmax','')} Hz · Cyl={_top.get('cyl','')} · "
-                    f"Takt={_top.get('takt','')} · Ord={_top.get('order','')} · "
-                    f"Offset={_top.get('offset_s', 0.0):+.2f}s · "
-                    f"Innerhalb={_top.get('within_pct', 0.0):.1f}% · RMSE={_top.get('rmse', 0.0):.0f}"
+                    f"Rang 1: **{_top.get('method','')}** Â· "
+                    f"NFFT={_top.get('nfft','')} Â· Overlap={_top.get('overlap_pct','')}% Â· "
+                    f"Fmax={_top.get('fmax','')} Hz Â· Cyl={_top.get('cyl','')} Â· "
+                    f"Takt={_top.get('takt','')} Â· Ord={_top.get('order','')} Â· "
+                    f"Offset={_top.get('offset_s', 0.0):+.2f}s Â· "
+                    f"Innerhalb={_top.get('within_pct', 0.0):.1f}% Â· RMSE={_top.get('rmse', 0.0):.0f}"
                 )
-                if st.button("Top-1 Parameter in Standard-Analyse übernehmen", key="sw_apply_top"):
+                if st.button("Top-1 Parameter in Standard-Analyse Ã¼bernehmen", key="sw_apply_top"):
                     _ks = {
-                        "aud_stft_mode_new":  "Fest auswählen",
+                        "aud_stft_mode_new":  "Fest auswÃ¤hlen",
                         "aud_nfft_new":        int(_top.get("nfft",        2048)),
                         "aud_overlap_new":     float(_top.get("overlap_pct", 75.0)),
                         "aud_fmax_new":        float(_top.get("fmax",        500.0)),
@@ -1035,8 +1044,14 @@ def render(ns):
                     }
                     for _k, _v in _ks.items():
                         st.session_state[_k] = _v
-                    st.session_state["aud_cyl_mode"]  = "Fest auswählen"
-                    st.session_state["aud_harm_mode"] = "Fest auswählen"
+                    st.session_state["aud_cyl_mode"]  = "Fest auswÃ¤hlen"
+                    st.session_state["aud_harm_mode"] = "Fest auswÃ¤hlen"
                     st.session_state["aud_mode_idx"]  = 0  # switch back to Standard
-                    st.success("Parameter übernommen — wechsle zu Standard-Analyse und starte eine neue Audioanalyse.")
+                    st.success("Parameter Ã¼bernommen â€” wechsle zu Standard-Analyse und starte eine neue Audioanalyse.")
                     st.rerun()
+
+
+
+
+
+
