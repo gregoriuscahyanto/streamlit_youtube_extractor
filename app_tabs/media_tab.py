@@ -97,7 +97,13 @@ def _read_json_detail(jp: Path) -> dict:
     has_track_minimap = False
     if isinstance(roi_table, list):
         for row in roi_table:
-            nm = str((row or {}).get("name_roi") or (row or {}).get("name") or "").strip().lower()
+            if isinstance(row, dict):
+                nm = str(row.get("name_roi") or row.get("name") or "").strip().lower()
+            elif isinstance(row, str):
+                # Legacy flat format: [name, [x,y,w,h], fmt, scale, ...]
+                nm = row.strip().lower()
+            else:
+                continue
             if nm == "track_minimap":
                 has_track_minimap = True
                 break
@@ -370,6 +376,71 @@ def _update_db_status(folder: str, link: str, status: str, error: str = "") -> N
         db_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _delete_row(base: Path, folder: str, youtube_link: str) -> tuple[list[str], list[str]]:
+    """
+    Delete all files/folders for a row.
+    Returns (deleted, errors) — lists of human-readable strings.
+    """
+    import shutil
+    deleted: list[str] = []
+    errors: list[str] = []
+
+    def _rm_file(p: Path) -> None:
+        try:
+            if p.exists():
+                p.unlink()
+                deleted.append(p.name)
+        except Exception as e:
+            errors.append(f"{p.name}: {e}")
+
+    def _rm_dir(p: Path) -> None:
+        try:
+            if p.exists() and p.is_dir():
+                shutil.rmtree(p)
+                deleted.append(str(p.relative_to(base)))
+        except Exception as e:
+            errors.append(f"{p.name}/: {e}")
+
+    # JSON + MAT result files
+    res_dir = base / "results"
+    _rm_file(res_dir / f"results_{folder}.json")
+    _rm_file(res_dir / f"results_{folder}.mat")
+
+    # Capture folder (video + audio)
+    _rm_dir(base / "captures" / folder)
+
+    # Remove from YouTube DB
+    db_path = Path("logs") / "youtube_download_table.json"
+    try:
+        if db_path.exists():
+            entries = json.loads(db_path.read_text(encoding="utf-8")) or []
+            before = len(entries)
+            entries = [
+                e for e in entries
+                if not (
+                    (folder and str(e.get("capture_folder") or "").strip() == folder)
+                    or (youtube_link and str(e.get("youtube_link") or "").strip() == youtube_link)
+                )
+            ]
+            if len(entries) < before:
+                db_path.write_text(
+                    json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                deleted.append("DB-Eintrag")
+    except Exception as e:
+        errors.append(f"DB: {e}")
+
+    # Invalidate caches
+    try:
+        from core.watchdog_state import _JSON_ROW_CACHE, _DETAIL_CACHE
+        _JSON_ROW_CACHE.pop(str(res_dir / f"results_{folder}.json"), None)
+        _DETAIL_CACHE.pop(str(res_dir / f"results_{folder}.json"), None)
+    except Exception:
+        pass
+
+    return deleted, errors
+
+
 # ── Background: MAT→JSON conversion ──────────────────────────────────────────
 
 def _inline_convert_one_mat(mat_path: Path) -> dict:
@@ -635,6 +706,109 @@ def render(ns: dict) -> None:
                 st.success("Link hinzugefügt.")
                 st.rerun()
 
+    # ── Nachkorrektur / Nachfiltern ────────────────────────────────────────────
+    _result_json_paths = sorted(
+        str(p) for p in (base / "results").glob("results_*.json")
+    ) if (base / "results").exists() else []
+
+    with st.expander(f"Nachkorrektur ({len(_result_json_paths)} Dateien)", expanded=False):
+        st.caption(
+            "Kombinierte Nachkorrektur für bereits ausgewertete Dateien. "
+            "Führt die Schritte aus die beim Auswerten fehlten oder durch Bugs fehlerhaft waren."
+        )
+
+        _nc1, _nc2 = st.columns(2)
+
+        # ── Button 1: Vollständige Nachkorrektur ──────────────────────────────
+        with _nc1:
+            st.markdown("**Vollständige Nachkorrektur**")
+            st.caption(
+                "① Zeilen außerhalb start_s/end_s löschen  \n"
+                "② Min/Max + Steigung aus ROI-Katalog filtern  \n"
+                "③ track_minimap neu berechnen wenn track_minimap_found überall 0"
+            )
+            if st.button(
+                f"Alle {len(_result_json_paths)} Dateien nachkorrigieren",
+                disabled=not _result_json_paths,
+                key="lib_retrofix_btn",
+            ):
+                try:
+                    from app_tabs.plausibility_filter import retrofix_result_json, needs_track_rerun
+                    from app_tabs.roi_catalog_tab import load_catalog as _lc_lib2
+                    _rf_catalog = st.session_state.get("roi_catalog") or _lc_lib2()
+                    _rf_ok, _rf_skip, _rf_err, _rf_track = 0, 0, 0, 0
+                    _rf_needs_track: list[str] = []
+                    _prog2 = st.progress(0.0, text="Nachkorrektur läuft…")
+                    for _ri, _rp in enumerate(_result_json_paths):
+                        _ok, _msg, _tn = retrofix_result_json(_rp, _rf_catalog)
+                        if _ok:
+                            _rf_ok += 1
+                        elif any(x in _msg for x in ("keine Tabelle", "kein ocr", "kein recordResult", "keine Änderungen")):
+                            _rf_skip += 1
+                        else:
+                            _rf_err += 1
+                        if _tn:
+                            _rf_needs_track.append(_rp)
+                        _prog2.progress((_ri + 1) / len(_result_json_paths),
+                                        text=f"Nachkorrektur… {_ri+1}/{len(_result_json_paths)}")
+                    _prog2.empty()
+                    st.success(
+                        f"Trim+Filter: {_rf_ok} geändert, {_rf_skip} ohne Daten"
+                        + (f", {_rf_err} Fehler" if _rf_err else "") + "."
+                        + (f"  \n{len(_rf_needs_track)} Datei(en) benötigen Track-Nachkorrektur (siehe unten)." if _rf_needs_track else "")
+                    )
+                    if _rf_needs_track:
+                        st.session_state["_retrofix_track_queue"] = _rf_needs_track
+                    st.session_state.cmp_data = {}
+                    st.session_state.pop("_detail_cache", None)
+                except Exception as _rfe:
+                    st.error(f"Nachkorrektur fehlgeschlagen: {_rfe}")
+
+            # Track-Minimap re-run info (shown after retrofix identified candidates)
+            _track_queue = list(st.session_state.get("_retrofix_track_queue") or [])
+            if _track_queue:
+                st.info(
+                    f"**{len(_track_queue)} Datei(en)** benötigen Track-Minimap-Nachkorrektur "
+                    f"(track_minimap_found war überall 0 → Bug behoben).  \n"
+                    f"Da dies Video-Zugriff erfordert, bitte im **Watchdog-Tab** die Aufgabe "
+                    f"**'Nachkorrektur'** aktivieren und den Watchdog starten."
+                )
+
+        # ── Button 2: Nur Plausibilität nachfiltern ───────────────────────────
+        with _nc2:
+            st.markdown("**Nur Plausibilität nachfiltern**")
+            st.caption("Nur Min/Max + Steigung auf cleaned anwenden. Kein Trimmen, keine Track-Neuberechnung.")
+            if st.button(
+                f"Alle {len(_result_json_paths)} Dateien nachfiltern",
+                disabled=not _result_json_paths,
+                key="lib_reclean_btn",
+            ):
+                try:
+                    from app_tabs.plausibility_filter import reclean_result_json
+                    from app_tabs.roi_catalog_tab import load_catalog as _lc_lib
+                    _rc_catalog = st.session_state.get("roi_catalog") or _lc_lib()
+                    _rc_ok, _rc_skip, _rc_err = 0, 0, 0
+                    _prog = st.progress(0.0, text="Nachfiltern läuft…")
+                    for _ri, _rp in enumerate(_result_json_paths):
+                        _ok, _msg = reclean_result_json(_rp, _rc_catalog)
+                        if _ok:
+                            _rc_ok += 1
+                        elif any(x in _msg for x in ("keine Tabelle", "kein ocr", "kein recordResult")):
+                            _rc_skip += 1
+                        else:
+                            _rc_err += 1
+                        _prog.progress((_ri + 1) / len(_result_json_paths),
+                                       text=f"Nachfiltern… {_ri+1}/{len(_result_json_paths)}")
+                    _prog.empty()
+                    st.success(
+                        f"Fertig: {_rc_ok} gefiltert, {_rc_skip} ohne Daten übersprungen"
+                        + (f", {_rc_err} Fehler" if _rc_err else "") + "."
+                    )
+                    st.session_state.cmp_data = {}
+                    st.session_state.pop("_detail_cache", None)
+                except Exception as _rce:
+                    st.error(f"Nachfiltern fehlgeschlagen: {_rce}")
+
     # ── Analyse-Übersicht ─────────────────────────────────────────────────────
     _render_media_analysis(rows)
 
@@ -680,7 +854,44 @@ def render(ns: dict) -> None:
 
     sel_row = rows[sel_indices[0]]
     st.divider()
-    st.markdown(f"**Ausgewählt:** `{sel_row['folder']}` — {sel_row['title'] or '(kein Titel)'}")
+
+    _hdr_c1, _hdr_c2 = st.columns([6, 1])
+    _hdr_c1.markdown(f"**Ausgewählt:** `{sel_row['folder']}` — {sel_row['title'] or '(kein Titel)'}")
+
+    # ── Löschen ───────────────────────────────────────────────────────────────
+    _del_key = f"lib_del_confirm_{sel_row['folder']}"
+    if _hdr_c2.button("🗑 Löschen", key="lib_del_btn", type="secondary"):
+        st.session_state[_del_key] = True
+
+    if st.session_state.get(_del_key):
+        _del_folder = sel_row["folder"]
+        _del_items: list[str] = []
+        if sel_row.get("json_exists"):
+            _del_items.append(f"results_{_del_folder}.json")
+        if sel_row.get("mat_exists"):
+            _del_items.append(f"results_{_del_folder}.mat")
+        if sel_row.get("video_exists") or sel_row.get("audio_exists"):
+            _del_items.append(f"captures/{_del_folder}/ (Video + Audio)")
+        _del_items.append("DB-Eintrag")
+        with st.container(border=True):
+            st.warning(
+                "**Folgende Dateien werden unwiderruflich gelöscht:**  \n"
+                + "  \n".join(f"• {x}" for x in _del_items)
+            )
+            _conf_c1, _conf_c2 = st.columns(2)
+            if _conf_c1.button("✓ Ja, löschen", key="lib_del_confirm_btn", type="primary"):
+                _deleted, _errors = _delete_row(base, _del_folder, sel_row.get("youtube_link", ""))
+                st.session_state.pop(_del_key, None)
+                st.session_state.pop("_detail_cache", None)
+                st.session_state.cmp_data = {}
+                if _errors:
+                    st.error(f"Fehler: {'; '.join(_errors)}")
+                else:
+                    st.success(f"Gelöscht: {', '.join(_deleted)}")
+                st.rerun()
+            if _conf_c2.button("✗ Abbrechen", key="lib_del_cancel_btn"):
+                st.session_state.pop(_del_key, None)
+                st.rerun()
 
     def _scalar(v, default: float = 0.0) -> float:
         """Unwrap single-element list/array from MAT conversion, then convert to float."""

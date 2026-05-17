@@ -398,7 +398,6 @@ def render(ns):
                     _sel_col: bool(i == _sel),
                     "Name": str(r.get("name", "_")),
                     "Format": str(r.get("fmt", "any")) if str(r.get("fmt", "any")) != "custom" else "any",
-                    "Pattern": str(r.get("pattern", "")),
                     "Scale": float(r.get("max_scale", st.session_state.get("roi_global_scale", 1.2)) or 1.2),
                     "OCR OK": bool(r.get("ocr_test_ok", False)),
                     "OCR Wert": str(r.get("ocr_test_value", "")),
@@ -407,7 +406,7 @@ def render(ns):
                 }
                 for i, r in enumerate(_rois)
             ]
-            _roi_cols = [_sel_col, "Name", "Format", "Pattern", "Scale", "OCR OK", "OCR Wert", "Plausibel", "OCR Details"]
+            _roi_cols = [_sel_col, "Name", "Format", "Scale", "OCR OK", "OCR Wert", "Plausibel", "OCR Details"]
             _base_df = pd.DataFrame(_base_rows, columns=_roi_cols)
             if _base_df.empty:
                 _base_df = pd.DataFrame(
@@ -415,7 +414,6 @@ def render(ns):
                         _sel_col: pd.Series(dtype="bool"),
                         "Name": pd.Series(dtype="object"),
                         "Format": pd.Series(dtype="object"),
-                        "Pattern": pd.Series(dtype="object"),
                         "Scale": pd.Series(dtype="float"),
                         "OCR OK": pd.Series(dtype="bool"),
                         "OCR Wert": pd.Series(dtype="object"),
@@ -460,7 +458,6 @@ def render(ns):
                         [str(r.get("fmt", "any")) if str(r.get("fmt", "any")) != "custom" else "any" for r in _rois],
                         dtype="object",
                     ),
-                    "Pattern": pd.Series([str(v) for v in df_edit.get("Pattern", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
                     "Scale": pd.Series([float(v or 1.2) for v in df_edit.get("Scale", pd.Series([float(st.session_state.get("roi_global_scale", 1.2))] * len(df_edit))).tolist()], dtype="float"),
                     "OCR OK": pd.Series([bool(v) for v in df_edit.get("OCR OK", pd.Series([False] * len(df_edit))).tolist()], dtype="bool"),
                     "OCR Wert": pd.Series([str(v) for v in df_edit.get("OCR Wert", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
@@ -480,7 +477,6 @@ def render(ns):
                         _sel_col: st.column_config.CheckboxColumn("", width=42),
                         "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width=150),
                         "Format": st.column_config.SelectboxColumn("Format", options=_fmt_opts_ordered, width=170),
-                        "Pattern": st.column_config.TextColumn("Pat.", width=56, disabled=True),
                         "Scale": st.column_config.NumberColumn("Sc.", width=52, disabled=True),
                         "OCR OK": st.column_config.CheckboxColumn("OCR OK", width=70, disabled=True),
                         "OCR Wert": st.column_config.TextColumn("OCR Wert", width=110, disabled=True, help="OCR-Testwert; Details stehen in der Spalte OCR Details."),

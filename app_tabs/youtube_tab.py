@@ -643,6 +643,18 @@ def render(ns):
                 out.append([vals[i], vals[i + 1]])
             return out
 
+        def _to_roi_dict(lst) -> dict | None:
+            """Convert [x,y,w,h] list to the dict format extract_minimap_crop expects."""
+            if isinstance(lst, dict) and all(k in lst for k in ("x", "y", "w", "h")):
+                return lst
+            if isinstance(lst, (list, tuple)) and len(lst) >= 4:
+                try:
+                    return {"x": float(lst[0]), "y": float(lst[1]),
+                            "w": float(lst[2]), "h": float(lst[3])}
+                except Exception:
+                    return None
+            return None
+
         track_roi = None
         roi_table = ocr.get("roi_table")
         if isinstance(roi_table, dict):
@@ -653,25 +665,25 @@ def render(ns):
                     if str(nm or "").strip().lower() != "track_minimap":
                         continue
                     if i < len(rois):
-                        track_roi = _parse_rect(rois[i])
+                        track_roi = _to_roi_dict(_parse_rect(rois[i]))
                         if track_roi:
                             break
             else:
                 if str(names or "").strip().lower() == "track_minimap":
-                    track_roi = _parse_rect(rois)
+                    track_roi = _to_roi_dict(_parse_rect(rois))
         elif isinstance(roi_table, list):
             for row in roi_table:
                 if not isinstance(row, dict):
                     continue
                 if str(row.get("name_roi") or row.get("name") or "").strip().lower() != "track_minimap":
                     continue
-                track_roi = _parse_rect(row.get("roi"))
+                track_roi = _to_roi_dict(_parse_rect(row.get("roi")))
                 if track_roi:
                     break
 
         trk = ocr.get("trkCalSlim") if isinstance(ocr.get("trkCalSlim"), dict) else {}
         if not track_roi and isinstance(trk, dict):
-            track_roi = _parse_rect(trk.get("roi"))
+            track_roi = _to_roi_dict(_parse_rect(trk.get("roi")))
         mini_pts = _pts((trk.get("minimap_pts") if isinstance(trk, dict) else None) or (trk.get("ptsMini") if isinstance(trk, dict) else None))
         ref_pts = _pts((trk.get("ref_pts") if isinstance(trk, dict) else None) or (trk.get("ptsRef") if isinstance(trk, dict) else None))
 
@@ -1277,6 +1289,352 @@ def render(ns):
             return True, f"{mat_path.name} -> {json_path.name}"
         return False, "nichts offen"
 
+    def _wd_retrofix_one(base_override=None) -> tuple[bool, str, bool]:
+        """Run retrofix (time-trim + plausibility filter) for one result JSON.
+        Skip-set updated AFTER processing so an interrupted file is retried next pass.
+        Returns (changed, message, needs_track_rerun)."""
+        try:
+            from app_tabs.plausibility_filter import retrofix_result_json
+            from app_tabs.roi_catalog_tab import load_catalog as _lc_rf
+        except Exception as e:
+            return False, f"Import fehlgeschlagen: {e}", False
+
+        base = _capture_base(base_override=base_override)
+        res_dir = base / "results"
+        if not res_dir.exists():
+            return False, "nichts offen", False
+
+        with _YT_WATCHDOG_LOCK:
+            skip: set = set(_YT_WATCHDOG.get("retrofix_skip") or set())
+
+        catalog = _lc_rf()
+
+        for jp in sorted(res_dir.glob("results_*.json")):
+            jp_str = str(jp)
+            if jp_str in skip:
+                continue
+            ok, msg, track_needed = retrofix_result_json(jp_str, catalog)
+            # Mark done AFTER processing — interrupted files will be retried
+            with _YT_WATCHDOG_LOCK:
+                _YT_WATCHDOG.setdefault("retrofix_skip", set()).add(jp_str)
+            return ok, msg, track_needed
+
+        return False, "nichts offen", False
+
+    def _wd_retro_track_one(base_override=None) -> tuple[bool, str]:
+        """Re-run track minimap detection for one JSON where track columns are empty/missing.
+        Uses existing frame_idx list from table/cleaned — no full OCR re-run needed."""
+        try:
+            from app_tabs.plausibility_filter import needs_track_rerun as _ntr
+            from app_tabs.roi_catalog_tab import load_catalog as _lc_tr
+        except Exception as e:
+            return False, f"Import fehlgeschlagen: {e}"
+
+        base = _capture_base(base_override=base_override)
+        res_dir = base / "results"
+        if not res_dir.exists():
+            return False, "nichts offen"
+
+        with _YT_WATCHDOG_LOCK:
+            skip: set = set(_YT_WATCHDOG.get("retro_track_skip") or set())
+
+        for jp in sorted(res_dir.glob("results_*.json")):
+            jp_str = str(jp)
+            if jp_str in skip:
+                continue
+            try:
+                doc = _wd_load_json(jp)
+                if not _ntr(doc):
+                    # No rerun needed — skip immediately
+                    with _YT_WATCHDOG_LOCK:
+                        _YT_WATCHDOG.setdefault("retro_track_skip", set()).add(jp_str)
+                    continue
+            except Exception:
+                with _YT_WATCHDOG_LOCK:
+                    _YT_WATCHDOG.setdefault("retro_track_skip", set()).add(jp_str)
+                continue
+
+            # Found a file that needs track re-run.
+            # Mark done AFTER processing — if interrupted, partial state is saved
+            # to JSON and needs_track_rerun will detect it on next pass.
+            ok, msg = _wd_run_track_only(jp, base_override=base_override)
+            with _YT_WATCHDOG_LOCK:
+                _YT_WATCHDOG.setdefault("retro_track_skip", set()).add(jp_str)
+            return ok, msg
+
+        return False, "nichts offen"
+
+    def _wd_run_track_only(json_path: Path, base_override=None) -> tuple[bool, str]:
+        """Re-run only the track/minimap detection columns for an already-OCR'd JSON.
+        Reads existing frame_idx from cleaned/table and processes those frames only."""
+        folder = json_path.stem.replace("results_", "", 1)
+        _wd_set_current(f"Track-Nachkorrektur: {folder}")
+
+        _extract_minimap_crop = globals().get("extract_minimap_crop")
+        _detect_moving_point = globals().get("detect_moving_point")
+        if not callable(_extract_minimap_crop) or not callable(_detect_moving_point):
+            return False, "track-Tools fehlen"
+
+        doc = _wd_load_json(json_path)
+        rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+        if not isinstance(rr, dict):
+            return False, "recordResult fehlt"
+        ocr = rr.get("ocr") if isinstance(rr.get("ocr"), dict) else {}
+
+        track_cfg = _wd_extract_track_cfg(doc)
+        track_roi = track_cfg.get("track_roi")
+        if not track_roi:
+            return False, "kein track_roi"
+
+        # Load existing table to get frame_idx list
+        src_tbl = None
+        for k in ("cleaned", "table"):
+            t = ocr.get(k)
+            if isinstance(t, dict) and t.get("frame_idx"):
+                src_tbl = t
+                break
+        if src_tbl is None:
+            return False, "keine Tabelle mit frame_idx"
+
+        frame_idxs = [int(v) for v in src_tbl["frame_idx"] if v not in ("", None)]
+        from app_tabs.plausibility_filter import _to_float as _pf_to_float
+        time_ss = [_pf_to_float(v) for v in src_tbl.get("time_s", [])]
+        n = len(frame_idxs)
+        if n == 0:
+            return False, "keine Frames"
+
+        out_video, _ = _capture_media_paths(folder, base_override=base_override)
+        if not out_video.exists():
+            # Fallback scan
+            cap_dir = out_video.parent
+            found = None
+            if cap_dir.is_dir():
+                for ext in ("*.avi", "*.mp4", "*.mkv"):
+                    cands = sorted(cap_dir.glob(ext))
+                    if cands:
+                        found = cands[0]
+                        break
+            if found is None:
+                return False, "video fehlt"
+            out_video = found
+
+        cap = cv2.VideoCapture(str(out_video))
+        if not cap.isOpened():
+            return False, "video kann nicht geöffnet werden"
+
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            if fps <= 0:
+                fps = 30.0
+            total_vid = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+            fh_v = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+
+            _mini_pts = list(track_cfg.get("minimap_pts") or [])
+            _ref_pts = list(track_cfg.get("ref_pts") or [])
+            _color_range = dict(track_cfg.get("moving_pt_color_range") or {})
+            _centerline_px = track_cfg.get("centerline_px")
+
+            _H_fallback = None
+            if len(_mini_pts) >= 4 and len(_ref_pts) >= 4:
+                try:
+                    _src = np.asarray(_mini_pts[:8], dtype=np.float32).reshape(-1, 2)
+                    _dst = np.asarray(_ref_pts[:8], dtype=np.float32).reshape(-1, 2)
+                    _H_fallback, _ = cv2.findHomography(_src, _dst, method=0)
+                except Exception:
+                    _H_fallback = None
+
+            def _cl_pct(ref_pt, cl_px):
+                if ref_pt is None or cl_px is None:
+                    return None
+                try:
+                    cl = np.asarray(cl_px, dtype=float)
+                    if cl.ndim != 2 or cl.shape[0] < 2:
+                        return None
+                    p = np.asarray(ref_pt, dtype=float).ravel()[:2]
+                    d = np.diff(cl[:, :2], axis=0)
+                    seg_len = np.sqrt(np.sum(d * d, axis=1))
+                    cum = np.concatenate(([0.0], np.cumsum(seg_len)))
+                    total = float(cum[-1])
+                    if total <= 1e-9:
+                        return None
+                    best_d2, best_s = float("inf"), 0.0
+                    for i in range(len(seg_len)):
+                        v = cl[i + 1, :2] - cl[i, :2]
+                        l2 = float(np.dot(v, v))
+                        if l2 <= 0:
+                            continue
+                        u = float(np.clip(np.dot(p - cl[i, :2], v) / l2, 0.0, 1.0))
+                        q = cl[i, :2] + u * v
+                        d2 = float(np.sum((p - q) ** 2))
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_s = float(cum[i] + u * seg_len[i])
+                    return float(np.clip(100.0 * best_s / total, 0.0, 100.0))
+                except Exception:
+                    return None
+
+            # ── Resume from partial save if watchdog was interrupted ─────────
+            _partial = ocr.get("track_rerun_partial")
+            _resume_idx = 0
+            tmf_out = [0] * n
+            tmx_out = [""] * n
+            tmy_out = [""] * n
+            txx_out = [""] * n
+            txy_out = [""] * n
+            tpc_out = [""] * n
+            if isinstance(_partial, dict) and int(_partial.get("n", 0)) == n:
+                try:
+                    tmf_out = list(_partial["tmf"])
+                    tmx_out = list(_partial["tmx"])
+                    tmy_out = list(_partial["tmy"])
+                    txx_out = list(_partial["txx"])
+                    txy_out = list(_partial["txy"])
+                    tpc_out = list(_partial["tpc"])
+                    _resume_idx = int(_partial.get("last_idx", 0))
+                    _wd_log(f"Track-Nachkorrektur: {folder} – Resume ab {_resume_idx}/{n}")
+                except Exception:
+                    _resume_idx = 0
+                    tmf_out = [0] * n
+                    tmx_out = tmx_out[:0] or [""] * n
+                    tmy_out = [""] * n
+                    txx_out = [""] * n
+                    txy_out = [""] * n
+                    tpc_out = [""] * n
+
+            _save_every = max(10, n // 20)  # checkpoint every ~5%
+            _json_path_lock = get_path_lock(str(json_path))
+
+            def _save_partial(last_idx: int) -> None:
+                ocr["track_rerun_partial"] = {
+                    "n": n, "last_idx": last_idx,
+                    "tmf": tmf_out, "tmx": tmx_out, "tmy": tmy_out,
+                    "txx": txx_out, "txy": txy_out, "tpc": tpc_out,
+                }
+                rr["ocr"] = ocr
+                doc["recordResult"] = rr
+                from app_tabs.plausibility_filter import _atomic_write as _aw
+                with _json_path_lock:
+                    _aw(json_path, doc)
+
+            _with_stop = _YT_WATCHDOG.get("stop_event")
+            _stopped = False
+            for i in range(_resume_idx, n):
+                if _with_stop is not None and _with_stop.is_set():
+                    _save_partial(i)
+                    _stopped = True
+                    _wd_log(f"Track-Nachkorrektur: {folder} – gestoppt bei {i}/{n}, Zwischenstand gespeichert")
+                    break
+                fidx = frame_idxs[i]
+                if fidx < 1 or (total_vid > 0 and fidx > total_vid):
+                    continue
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fidx - 1)
+                ok_r, frame_bgr = cap.read()
+                if not ok_r or frame_bgr is None:
+                    continue
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                try:
+                    crop = _extract_minimap_crop(frame_rgb, track_roi, fw, fh_v)
+                except Exception:
+                    continue
+                if crop is None:
+                    continue
+                mp = _detect_moving_point(crop, _color_range)
+                if isinstance(mp, dict):
+                    tmf_out[i] = 1
+                    try:
+                        _x = float(mp.get("x", 0.0) or 0.0)
+                        _y = float(mp.get("y", 0.0) or 0.0)
+                        tmx_out[i] = _x
+                        tmy_out[i] = _y
+                        _ref_pt = None
+                        if _H_fallback is not None:
+                            try:
+                                _p = np.array([[[_x, _y]]], dtype=np.float32)
+                                _q = cv2.perspectiveTransform(_p, _H_fallback)
+                                _ref_pt = [float(_q[0, 0, 0]), float(_q[0, 0, 1])]
+                            except Exception:
+                                pass
+                        if _ref_pt is not None:
+                            txx_out[i] = float(_ref_pt[0])
+                            txy_out[i] = float(_ref_pt[1])
+                            pct = _cl_pct(_ref_pt, _centerline_px)
+                            if pct is not None:
+                                tpc_out[i] = float(pct)
+                    except Exception:
+                        pass
+
+                if i % _save_every == 0:
+                    _save_partial(i + 1)
+                    _wd_set_current(f"Track-Nachkorrektur: {folder} {i+1}/{n}")
+        finally:
+            cap.release()
+
+        if _stopped:
+            return False, f"{folder}: bei {_resume_idx}/{n} gestoppt – Resume beim nächsten Start"
+
+        # Completed — write final results and remove the partial marker
+        found_count = sum(tmf_out)
+        for key in ("table", "cleaned"):
+            tbl = ocr.get(key)
+            if not isinstance(tbl, dict) or not tbl.get("frame_idx"):
+                continue
+            if len(tbl["frame_idx"]) != n:
+                continue
+            tbl["track_minimap_found"] = tmf_out
+            tbl["track_minimap_x"] = tmx_out
+            tbl["track_minimap_y"] = tmy_out
+            tbl["track_xy_x"] = txx_out
+            tbl["track_xy_y"] = txy_out
+            tbl["track_pct"] = tpc_out
+            ocr[key] = tbl
+
+        ocr.pop("track_rerun_partial", None)  # clean up partial marker
+        rr["ocr"] = ocr
+        doc["recordResult"] = rr
+        from app_tabs.plausibility_filter import _atomic_write as _aw_final
+        with get_path_lock(str(json_path)):
+            _aw_final(json_path, doc)
+        return True, f"{folder}: {found_count}/{n} Frames mit Track-Punkt"
+
+    def _wd_reclean_one(base_override=None) -> tuple[bool, str]:
+        """Filter one result JSON with current catalog plausibility + slope bounds.
+        Tracks processed files in _YT_WATCHDOG['reclean_skip'] for this session."""
+        try:
+            from app_tabs.plausibility_filter import reclean_result_json
+            from app_tabs.roi_catalog_tab import load_catalog as _lc_rc
+        except Exception as e:
+            return False, f"Import fehlgeschlagen: {e}"
+
+        base = _capture_base(base_override=base_override)
+        res_dir = base / "results"
+        if not res_dir.exists():
+            return False, "nichts offen"
+
+        with _YT_WATCHDOG_LOCK:
+            skip: set = set(_YT_WATCHDOG.get("reclean_skip") or set())
+
+        catalog = _lc_rc()
+        if not (catalog.get("plausibility")):
+            return False, "kein Katalog"
+
+        for jp in sorted(res_dir.glob("results_*.json")):
+            jp_str = str(jp)
+            if jp_str in skip:
+                continue
+            ok, msg = reclean_result_json(jp_str, catalog)
+            # Mark done AFTER processing — interrupted files will be retried
+            with _YT_WATCHDOG_LOCK:
+                _YT_WATCHDOG.setdefault("reclean_skip", set()).add(jp_str)
+            if ok:
+                return True, msg
+            # file had no usable table — not an error, continue to next
+            if "keine Tabelle" in msg or "kein recordResult" in msg or "kein ocr" in msg:
+                continue
+            return False, msg
+
+        return False, "nichts offen"
+
     def _wd_process_once(cfg: dict) -> bool:
         base_override = cfg.get("local_base_path")
         # Always read from the live shared dict so UI changes take effect at the
@@ -1286,8 +1644,10 @@ def render(ns):
         task_mat_json = bool(tasks.get("mat_json", False))
         task_download = bool(tasks.get("download", True))
         task_ocr = bool(tasks.get("ocr", True))
+        task_reclean = bool(tasks.get("reclean", False))
+        task_retrofix = bool(tasks.get("retrofix", False))
 
-        _wd_log(f"Tick | Aufgaben: MAT-JSON={task_mat_json} Download={task_download} OCR={task_ocr}")
+        _wd_log(f"Tick | Aufgaben: MAT-JSON={task_mat_json} Download={task_download} OCR={task_ocr} Nachfiltern={task_reclean} Nachkorrektur={task_retrofix}")
 
         if task_mat_json:
             _wd_set_current("MAT->JSON")
@@ -1417,12 +1777,48 @@ def render(ns):
                         _YT_WATCHDOG.setdefault("ocr_skip", set()).add(folder)
                     return True
 
+        # ── Nachkorrektur (trim + filter + track re-run) ──────────────────────
+        if task_retrofix:
+            _wd_set_current("Nachkorrektur: retrofix")
+            ok_rf, msg_rf, track_needed_rf = _wd_retrofix_one(base_override=base_override)
+            if ok_rf:
+                _wd_log(f"Nachkorrektur: {msg_rf}")
+                return True
+            if "nichts offen" not in str(msg_rf).lower():
+                _wd_inc("errors")
+                _wd_log(f"Nachkorrektur Fehler: {msg_rf}")
+                return True
+            # retrofix pass done — now do track re-run pass
+            _wd_set_current("Nachkorrektur: track re-run")
+            ok_tr, msg_tr = _wd_retro_track_one(base_override=base_override)
+            if ok_tr:
+                _wd_log(f"Track-Nachkorrektur: {msg_tr}")
+                return True
+            if "nichts offen" not in str(msg_tr).lower():
+                _wd_inc("errors")
+                _wd_log(f"Track-Nachkorrektur Fehler: {msg_tr}")
+                return True
+
+        # ── Nachfiltern ───────────────────────────────────────────────────────
+        if task_reclean:
+            _wd_set_current("Nachfiltern")
+            ok_rc, msg_rc = _wd_reclean_one(base_override=base_override)
+            if ok_rc:
+                _wd_log(f"Nachfiltern: {msg_rc}")
+                return True
+            if "nichts offen" not in str(msg_rc).lower() and "kein katalog" not in str(msg_rc).lower():
+                _wd_inc("errors")
+                _wd_log(f"Nachfiltern Fehler: {msg_rc}")
+                return True
+
         _wd_log("Tick abgeschlossen: nichts zu tun – starte Suche neu (ocr_skip zurückgesetzt)")
         _wd_set_current("")
-        # Reset skip-set so the next pass re-evaluates all folders from scratch,
-        # catching files that gained ROI calibration since the last pass.
+        # Reset skip-sets so the next pass re-evaluates all folders from scratch.
         with _YT_WATCHDOG_LOCK:
             _YT_WATCHDOG["ocr_skip"] = set()
+            _YT_WATCHDOG["reclean_skip"] = set()
+            _YT_WATCHDOG["retrofix_skip"] = set()
+            _YT_WATCHDOG["retro_track_skip"] = set()
         return False
 
     def _wd_loop(stop_event, cfg: dict) -> None:

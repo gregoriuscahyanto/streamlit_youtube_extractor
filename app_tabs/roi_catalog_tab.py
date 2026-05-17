@@ -1,6 +1,7 @@
 """ROI Catalog tab — manage ROI names, FMT priority, and plausibility bounds."""
 from __future__ import annotations
 import json
+import math
 from pathlib import Path
 
 
@@ -37,17 +38,17 @@ _DEFAULT_FMT_PRIORITY: dict[str, list[str]] = {
     "stellung_bremspedal_proz": ["int_3"],
 }
 
-_DEFAULT_PLAUSIBILITY: dict[str, dict[str, float]] = {
-    "v_Fzg_kmph": {"min": 0, "max": 350},
-    "v_Fzg_mph":  {"min": 0, "max": 220},
-    "numgear_GET": {"min": 0, "max": 10},
-    "a_G":        {"min": -5, "max": 5},
-    "a_mps2":     {"min": -50, "max": 50},
-    "P_kW":       {"min": -2000, "max": 2000},
-    "M_Nm":       {"min": -5000, "max": 5000},
-    "n_mot_Upmin": {"min": 0, "max": 20000},
-    "stellung_gaspedal_proz":  {"min": 0, "max": 100},
-    "stellung_bremspedal_proz": {"min": 0, "max": 100},
+_DEFAULT_PLAUSIBILITY: dict[str, dict] = {
+    "v_Fzg_kmph": {"min": 0,     "max": 350,   "max_slope": 150},
+    "v_Fzg_mph":  {"min": 0,     "max": 220,   "max_slope": 100},
+    "numgear_GET":{"min": 0,     "max": 10,    "max_slope": 5},
+    "a_G":        {"min": -5,    "max": 5},
+    "a_mps2":     {"min": -50,   "max": 50},
+    "P_kW":       {"min": -2000, "max": 2000,  "max_slope": 2000},
+    "M_Nm":       {"min": -5000, "max": 5000,  "max_slope": 5000},
+    "n_mot_Upmin":{"min": 0,     "max": 20000, "max_slope": 8000},
+    "stellung_gaspedal_proz":   {"min": 0, "max": 100, "max_slope": 300},
+    "stellung_bremspedal_proz": {"min": 0, "max": 100, "max_slope": 300},
 }
 
 
@@ -173,9 +174,10 @@ def render(ns: dict) -> None:
     # ── 3. Plausibilitätsgrenzen ──────────────────────────────────────────────
     with st.expander("Plausibilitätsgrenzen", expanded=True):
         st.caption(
-            "Min/Max für numerische ROIs. "
-            "Nicht verfügbar für t_s (Zeitformat), _ und track_minimap — "
-            "deren OCR-Werte sind keine Dezimalzahlen und können nicht geprüft werden."
+            "Min/Max und max. Steigung [Einheit/s] für numerische ROIs. "
+            "Werte außerhalb Min/Max oder mit Sprung > Max Steigung/s werden beim "
+            "Filtern auf leer gesetzt. "
+            "t_s, _ und track_minimap sind ausgenommen (kein numerischer OCR-Wert)."
         )
         plaus: dict = dict(catalog.get("plausibility") or {})
         plaus_names = [n for n in all_roi_names(catalog) if n not in _NO_PLAUS_NAMES]
@@ -183,20 +185,30 @@ def render(ns: dict) -> None:
         plaus_rows = []
         for n in plaus_names:
             cur = plaus.get(n) or {}
+            ms = cur.get("max_slope")
             plaus_rows.append({
                 "ROI Name": n,
                 "Min": float(cur.get("min", 0.0)),
                 "Max": float(cur.get("max", 9999.0)),
+                "Max Steigung /s": float(ms) if ms is not None else None,
             })
         plaus_df = pd.DataFrame(plaus_rows) if plaus_rows else pd.DataFrame(
-            columns=["ROI Name", "Min", "Max"]
+            columns=["ROI Name", "Min", "Max", "Max Steigung /s"]
         )
+        # Ensure float dtype so NumberColumn works even when all values are None
+        for _c in ("Min", "Max", "Max Steigung /s"):
+            plaus_df[_c] = pd.to_numeric(plaus_df[_c], errors="coerce")
+
         edited_plaus = st.data_editor(
             plaus_df,
             column_config={
-                "ROI Name": st.column_config.TextColumn("ROI Name", width=200, disabled=True),
-                "Min": st.column_config.NumberColumn("Min", width=100, format="%.2f"),
-                "Max": st.column_config.NumberColumn("Max", width=100, format="%.2f"),
+                "ROI Name": st.column_config.TextColumn("ROI Name", width=180, disabled=True),
+                "Min": st.column_config.NumberColumn("Min", width=90, format="%.2f"),
+                "Max": st.column_config.NumberColumn("Max", width=90, format="%.2f"),
+                "Max Steigung /s": st.column_config.NumberColumn(
+                    "Max Steigung /s", width=130, format="%.1f",
+                    help="Maximale Wertänderung pro Sekunde. Leer = kein Limit.",
+                ),
             },
             num_rows="fixed",
             hide_index=True,
@@ -211,7 +223,14 @@ def render(ns: dict) -> None:
                 if not n:
                     continue
                 try:
-                    plaus[n] = {"min": float(row["Min"]), "max": float(row["Max"])}
+                    entry: dict = {
+                        "min": float(row["Min"]),
+                        "max": float(row["Max"]),
+                    }
+                    ms_val = row.get("Max Steigung /s")
+                    if ms_val is not None and not (isinstance(ms_val, float) and math.isnan(ms_val)):
+                        entry["max_slope"] = float(ms_val)
+                    plaus[n] = entry
                 except Exception:
                     pass
             catalog["plausibility"] = plaus

@@ -253,13 +253,32 @@ def render(ns: dict) -> None:
         )
         c3.caption(f"Versatz: {f['offset_s']:+.3f}s")
 
-    # Load data (cache by path + offset)
+    # Build a short hash of the current plausibility catalog so that changes
+    # to bounds/slopes invalidate the cache and trigger a reload+refilter.
+    _cmp_catalog = st.session_state.get("roi_catalog") or {}
+    try:
+        import hashlib as _hl
+        _plaus_hash = _hl.md5(
+            json.dumps(_cmp_catalog.get("plausibility") or {}, sort_keys=True).encode()
+        ).hexdigest()[:8]
+    except Exception:
+        _plaus_hash = "0"
+
+    # Load data (cache by path + offset + catalog hash)
     cmp_data: dict[str, dict] = {}
     for f in st.session_state.cmp_files:
-        key = f"{f['path']}::{f['offset_s']}"
+        key = f"{f['path']}::{f['offset_s']}::{_plaus_hash}"
         cached = st.session_state.cmp_data.get(key)
         if cached is None:
+            import copy as _copy
             cached = _load_file_data(f["path"], f["offset_s"])
+            # Apply plausibility + slope filter using current catalog
+            if _cmp_catalog and cached:
+                try:
+                    from app_tabs.plausibility_filter import filter_cols as _fc
+                    _fc(cached, _cmp_catalog)
+                except Exception:
+                    pass
             st.session_state.cmp_data[key] = cached
         cmp_data[f["path"]] = cached
 
