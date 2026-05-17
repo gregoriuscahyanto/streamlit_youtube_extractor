@@ -484,22 +484,23 @@ def _render_media_analysis(rows: list[dict]) -> None:
     n_acfg     = sum(1 for r in rows if r.get("audio_config"))
     n_val      = sum(1 for r in rows if r.get("validierung"))
 
+    _ROW_STYLE = 'style="grid-template-columns:160px 1fr auto;min-width:0;"'
+
     def _simple_bar(label: str, ok: int, color: str = "#4a90a4") -> str:
         p = _pct(ok)
         return (
-            f'<div class="mat-analysis-bar-row">'
+            f'<div class="mat-analysis-bar-row" {_ROW_STYLE}>'
             f'<div>{label}</div>'
             f'<div class="mat-analysis-bar-track">'
             f'<div class="mat-analysis-bar-fill" style="width:{p:.1f}%;background:{color};"></div>'
             f'</div>'
-            f'<div>{ok}/{total} · {p:.0f}%</div>'
+            f'<div style="white-space:nowrap;padding-left:.4rem;">{ok}/{total} · {p:.0f}%</div>'
             f'</div>'
         )
 
     def _stacked_bar(label: str, segments: list[tuple[int, str]]) -> str:
-        """segments = [(count, color), ...]"""
         inner = "".join(
-            f'<div style="width:{_pct(n):.1f}%;background:{c};height:100%;"></div>'
+            f'<div style="width:{_pct(n):.1f}%;background:{c};height:100%;flex-shrink:0;"></div>'
             for n, c in segments if n > 0
         )
         legend = " · ".join(
@@ -507,10 +508,10 @@ def _render_media_analysis(rows: list[dict]) -> None:
             for n, c in segments
         )
         return (
-            f'<div class="mat-analysis-bar-row">'
+            f'<div class="mat-analysis-bar-row" {_ROW_STYLE}>'
             f'<div>{label}</div>'
             f'<div class="mat-analysis-bar-track" style="display:flex;overflow:hidden;">{inner}</div>'
-            f'<div style="white-space:nowrap;">{legend} / {total}</div>'
+            f'<div style="white-space:nowrap;padding-left:.4rem;">{legend} / {total}</div>'
             f'</div>'
         )
 
