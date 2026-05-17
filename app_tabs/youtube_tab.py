@@ -907,7 +907,19 @@ def render(ns):
                 except ValueError:
                     _tgt_fps = 2.0
                 frame_step = max(1, int(round(fps / _tgt_fps))) if _tgt_fps > 0 else 1
-            total_processed = max(1, total_frames // frame_step)
+            # Read start_s / end_s from ocr.params — these are the absolute boundaries
+            # set by the user in ROI Setup (the time-range sliders).
+            _ocr_params = ocr.get("params") if isinstance(ocr.get("params"), dict) else {}
+            _start_s = float(_ocr_params.get("start_s") or 0.0)
+            _end_s_cfg = _ocr_params.get("end_s")
+            _end_s = float(_end_s_cfg) if _end_s_cfg is not None and float(_end_s_cfg) > 0 else dur
+            # Clamp to actual video duration
+            _start_s = max(0.0, min(_start_s, dur))
+            _end_s = max(_start_s + 0.1, min(_end_s, dur))
+            _start_frame = int(_start_s * fps)
+            _end_frame = int(_end_s * fps)
+            total_frames_range = max(1, _end_frame - _start_frame)
+            total_processed = max(1, total_frames_range // frame_step)
 
             # Columnar format: {"time_s": [...], "frame_idx": [...], "roi_a": [...], ...}
             # Convert legacy array-of-objects to columnar if needed
@@ -944,14 +956,17 @@ def render(ns):
                 clean_cols = {k: list(v) for k, v in existing_cleaned.items() if isinstance(v, list)}
                 # frame_idx stored as 1-based; last value = next 0-based index to process
                 frame_idx = int(raw_cols["frame_idx"][-1])
+                # Never resume before start_s boundary
+                frame_idx = max(frame_idx, _start_frame)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 _resume_start = frame_idx
             else:
                 roi_names = list(exp_roi_cols)
                 raw_cols: dict[str, list] = {"time_s": [], "frame_idx": [], **{nm: [] for nm in roi_names}}
                 clean_cols: dict[str, list] = {"time_s": [], "frame_idx": [], **{nm: [] for nm in roi_names}}
-                frame_idx = 0
-                _resume_start = 0
+                frame_idx = _start_frame
+                cap.set(cv2.CAP_PROP_POS_FRAMES, _start_frame)
+                _resume_start = _start_frame
 
             # Track/minimap columns (positions) are always kept in table/cleaned when track ROI exists.
             _track_cols = list(exp_track_cols)
@@ -1029,8 +1044,8 @@ def render(ns):
                 ocr["created"] = datetime.now().isoformat(timespec="seconds")
                 ocr["sample_rate_hz"] = round(fps, 6)
                 _params = ocr.get("params") if isinstance(ocr.get("params"), dict) else {}
-                _params.setdefault("start_s", 0.0)
-                _params["end_s"] = round(dur, 6)
+                _params["start_s"] = round(_start_s, 6)
+                _params["end_s"] = round(_end_s, 6)
                 if partial:
                     _params["partial"] = True
                 else:
@@ -1048,6 +1063,9 @@ def render(ns):
             while True:
                 if _stop_event is not None and _stop_event.is_set():
                     _stopped_early = True
+                    break
+                # Stop at end_s boundary
+                if frame_idx >= _end_frame:
                     break
                 ok, frame_bgr = cap.read()
                 if (not ok) or frame_bgr is None:
@@ -1261,7 +1279,10 @@ def render(ns):
 
     def _wd_process_once(cfg: dict) -> bool:
         base_override = cfg.get("local_base_path")
-        tasks = dict(cfg.get("tasks") or {})
+        # Always read from the live shared dict so UI changes take effect at the
+        # next tick without stopping the watchdog mid-operation.
+        with _YT_WATCHDOG_LOCK:
+            tasks = dict(_YT_WATCHDOG.get("tasks") or cfg.get("tasks") or {})
         task_mat_json = bool(tasks.get("mat_json", False))
         task_download = bool(tasks.get("download", True))
         task_ocr = bool(tasks.get("ocr", True))

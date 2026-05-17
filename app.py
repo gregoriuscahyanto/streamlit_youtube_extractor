@@ -90,12 +90,12 @@ from core.track_analysis import (
     extract_minimap_crop,
     project_point_with_homography,
 )
-from app_tabs import audio_tab, mat_to_json_tab, media_tab, roi_setup_tab, setup_tab, video_ocr_tab, watchdog_tab, youtube_tab
+from app_tabs import audio_tab, compare_tab, mat_to_json_tab, media_tab, roi_catalog_tab, roi_setup_tab, setup_tab, track_geoplot, video_ocr_tab, watchdog_tab, youtube_tab
 try:
     # Streamlit reruns app.py in the same Python process. Reload extracted tab modules
     # so changes in app_tabs/*.py are visible without a full server restart.
     import importlib
-    for _tab_module in (audio_tab, mat_to_json_tab, media_tab, roi_setup_tab, setup_tab, video_ocr_tab, watchdog_tab, youtube_tab):
+    for _tab_module in (audio_tab, compare_tab, mat_to_json_tab, media_tab, roi_catalog_tab, roi_setup_tab, setup_tab, track_geoplot, video_ocr_tab, watchdog_tab, youtube_tab):
         importlib.reload(_tab_module)
 except Exception:
     pass
@@ -377,6 +377,15 @@ FMT_OPTIONS = [
     "integer","int_1","int_2","int_3","int_4","int_min2_max3","int_min3_max4",
     "float","alnum",
 ]
+
+# Load ROI catalog and merge custom names into ROI_NAMES so they appear in selectors.
+try:
+    from app_tabs.roi_catalog_tab import load_catalog as _load_roi_catalog, all_roi_names as _all_roi_names
+    _roi_catalog = _load_roi_catalog()
+    ROI_NAMES = _all_roi_names(_roi_catalog)
+except Exception:
+    _roi_catalog = {}
+
 MAT_OVERVIEW_COLCFG = {
     "mat_datei": st.column_config.TextColumn("mat_datei", width="medium"),
     "video_title": st.column_config.TextColumn("video_title", width="large"),
@@ -1674,7 +1683,19 @@ def _run_video_ocr_fullvideo_framewise_now(
         if target_fps <= 0:
             target_fps = 2.0
         frame_step = max(1, int(round(fps / target_fps)))
-    processed_target = max(1, int(math.ceil(frame_count / max(1, frame_step))))
+
+    # Read start_s / end_s from current session state (t_start / t_end set by ROI Setup).
+    # These are the absolute boundaries; OCR must not go outside them.
+    _dur_full = float(frame_count) / max(fps, 1e-9)
+    _start_s = float(st.session_state.get("t_start") or 0.0)
+    _end_s = float(st.session_state.get("t_end") or _dur_full)
+    _start_s = max(0.0, min(_start_s, _dur_full))
+    _end_s = max(_start_s + 0.1, min(_end_s, _dur_full))
+    _start_frame = int(_start_s * fps)
+    _end_frame = int(_end_s * fps)
+    frames_in_range = max(1, _end_frame - _start_frame)
+
+    processed_target = max(1, int(math.ceil(frames_in_range / max(1, frame_step))))
     checkpoint_every = max(1, processed_target // 10)
 
     raw_rows: list[dict] = []
@@ -1750,8 +1771,12 @@ def _run_video_ocr_fullvideo_framewise_now(
     progress_step = int(_tpo.get("progress_step_frames") or st.session_state.get("video_ocr_live_progress_step_frames") or 2)
     progress_step = max(1, progress_step)
 
+    # Seek to start_s boundary
+    if _start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, _start_frame)
+
     processed = 0
-    frame_idx_native = 0
+    frame_idx_native = _start_frame
     cancelled = False
     save_error = ""
 
@@ -1793,6 +1818,9 @@ def _run_video_ocr_fullvideo_framewise_now(
                         break
                 except Exception:
                     pass
+            # Stop at end_s boundary
+            if frame_idx_native >= _end_frame:
+                break
             ok, frame_bgr = cap.read()
             if (not ok) or frame_bgr is None:
                 break
@@ -1869,12 +1897,13 @@ def _run_video_ocr_fullvideo_framewise_now(
             raw_rows.append(raw_row)
             clean_rows.append(clean_row)
             processed += 1
-            done_native = min(frame_count, frame_idx_native + 1)
-            if callable(progress_cb) and (processed <= 3 or processed % progress_step == 0 or done_native >= frame_count):
+            done_native = min(_end_frame, frame_idx_native + 1) - _start_frame
+            total_native = frames_in_range
+            if callable(progress_cb) and (processed <= 3 or processed % progress_step == 0 or done_native >= total_native):
                 try:
-                    progress_cb(done_native, frame_count, t_s, dict(live_snapshot))
+                    progress_cb(done_native, total_native, t_s, dict(live_snapshot))
                 except TypeError:
-                    progress_cb(done_native, frame_count, t_s)
+                    progress_cb(done_native, total_native, t_s)
                 except Exception:
                     pass
             skipped = 0
@@ -7672,6 +7701,8 @@ _tab_labels = [
     "ROI Setup",
     "Video OCR Full",
     "Audio Auswertung",
+    "Vergleich",
+    "ROI Katalog",
 ]
 _tabs = st.tabs(_tab_labels)
 _activate_tab_once()
@@ -7692,4 +7723,8 @@ with _tabs[4]:
     video_ocr_tab.render(globals())
 with _tabs[5]:
     audio_tab.render(globals())
+with _tabs[6]:
+    compare_tab.render(globals())
+with _tabs[7]:
+    roi_catalog_tab.render(globals())
 

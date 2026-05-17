@@ -1,0 +1,456 @@
+"""Multi-file OCR / Audio comparison tab."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+
+# ── Data helpers ──────────────────────────────────────────────────────────────
+
+def _base() -> Path:
+    import streamlit as _st
+    lp = str(_st.session_state.get("local_base_path") or "").strip()
+    return Path(lp).expanduser().resolve() if lp else Path.cwd()
+
+
+def _is_locked(json_path: str) -> bool:
+    try:
+        from core.watchdog_state import is_path_locked
+        return is_path_locked(json_path)
+    except Exception:
+        return False
+
+
+def _watchdog_active_paths() -> set[str]:
+    """Paths currently being written by the watchdog."""
+    try:
+        from app_tabs.youtube_tab import watchdog_snapshot
+        snap = watchdog_snapshot()
+        active: set[str] = set()
+        if snap.get("running"):
+            live = snap.get("ocr_live") or {}
+            folder = str(live.get("folder") or "")
+            if folder and live.get("active"):
+                b = _base()
+                active.add(str((b / "results" / f"results_{folder}.json").resolve()))
+        return active
+    except Exception:
+        return set()
+
+
+def _scan_available_jsons() -> list[dict]:
+    """Return list of result JSONs that have OCR or audio data."""
+    base = _base()
+    res_dir = base / "results"
+    if not res_dir.exists():
+        return []
+    locked = _watchdog_active_paths()
+    out: list[dict] = []
+    for jp in sorted(res_dir.glob("results_*.json"), reverse=True):
+        folder = jp.stem.replace("results_", "", 1)
+        path_str = str(jp.resolve())
+        is_busy = path_str in locked or _is_locked(path_str)
+        try:
+            doc = json.loads(jp.read_text(encoding="utf-8", errors="ignore"))
+            rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+            if not isinstance(rr, dict):
+                continue
+            meta = rr.get("metadata") or {}
+            title = str(
+                meta.get("title") or meta.get("video_title") or
+                meta.get("youtube_title") or ""
+            ).strip()
+            ocr = rr.get("ocr") or {}
+            has_ocr = bool(
+                isinstance(ocr.get("cleaned"), dict) and ocr["cleaned"].get("time_s")
+                or isinstance(ocr.get("table"), dict) and ocr["table"].get("time_s")
+            )
+            arpm = rr.get("audio_rpm") or {}
+            has_audio = bool(
+                isinstance(arpm.get("processed"), dict)
+                and arpm["processed"].get("t_s")
+            )
+            if not (has_ocr or has_audio):
+                continue
+            out.append({
+                "folder": folder,
+                "path": path_str,
+                "title": title,
+                "has_ocr": has_ocr,
+                "has_audio": has_audio,
+                "busy": is_busy,
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _load_file_data(json_path: str, offset_s: float) -> dict[str, list]:
+    """Load OCR cleaned + audio RPM into {col: [values]} with time offset applied."""
+    try:
+        doc = json.loads(Path(json_path).read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {}
+    rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+    if not isinstance(rr, dict):
+        return {}
+    cols: dict[str, list] = {}
+
+    # OCR cleaned table (columnar)
+    ocr = rr.get("ocr") or {}
+    tbl = ocr.get("cleaned") if isinstance(ocr.get("cleaned"), dict) else {}
+    if not tbl:
+        tbl = ocr.get("table") if isinstance(ocr.get("table"), dict) else {}
+    if isinstance(tbl, dict) and tbl.get("time_s"):
+        n = len(tbl["time_s"])
+        for k, v in tbl.items():
+            if isinstance(v, list) and len(v) == n:
+                if k == "time_s":
+                    cols["time_s"] = [float(x) + offset_s for x in v]
+                else:
+                    try:
+                        import numpy as _np
+                        cols[k] = [float(x) if x not in ("", None) else float("nan") for x in v]
+                    except Exception:
+                        cols[k] = list(v)
+
+    # Audio RPM processed
+    arpm = rr.get("audio_rpm") or {}
+    proc = arpm.get("processed") if isinstance(arpm.get("processed"), dict) else {}
+    if isinstance(proc, dict) and proc.get("t_s"):
+        t_audio = [float(x) + offset_s for x in proc["t_s"]]
+        n_a = len(t_audio)
+        if "time_s" not in cols:
+            cols["time_s"] = t_audio
+        else:
+            cols["audio_time_s"] = t_audio
+        for k, v in proc.items():
+            if k == "t_s":
+                continue
+            if isinstance(v, list) and len(v) == n_a:
+                try:
+                    cols[f"audio_{k}"] = [float(x) if x not in ("", None) else float("nan") for x in v]
+                except Exception:
+                    cols[f"audio_{k}"] = list(v)
+    return cols
+
+
+# ── Track calibration helper ──────────────────────────────────────────────────
+
+def _load_trkCalSlim(json_path: str) -> dict:
+    """Load trkCalSlim from a result JSON (centerline_px, minimap_pts, ref_pts)."""
+    try:
+        doc = json.loads(Path(json_path).read_text(encoding="utf-8", errors="ignore"))
+        rr = doc.get("recordResult") if isinstance(doc, dict) else {}
+        ocr = (rr or {}).get("ocr") or {}
+        trk = ocr.get("trkCalSlim")
+        return trk if isinstance(trk, dict) else {}
+    except Exception:
+        return {}
+
+
+# ── Config persistence ────────────────────────────────────────────────────────
+
+def _config_dir() -> Path:
+    d = _base() / "logs" / "compare_configs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _save_config(name: str, cfg: dict) -> None:
+    p = _config_dir() / f"{name}.json"
+    p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_config(name: str) -> dict | None:
+    p = _config_dir() / f"{name}.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _list_configs() -> list[str]:
+    try:
+        return [p.stem for p in sorted(_config_dir().glob("*.json"))]
+    except Exception:
+        return []
+
+
+# ── Render ────────────────────────────────────────────────────────────────────
+
+def render(ns: dict) -> None:
+    globals().update(ns)
+
+    st.markdown('<div class="section-title">Vergleich</div>', unsafe_allow_html=True)
+    st.caption("Vergleiche OCR- und Audio-Auswertungen aus mehreren JSON-Dateien.")
+
+    # ── Session state defaults ────────────────────────────────────────────────
+    st.session_state.setdefault("cmp_files", [])
+    # cmp_files: list of {"path": str, "label": str, "offset_s": float}
+    st.session_state.setdefault("cmp_charts", [
+        {"title": "Diagramm 1", "x_col": "time_s", "y_col": "", "plot_type": "line"}
+    ])
+    # cmp_data: {path: {col: [values]}}  — cache, rebuilt when selection/offset changes
+    st.session_state.setdefault("cmp_data", {})
+
+    # ── Reload config command ─────────────────────────────────────────────────
+    if st.session_state.pop("_cmp_apply_cfg", None):
+        pass  # already applied below
+
+    # ── 1. Datei-Auswahl ─────────────────────────────────────────────────────
+    st.markdown("### Dateien")
+    available = _scan_available_jsons()
+    avail_paths = {a["path"] for a in available}
+
+    busy_paths = {a["path"] for a in available if a["busy"]}
+    selectable = [a for a in available if not a["busy"]]
+    label_map = {
+        a["path"]: (a["title"] if a.get("title") else a["folder"])
+        for a in available
+    }
+
+    current_paths = [f["path"] for f in st.session_state.cmp_files]
+    valid_current = [p for p in current_paths if p in avail_paths and p not in busy_paths]
+
+    chosen = st.multiselect(
+        "JSON-Dateien auswählen (mit OCR oder Audio-Auswertung)",
+        options=[a["path"] for a in selectable],
+        default=valid_current,
+        format_func=lambda p: label_map.get(p, Path(p).stem),
+        key="cmp_file_chooser",
+    )
+    if busy_paths:
+        st.caption(f"⚠️ {len(busy_paths)} Datei(en) werden gerade vom Watchdog bearbeitet und sind nicht auswählbar.")
+
+    # Sync cmp_files with chosen selection
+    existing = {f["path"]: f for f in st.session_state.cmp_files}
+    new_files = []
+    for p in chosen:
+        if p in existing:
+            new_files.append(existing[p])
+        else:
+            # prefer title; folder as fallback so label is always human-readable
+            _a = next((a for a in available if a["path"] == p), {})
+            _lbl = _a.get("title") or _a.get("folder") or Path(p).stem
+            new_files.append({"path": p, "label": _lbl, "offset_s": 0.0})
+    st.session_state.cmp_files = new_files
+
+    if not st.session_state.cmp_files:
+        st.info("Mindestens eine JSON-Datei auswählen.")
+        _render_config_section()
+        return
+
+    # Per-file label + offset
+    for i, f in enumerate(st.session_state.cmp_files):
+        c1, c2, c3 = st.columns([3, 2, 1])
+        f["label"] = c1.text_input(
+            "Label", value=f["label"], key=f"cmp_lbl_{i}", label_visibility="collapsed"
+        )
+        f["offset_s"] = c2.number_input(
+            "Zeitversatz [s]", value=float(f["offset_s"]),
+            step=0.001, format="%.3f", key=f"cmp_off_{i}", label_visibility="collapsed"
+        )
+        c3.caption(f"Versatz: {f['offset_s']:+.3f}s")
+
+    # Load data (cache by path + offset)
+    cmp_data: dict[str, dict] = {}
+    for f in st.session_state.cmp_files:
+        key = f"{f['path']}::{f['offset_s']}"
+        cached = st.session_state.cmp_data.get(key)
+        if cached is None:
+            cached = _load_file_data(f["path"], f["offset_s"])
+            st.session_state.cmp_data[key] = cached
+        cmp_data[f["path"]] = cached
+
+    # Collect all column names across all loaded files
+    all_cols: list[str] = []
+    for d in cmp_data.values():
+        for c in d:
+            if c not in all_cols:
+                all_cols.append(c)
+    numeric_cols = [c for c in all_cols if c != "frame_idx" or True]  # keep all for X
+
+    st.divider()
+
+    # ── 2. Diagramme ─────────────────────────────────────────────────────────
+    st.markdown("### Diagramme")
+
+    charts = st.session_state.cmp_charts
+    to_remove = None
+
+    for ci, chart in enumerate(charts):
+        with st.container(border=True):
+            h1, h2 = st.columns([6, 1])
+            chart["title"] = h1.text_input(
+                "Titel", value=chart.get("title", f"Diagramm {ci+1}"),
+                key=f"cmp_ctitle_{ci}", label_visibility="collapsed"
+            )
+            if h2.button("✕", key=f"cmp_rm_{ci}", help="Diagramm entfernen"):
+                to_remove = ci
+
+            col_a, col_b, col_c = st.columns([2, 2, 2])
+            x_opts = ["time_s"] + [c for c in all_cols if c != "time_s"]
+            x_def = chart.get("x_col", "time_s")
+            x_idx = x_opts.index(x_def) if x_def in x_opts else 0
+            chart["x_col"] = col_a.selectbox(
+                "X-Achse", options=x_opts, index=x_idx,
+                key=f"cmp_cx_{ci}"
+            )
+            y_opts = [c for c in all_cols if c != chart["x_col"]]
+            y_def = chart.get("y_col", "")
+            y_idx = y_opts.index(y_def) if y_def in y_opts else 0
+            chart["y_col"] = col_b.selectbox(
+                "Y-Achse", options=y_opts, index=y_idx if y_opts else 0,
+                key=f"cmp_cy_{ci}"
+            ) if y_opts else ""
+            chart["plot_type"] = col_c.selectbox(
+                "Darstellung",
+                options=["line", "scatter"],
+                index=0 if chart.get("plot_type", "line") == "line" else 1,
+                format_func=lambda v: "Linie" if v == "line" else "Punkte",
+                key=f"cmp_ctype_{ci}"
+            )
+
+            # Render this chart
+            if chart["y_col"] and all_cols:
+                _render_chart(chart, st.session_state.cmp_files, cmp_data)
+            else:
+                st.caption("Y-Achse auswählen um das Diagramm anzuzeigen.")
+
+    if to_remove is not None:
+        charts.pop(to_remove)
+        st.rerun()
+
+    if st.button("+ Diagramm hinzufügen", key="cmp_add_chart"):
+        charts.append({
+            "title": f"Diagramm {len(charts)+1}",
+            "x_col": "time_s",
+            "y_col": all_cols[1] if len(all_cols) > 1 else "",
+            "plot_type": "line",
+        })
+        st.rerun()
+
+    st.divider()
+
+    # ── Geoplot (nur wenn track_xy vorhanden) ────────────────────────────────
+    _geo_traces = []
+    _centerline_xy = None
+    for _f in st.session_state.cmp_files:
+        _d = cmp_data.get(_f["path"], {})
+        _xs = _d.get("track_xy_x")
+        _ys = _d.get("track_xy_y")
+        if _xs and _ys and len(_xs) == len(_ys):
+            _geo_traces.append({
+                "name": _f["label"],
+                "xs": _xs,
+                "ys": _ys,
+                "ts": _d.get("time_s"),
+            })
+            # Load centerline from the first file that has track data
+            if _centerline_xy is None:
+                try:
+                    from app_tabs.track_geoplot import transform_centerline
+                    _trk = _load_trkCalSlim(_f["path"])
+                    _cl_px = _trk.get("centerline_px")
+                    _mini = _trk.get("minimap_pts")
+                    _ref = _trk.get("ref_pts")
+                    if _cl_px and _mini and _ref:
+                        _centerline_xy = transform_centerline(_cl_px, _mini, _ref)
+                except Exception:
+                    pass
+
+    if _geo_traces:
+        st.markdown("### Geoplot")
+        try:
+            from app_tabs.track_geoplot import make_geoplot_figure
+            st.plotly_chart(
+                make_geoplot_figure(_geo_traces, _centerline_xy),
+                use_container_width=True,
+            )
+        except Exception as _ge:
+            st.caption(f"Geoplot nicht verfügbar: {_ge}")
+        st.divider()
+
+    _render_config_section()
+
+
+def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict]) -> None:
+    try:
+        import plotly.graph_objects as go
+        fig = go.Figure()
+        x_col = chart["x_col"]
+        y_col = chart["y_col"]
+        mode = "lines" if chart.get("plot_type") == "line" else "markers"
+
+        for f in files:
+            data = cmp_data.get(f["path"], {})
+            xs = data.get(x_col)
+            ys = data.get(y_col)
+            if not xs or not ys or len(xs) != len(ys):
+                continue
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys,
+                mode=mode,
+                name=f["label"],
+                marker=dict(size=4) if mode == "markers" else {},
+            ))
+
+        fig.update_layout(
+            title=chart.get("title", ""),
+            margin=dict(l=40, r=20, t=40, b=40),
+            height=340,
+            xaxis_title=x_col,
+            yaxis_title=y_col,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            template="plotly_dark",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.caption(f"Diagramm-Fehler: {e}")
+
+
+def _render_config_section() -> None:
+    """Save / load comparison configuration."""
+    st.markdown("### Konfiguration speichern / laden")
+    sc1, sc2 = st.columns(2)
+
+    with sc1:
+        st.markdown("**Speichern**")
+        cfg_name = st.text_input(
+            "Name", value="vergleich_1", key="cmp_save_name", label_visibility="collapsed"
+        )
+        if st.button("Speichern", key="cmp_save_btn"):
+            cfg = {
+                "files": [
+                    {"path": f["path"], "label": f["label"], "offset_s": f["offset_s"]}
+                    for f in st.session_state.cmp_files
+                ],
+                "charts": list(st.session_state.cmp_charts),
+            }
+            try:
+                _save_config(cfg_name.strip() or "vergleich", cfg)
+                st.success(f"Gespeichert: {cfg_name}")
+            except Exception as e:
+                st.error(f"Fehler: {e}")
+
+    with sc2:
+        st.markdown("**Laden**")
+        configs = _list_configs()
+        if configs:
+            sel = st.selectbox(
+                "Konfiguration", options=configs, key="cmp_load_sel",
+                label_visibility="collapsed"
+            )
+            if st.button("Laden", key="cmp_load_btn"):
+                loaded = _load_config(sel)
+                if loaded:
+                    st.session_state.cmp_files = loaded.get("files", [])
+                    st.session_state.cmp_charts = loaded.get("charts", [])
+                    st.session_state.cmp_data = {}
+                    st.success(f"Geladen: {sel}")
+                    st.rerun()
+                else:
+                    st.error("Laden fehlgeschlagen.")
+        else:
+            st.caption("Noch keine gespeicherten Konfigurationen.")

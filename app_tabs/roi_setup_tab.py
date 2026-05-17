@@ -6,6 +6,15 @@ session-state conventions remain shared during the incremental split.
 
 def render(ns):
     globals().update(ns)
+    # Re-derive ROI_NAMES from the live session-state catalog so newly added
+    # custom names appear in the Name selectbox without requiring a full reload.
+    try:
+        from app_tabs.roi_catalog_tab import all_roi_names as _ani_live
+        _live_cat = st.session_state.get("roi_catalog") or {}
+        if _live_cat:
+            globals()["ROI_NAMES"] = _ani_live(_live_cat)
+    except Exception:
+        pass
     has_pyarrow = bool(globals().get("HAS_PYARROW", False))
     _scroll_to_top_once()
     if not _has_media_source():
@@ -369,6 +378,21 @@ def render(ns):
             _sel = st.session_state.selected_roi
             _tbl_h = min(220, 38 * (len(_rois) + 1) + 4) if _rois else 80
             _sel_col = "__sel__"
+
+            # Plausibility check helper — uses catalog bounds if available
+            def _plaus_check(roi_name: str, ocr_val: str) -> str:
+                if not ocr_val:
+                    return ""
+                try:
+                    cat = st.session_state.get("roi_catalog") or {}
+                    bounds = (cat.get("plausibility") or {}).get(roi_name)
+                    if not bounds:
+                        return "–"
+                    v = float(ocr_val)
+                    lo, hi = float(bounds.get("min", float("-inf"))), float(bounds.get("max", float("inf")))
+                    return "✅" if lo <= v <= hi else f"⚠️ [{lo}…{hi}]"
+                except Exception:
+                    return "–"
             _base_rows = [
                 {
                     _sel_col: bool(i == _sel),
@@ -379,10 +403,11 @@ def render(ns):
                     "OCR OK": bool(r.get("ocr_test_ok", False)),
                     "OCR Wert": str(r.get("ocr_test_value", "")),
                     "OCR Details": str(r.get("ocr_test_details", "")),
+                    "Plausibel": _plaus_check(r.get("name",""), r.get("ocr_test_value","")),
                 }
                 for i, r in enumerate(_rois)
             ]
-            _roi_cols = [_sel_col, "Name", "Format", "Pattern", "Scale", "OCR OK", "OCR Wert", "OCR Details"]
+            _roi_cols = [_sel_col, "Name", "Format", "Pattern", "Scale", "OCR OK", "OCR Wert", "Plausibel", "OCR Details"]
             _base_df = pd.DataFrame(_base_rows, columns=_roi_cols)
             if _base_df.empty:
                 _base_df = pd.DataFrame(
@@ -394,6 +419,7 @@ def render(ns):
                         "Scale": pd.Series(dtype="float"),
                         "OCR OK": pd.Series(dtype="bool"),
                         "OCR Wert": pd.Series(dtype="object"),
+                        "Plausibel": pd.Series(dtype="object"),
                         "OCR Details": pd.Series(dtype="object"),
                     }
                 )
@@ -413,15 +439,35 @@ def render(ns):
 
             if _sel_col not in df_edit.columns:
                 df_edit[_sel_col] = False
+
+            # Build prioritized FMT options based on the SELECTED ROI's name only,
+            # so the priority items for the active row appear first in the dropdown.
+            _catalog_now = st.session_state.get("roi_catalog") or {}
+            _fp_now: dict = _catalog_now.get("fmt_priority") or {}
+            _sel_roi_name = str(_rois[_sel].get("name", "")) if isinstance(_sel, int) and 0 <= _sel < len(_rois) else ""
+            _prio_first = [f for f in (_fp_now.get(_sel_roi_name) or []) if f in FMT_OPTIONS]
+            _fmt_opts_ordered = _prio_first + [f for f in FMT_OPTIONS if f not in _prio_first]
+
+            # Format and Plausibel are always taken from st.session_state.rois so the
+            # DataFrame passed to data_editor is stable across reruns while a user edit
+            # is pending. A stable `data` means Streamlit preserves the pending edit
+            # (its internal delta) instead of resetting the widget to the data value.
             df_edit = pd.DataFrame(
                 {
                     _sel_col: pd.Series([bool(v) for v in df_edit[_sel_col].tolist()], dtype="bool"),
                     "Name": pd.Series([str(v) for v in df_edit["Name"].tolist()], dtype="object"),
-                    "Format": pd.Series([str(v) if str(v) != "custom" else "any" for v in df_edit["Format"].tolist()], dtype="object"),
+                    "Format": pd.Series(
+                        [str(r.get("fmt", "any")) if str(r.get("fmt", "any")) != "custom" else "any" for r in _rois],
+                        dtype="object",
+                    ),
                     "Pattern": pd.Series([str(v) for v in df_edit.get("Pattern", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
                     "Scale": pd.Series([float(v or 1.2) for v in df_edit.get("Scale", pd.Series([float(st.session_state.get("roi_global_scale", 1.2))] * len(df_edit))).tolist()], dtype="float"),
                     "OCR OK": pd.Series([bool(v) for v in df_edit.get("OCR OK", pd.Series([False] * len(df_edit))).tolist()], dtype="bool"),
                     "OCR Wert": pd.Series([str(v) for v in df_edit.get("OCR Wert", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
+                    "Plausibel": pd.Series(
+                        [_plaus_check(str(r.get("name", "")), str(r.get("ocr_test_value", ""))) for r in _rois],
+                        dtype="object",
+                    ),
                     "OCR Details": pd.Series([str(v) for v in df_edit.get("OCR Details", pd.Series([""] * len(df_edit))).tolist()], dtype="object"),
                 },
                 columns=_roi_cols,
@@ -433,11 +479,12 @@ def render(ns):
                     column_config={
                         _sel_col: st.column_config.CheckboxColumn("", width=42),
                         "Name": st.column_config.SelectboxColumn("Name", options=ROI_NAMES, width=150),
-                        "Format": st.column_config.SelectboxColumn("Format", options=FMT_OPTIONS, width=170),
+                        "Format": st.column_config.SelectboxColumn("Format", options=_fmt_opts_ordered, width=170),
                         "Pattern": st.column_config.TextColumn("Pat.", width=56, disabled=True),
                         "Scale": st.column_config.NumberColumn("Sc.", width=52, disabled=True),
                         "OCR OK": st.column_config.CheckboxColumn("OCR OK", width=70, disabled=True),
                         "OCR Wert": st.column_config.TextColumn("OCR Wert", width=110, disabled=True, help="OCR-Testwert; Details stehen in der Spalte OCR Details."),
+                        "Plausibel": st.column_config.TextColumn("Plausibel", width=100, disabled=True, help="Prüft ob OCR-Wert innerhalb der Grenzen aus ROI Katalog liegt."),
                         "OCR Details": st.column_config.TextColumn("OCR Details", width=210, disabled=True, help="raw, conf, scale und frUp aus dem letzten OCR-Test."),
                     },
                     num_rows="fixed",
@@ -466,12 +513,22 @@ def render(ns):
                 ]
                 _newly_sel = int(_checked_rows[0]) if _checked_rows else _sel
                 _meta_changed = False
+                _name_changed = False
+                _catalog = st.session_state.get("roi_catalog") or {}
+                _fmt_prio: dict = _catalog.get("fmt_priority") or {}
                 for _i, _row in edited_df.iterrows():
                     _r = _rois[_i]
                     _nn = str(_row["Name"]) if pd.notna(_row["Name"]) else _r.get("name", "_")
                     _nf = str(_row["Format"]) if pd.notna(_row["Format"]) else _r.get("fmt", "any")
                     if _nf == "custom":
                         _nf = "any"
+                    # When only the name changed (format untouched by user), auto-apply
+                    # the first catalog priority FMT for the new name.
+                    if _r.get("name") != _nn and _nf == _r.get("fmt", "any"):
+                        _prio = [f for f in (_fmt_prio.get(_nn) or []) if f in FMT_OPTIONS]
+                        if _prio:
+                            _nf = _prio[0]
+                        _name_changed = True
                     if (_r.get("name") != _nn or _r.get("fmt") != _nf):
                         st.session_state.rois[_i] = {**_r, "name": _nn, "fmt": _nf}
                         st.session_state.rois[_i].pop("pattern", None)
@@ -489,7 +546,11 @@ def render(ns):
                     st.session_state.roi_wait_user_move = True
                     st.session_state.roi_reject_anchor_events = 0
                     st.rerun()
-                if _meta_changed:
+                if _name_changed:
+                    # Rerun immediately so the Format dropdown refreshes its priority
+                    # order before the user picks a format. Without this, the dropdown
+                    # still shows the old order, and the subsequent format click lands
+                    # on the wrong value because df_edit["Format"] changes mid-interaction.
                     st.rerun()
             act_sel = st.session_state.selected_roi
 

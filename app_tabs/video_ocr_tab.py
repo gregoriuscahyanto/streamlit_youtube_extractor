@@ -12,6 +12,9 @@ def render(ns):
     st.session_state.setdefault("video_ocr_full_progress", {})
     st.session_state.setdefault("video_ocr_full_live_rows", [])
     st.session_state.setdefault("video_ocr_full_target_fps", "2")
+    st.session_state.setdefault("ocr_scope_charts", [
+        {"title": "Diagramm 1", "x_col": "time_s", "y_cols": [], "plot_type": "line"},
+    ])
 
     def _is_running() -> bool:
         fut = st.session_state.get("video_ocr_full_future")
@@ -339,45 +342,136 @@ def render(ns):
 
         st.dataframe(_df, use_container_width=True, hide_index=True, height=260 if _rows else 120)
 
-        # ── Live-Scope Diagramm ───────────────────────────────────────────────
-        st.caption("Live-Scope: Diagramm der OCR-Werte")
+        # ── Live-Scope Diagramme ──────────────────────────────────────────────
+        st.markdown("#### Live-Diagramme")
 
-        if _avail:
-            _sc1, _sc2 = st.columns([2, 3])
-            _x_def = "time_s" if "time_s" in _num else (_num[0] if _num else _avail[0])
-            _x_idx = _num.index(_x_def) if _x_def in _num else 0
-            _sx = _sc1.selectbox("X-Achse", options=_num or _avail, index=_x_idx, key="ocr_scope_x")
-            _y_def = [c for c in _num if c not in ("frame_idx", "time_s", "track_minimap_found")]
-            _sy = _sc2.multiselect(
-                "Y-Achse (mehrere möglich)",
-                options=[c for c in _num if c != _sx],
-                default=[c for c in (_y_def or _num) if c != _sx][:3],
-                key="ocr_scope_y",
-            )
-            if _sx and _sy and not _df.empty:
-                try:
-                    import plotly.graph_objects as go
-                    _fig = go.Figure()
-                    for _yc in _sy:
-                        _fig.add_trace(go.Scatter(
-                            x=_df[_sx], y=_df[_yc],
-                            mode="lines+markers", name=_yc, marker=dict(size=4),
-                        ))
-                    _fig.update_layout(
-                        margin=dict(l=40, r=20, t=30, b=40), height=320,
-                        xaxis_title=_sx, yaxis_title="Wert",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        template="plotly_dark",
+        _has_geo = (
+            not _df.empty
+            and "track_xy_x" in _df.columns
+            and "track_xy_y" in _df.columns
+        )
+        _plot_type_labels = {"line": "Linie", "scatter": "Punkte", "geoplot": "Geoplot"}
+        _plot_type_opts = ["line", "scatter"] + (["geoplot"] if _has_geo else [])
+
+        _charts = st.session_state.ocr_scope_charts
+        _to_remove = None
+
+        for _ci, _chart in enumerate(_charts):
+            with st.container(border=True):
+                _hc1, _hc2 = st.columns([6, 1])
+                _chart["title"] = _hc1.text_input(
+                    "Titel", value=_chart.get("title", f"Diagramm {_ci+1}"),
+                    key=f"ls_ctitle_{_ci}", label_visibility="collapsed",
+                )
+                if _hc2.button("✕", key=f"ls_rm_{_ci}", help="Diagramm entfernen"):
+                    _to_remove = _ci
+
+                _cur_type = _chart.get("plot_type", "line")
+                if _cur_type not in _plot_type_opts:
+                    _cur_type = _plot_type_opts[0]
+
+                if _cur_type == "geoplot":
+                    # type selector spans full row for geoplot
+                    _chart["plot_type"] = st.selectbox(
+                        "Art",
+                        options=_plot_type_opts,
+                        index=_plot_type_opts.index(_cur_type),
+                        format_func=_plot_type_labels.get,
+                        key=f"ls_ctype_{_ci}",
+                        label_visibility="collapsed",
                     )
-                    st.plotly_chart(_fig, use_container_width=True)
-                except Exception as _pe:
-                    st.caption(f"Diagramm nicht verfügbar: {_pe}")
-            elif not _sy:
-                st.caption("Mindestens eine Y-Achse auswählen.")
-            else:
-                st.caption("Warte auf Daten ...")
-        else:
-            st.caption("Noch keine Daten — Diagramm erscheint sobald OCR läuft.")
+                else:
+                    _cc1, _cc2, _cc3 = st.columns([2, 2, 3])
+                    _chart["plot_type"] = _cc1.selectbox(
+                        "Art",
+                        options=_plot_type_opts,
+                        index=_plot_type_opts.index(_cur_type),
+                        format_func=_plot_type_labels.get,
+                        key=f"ls_ctype_{_ci}",
+                        label_visibility="collapsed",
+                    )
+                    _x_opts = _num or _avail
+                    _x_def = _chart.get("x_col", "time_s")
+                    _x_idx = _x_opts.index(_x_def) if _x_def in _x_opts else 0
+                    _chart["x_col"] = _cc2.selectbox(
+                        "X-Achse", options=_x_opts, index=_x_idx,
+                        key=f"ls_cx_{_ci}",
+                    )
+                    _y_opts = [c for c in _num if c != _chart["x_col"]]
+                    _y_cur = [c for c in (_chart.get("y_cols") or []) if c in _y_opts]
+                    _chart["y_cols"] = _cc3.multiselect(
+                        "Y-Achse", options=_y_opts, default=_y_cur,
+                        key=f"ls_cy_{_ci}",
+                    )
+
+                # ── Render ────────────────────────────────────────────────────
+                _ptype = _chart.get("plot_type", "line")
+                if _ptype == "geoplot":
+                    if _has_geo:
+                        try:
+                            from app_tabs.track_geoplot import transform_centerline, make_geoplot_figure
+                            _xs = _df["track_xy_x"].tolist()
+                            _ys = _df["track_xy_y"].tolist()
+                            _ts = _df["time_s"].tolist() if "time_s" in _df.columns else None
+                            _cl_xy = None
+                            _cl_px = st.session_state.get("centerline_px")
+                            _mini = st.session_state.get("minimap_pts")
+                            _ref = st.session_state.get("ref_track_pts")
+                            if _cl_px is not None and _mini and _ref:
+                                _cl_px_l = _cl_px.tolist() if hasattr(_cl_px, "tolist") else list(_cl_px)
+                                _cl_xy = transform_centerline(_cl_px_l, _mini, _ref)
+                            st.plotly_chart(
+                                make_geoplot_figure(
+                                    [{"name": "Fahrzeug", "xs": _xs, "ys": _ys, "ts": _ts}],
+                                    centerline_xy=_cl_xy,
+                                ),
+                                use_container_width=True,
+                            )
+                        except Exception as _ge:
+                            st.caption(f"Geoplot-Fehler: {_ge}")
+                    else:
+                        st.caption("track_xy_x/y nicht in den aktuellen Daten vorhanden.")
+                else:
+                    _y_cols = _chart.get("y_cols") or []
+                    if _y_cols and not _df.empty:
+                        try:
+                            import plotly.graph_objects as go
+                            _mode = "lines" if _ptype == "line" else "markers"
+                            _fig = go.Figure()
+                            for _yc in _y_cols:
+                                if _yc in _df.columns:
+                                    _fig.add_trace(go.Scatter(
+                                        x=_df[_chart["x_col"]], y=_df[_yc],
+                                        mode=_mode, name=_yc,
+                                        marker=dict(size=4) if _mode == "markers" else {},
+                                    ))
+                            _fig.update_layout(
+                                title=_chart.get("title", ""),
+                                margin=dict(l=40, r=20, t=30, b=40), height=300,
+                                xaxis_title=_chart["x_col"], yaxis_title="Wert",
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                template="plotly_dark",
+                            )
+                            st.plotly_chart(_fig, use_container_width=True)
+                        except Exception as _pe:
+                            st.caption(f"Diagramm-Fehler: {_pe}")
+                    elif not _y_cols:
+                        st.caption("Y-Achse auswählen.")
+                    else:
+                        st.caption("Warte auf Daten ...")
+
+        if _to_remove is not None:
+            _charts.pop(_to_remove)
+            st.rerun()
+
+        if st.button("+ Diagramm hinzufügen", key="ls_add_chart"):
+            _charts.append({
+                "title": f"Diagramm {len(_charts) + 1}",
+                "x_col": "time_s",
+                "y_cols": [],
+                "plot_type": "line",
+            })
+            st.rerun()
 
         _last = st.session_state.get("video_ocr_full_result") or {}
         if isinstance(_last, dict) and _last:

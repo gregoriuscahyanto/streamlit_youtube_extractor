@@ -8,30 +8,48 @@ def render(ns):
     st.markdown('<div class="section-title">Watchdog Dashboard</div>', unsafe_allow_html=True)
     st.caption("Watchdog-Agent im Hintergrund: MAT->JSON, YouTube-Download und OCR (pro Task auswählbar).")
 
+    from core.watchdog_state import _YT_WATCHDOG, _YT_WATCHDOG_LOCK
+
     snap = _yt.watchdog_snapshot()
     is_running = bool(snap.get("running"))
     interval_sec = int(snap.get("interval_sec", 10) or 10)
 
-    # Config form (no rerun on checkbox click)
-    with st.form("watchdog_config_form", border=False):
-        st.markdown("**Aktive Aufgaben**")
-        t1, t2 = st.columns(2)
-        task_mat_json = t1.checkbox(
-            "Konvertierung MAT -> JSON",
-            value=bool(st.session_state.get("yt_watchdog_task_mat_json", False)),
-            disabled=is_running,
-        )
-        task_download = t2.checkbox(
-            "YouTube Download",
-            value=bool(st.session_state.get("yt_watchdog_task_download", False)),
-            disabled=is_running,
-        )
-        task_ocr = st.checkbox(
-            "OCR Auswertung",
-            value=bool(st.session_state.get("yt_watchdog_task_ocr", True)),
-            disabled=is_running,
-        )
+    # ── Aktive Aufgaben — immer editierbar, wirken beim nächsten Tick ─────────
+    st.markdown("**Aktive Aufgaben**")
+    st.caption("Änderungen werden beim nächsten Tick übernommen, ohne die laufende Aufgabe zu unterbrechen.")
+    t1, t2 = st.columns(2)
+    task_mat_json = t1.checkbox(
+        "Konvertierung MAT → JSON",
+        value=bool(st.session_state.get("yt_watchdog_task_mat_json", False)),
+        key="wd_task_mat_json_cb",
+    )
+    task_download = t2.checkbox(
+        "YouTube Download",
+        value=bool(st.session_state.get("yt_watchdog_task_download", False)),
+        key="wd_task_download_cb",
+    )
+    task_ocr = st.checkbox(
+        "OCR Auswertung",
+        value=bool(st.session_state.get("yt_watchdog_task_ocr", True)),
+        key="wd_task_ocr_cb",
+    )
 
+    # Persist to session state and push live to the running watchdog thread.
+    st.session_state.yt_watchdog_task_mat_json = task_mat_json
+    st.session_state.yt_watchdog_task_download = task_download
+    st.session_state.yt_watchdog_task_ocr = task_ocr
+    if is_running:
+        _new_tasks = {
+            "mat_json": task_mat_json,
+            "download": task_download,
+            "ocr": task_ocr,
+        }
+        with _YT_WATCHDOG_LOCK:
+            if _YT_WATCHDOG.get("tasks") != _new_tasks:
+                _YT_WATCHDOG["tasks"] = _new_tasks
+
+    # ── Start / Stop form ─────────────────────────────────────────────────────
+    with st.form("watchdog_config_form", border=False):
         _ocr_fps_options = ["2", "1", "max"]
         _ocr_fps_labels = {"2": "2 fps (Standard)", "1": "1 fps", "max": "max (native fps)"}
         _ocr_fps_cur = str(st.session_state.get("yt_watchdog_ocr_fps", "2") or "2")
@@ -67,9 +85,6 @@ def render(ns):
         )
 
     if start_clicked:
-        st.session_state.yt_watchdog_task_mat_json = bool(task_mat_json)
-        st.session_state.yt_watchdog_task_download = bool(task_download)
-        st.session_state.yt_watchdog_task_ocr = bool(task_ocr)
         st.session_state.yt_watchdog_ocr_fps = str(ocr_fps)
         st.session_state.yt_watchdog_interval_sec_cmd = int(wd_interval)
         st.session_state.yt_watchdog_cmd = "start"
