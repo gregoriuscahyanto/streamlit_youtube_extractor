@@ -16,6 +16,7 @@ def watchdog_snapshot() -> dict:
         running = bool(_YT_WATCHDOG.get("running")) and th is not None and th.is_alive()
         if not running:
             _YT_WATCHDOG["running"] = False
+        ocr_live = dict(_YT_WATCHDOG.get("ocr_live") or {})
         return {
             "running": running,
             "interval_sec": int(_YT_WATCHDOG.get("interval_sec", 10) or 10),
@@ -27,6 +28,7 @@ def watchdog_snapshot() -> dict:
             "errors": int(_YT_WATCHDOG.get("errors", 0) or 0),
             "tasks": dict(_YT_WATCHDOG.get("tasks") or {}),
             "logs": list(_YT_WATCHDOG.get("logs") or []),
+            "ocr_live": ocr_live,
         }
 
 
@@ -1123,11 +1125,29 @@ def render(ns):
                         break
                 pct = int(100 * frame_idx / max(1, total_frames))
                 _wd_set_current(f"OCR: {folder} – Frame {frame_idx}/{total_frames} ({pct}%)")
+                # Push live state for Video OCR Full tab (atomic dict swap, no lock needed).
+                _live_row = {"time_s": round(time_s, 3), "frame_idx": frame_idx}
+                for _k, _v in clean_cols.items():
+                    if _k not in ("time_s", "frame_idx") and _v:
+                        _live_row[_k] = _v[-1]
+                _ocr_live = _YT_WATCHDOG.get("ocr_live") or {}
+                _prev_rows = _ocr_live.get("rows") or []
+                _new_rows = (_prev_rows + [_live_row])[-120:]
+                _YT_WATCHDOG["ocr_live"] = {
+                    "folder": folder,
+                    "done": frame_idx,
+                    "total": total_frames,
+                    "t_s": round(time_s, 3),
+                    "rows": _new_rows,
+                    "active": True,
+                }
                 if _processed_count % _pct_log_every == 0:
                     _wd_log(f"OCR {folder}: {pct}% (Frame {frame_idx}/{total_frames})")
                     _save_ocr_progress(partial=True)
         finally:
             cap.release()
+
+        _YT_WATCHDOG["ocr_live"] = {"folder": folder, "active": False}
 
         if _stopped_early:
             if _n_rows > 0:
@@ -1264,6 +1284,20 @@ def render(ns):
         rows_now = _read_db()
         _wd_log(f"DB: {len(rows_now)} Einträge geladen")
 
+        # Also scan results/*.json directly — picks up MAT-converted files not in YouTube DB.
+        # Only needed when OCR is active; de-duplicated by capture_folder.
+        if task_ocr:
+            try:
+                known_cf = {str(r.get("capture_folder") or "").strip() for r in rows_now if str(r.get("capture_folder") or "").strip()}
+                for jr in _rows_from_results_json():
+                    cf = str(jr.get("capture_folder") or "").strip()
+                    if cf and cf not in known_cf:
+                        rows_now = list(rows_now) + [jr]
+                        known_cf.add(cf)
+                _wd_log(f"Gesamt (DB + results/): {len(rows_now)} Ordner")
+            except Exception as _e:
+                _wd_log(f"results/-Scan Fehler: {_e}")
+
         with _YT_WATCHDOG_LOCK:
             ocr_skip_now: set = set(_YT_WATCHDOG.get("ocr_skip", set()))
 
@@ -1362,8 +1396,12 @@ def render(ns):
                         _YT_WATCHDOG.setdefault("ocr_skip", set()).add(folder)
                     return True
 
-        _wd_log("Tick abgeschlossen: nichts zu tun")
+        _wd_log("Tick abgeschlossen: nichts zu tun – starte Suche neu (ocr_skip zurückgesetzt)")
         _wd_set_current("")
+        # Reset skip-set so the next pass re-evaluates all folders from scratch,
+        # catching files that gained ROI calibration since the last pass.
+        with _YT_WATCHDOG_LOCK:
+            _YT_WATCHDOG["ocr_skip"] = set()
         return False
 
     def _wd_loop(stop_event, cfg: dict) -> None:
@@ -1374,7 +1412,13 @@ def render(ns):
                 with _YT_WATCHDOG_LOCK:
                     _YT_WATCHDOG["last_tick"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 sleep_s = 1 if progressed else max(2, int(cfg.get("interval_sec", 20) or 20))
+                if not progressed:
+                    next_ts = (datetime.now() + __import__("datetime").timedelta(seconds=sleep_s)).strftime("%H:%M:%S")
+                    _wd_log(f"Warte {sleep_s}s – nächster Tick um {next_ts}")
+                    _wd_set_current(f"Warte {sleep_s}s (nächster Tick: {next_ts})")
                 stop_event.wait(float(sleep_s))
+                if not progressed and not stop_event.is_set():
+                    _wd_set_current("")
             except Exception as e:
                 _wd_inc("errors")
                 _wd_log(f"Watchdog Exception: {e.__class__.__name__}: {e}")

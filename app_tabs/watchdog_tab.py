@@ -109,7 +109,7 @@ def render(ns):
         srv_port = 0
 
     if srv_port:
-        poll_ms = max(1000, interval_sec * 1000)
+        poll_ms = 2000  # always 2s regardless of interval_sec so the log stays live
         html = f"""
 <style>
   #wd-log {{

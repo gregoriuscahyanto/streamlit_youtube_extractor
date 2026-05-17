@@ -42,16 +42,25 @@ def render(ns):
         wd_running = bool(wd_snap.get("running"))
         wd_current = str(wd_snap.get("current") or "")
         capture_folder_now = _current_capture_folder() or str(st.session_state.get("capture_folder") or "").strip()
-        wd_ocr_active = wd_running and "OCR" in wd_current and capture_folder_now and capture_folder_now in wd_current
+        wd_ocr_active = bool(wd_running and "OCR" in wd_current and capture_folder_now and capture_folder_now in wd_current)
+        wd_ocr_running = bool(wd_running and "OCR" in wd_current)
     except Exception:
+        wd_snap = {}
         wd_running = False
         wd_current = ""
         wd_ocr_active = False
+        wd_ocr_running = False
 
     if wd_ocr_active:
         st.info(
             f"**Watchdog läuft automatisiert:** {wd_current}\n\n"
             "OCR wird im Hintergrund durchgeführt. Manuelle Auswertung ist währenddessen deaktiviert.",
+            icon="🤖",
+        )
+    elif wd_ocr_running:
+        _wd_live_folder_hint = str((wd_snap.get("ocr_live") or {}).get("folder") or "")
+        st.info(
+            f"**Watchdog OCR läuft** für Ordner: `{_wd_live_folder_hint or wd_current}` — Live-Daten werden unten angezeigt.",
             icon="🤖",
         )
     elif wd_running:
@@ -274,29 +283,24 @@ def render(ns):
     done_n = int(prog.get("done", 0) or 0)
     total_n = int(max(1, int(prog.get("total", 1) or 1)))
     t_s = float(prog.get("t_s", 0.0) or 0.0)
-    # If watchdog OCR is active for this folder, display watchdog live progress/values.
     live_rows = list(st.session_state.get("video_ocr_full_live_rows") or [])
-    if wd_ocr_active and capture_folder:
-        wd_prog, wd_rows, wd_json = _watchdog_live_ocr_for_folder(capture_folder, wd_current)
-        if wd_prog:
-            done_n = int(wd_prog.get("done", done_n) or done_n)
-            total_n = int(max(1, int(wd_prog.get("total", total_n) or total_n)))
-            t_s = float(wd_prog.get("t_s", t_s) or t_s)
-            live_rows = wd_rows if wd_rows else live_rows
-            st.caption(
-                f"Watchdog OCR-Live: rows={int(wd_prog.get('rows', 0) or 0)} | "
-                f"partial={bool(wd_prog.get('partial'))} | json={wd_json or '-'}"
-            )
+
+    # Pull live progress from _YT_WATCHDOG["ocr_live"] whenever watchdog is doing OCR
+    # (any folder — not just the one currently loaded in the UI).
+    if wd_ocr_running:
+        _wd_live = dict(wd_snap.get("ocr_live") or {})
+        if _wd_live.get("active"):
+            done_n = int(_wd_live.get("done", done_n) or done_n)
+            total_n = int(max(1, int(_wd_live.get("total", total_n) or total_n)))
+            t_s = float(_wd_live.get("t_s", t_s) or t_s)
+            _wd_rows = list(_wd_live.get("rows") or [])
+            if _wd_rows:
+                live_rows = _wd_rows
 
     st.progress(min(1.0, done_n / total_n), text=f"{done_n}/{total_n} Frames | t={t_s:.2f}s")
 
     if running or _is_running():
         st.info("Video OCR läuft im Hintergrund. Fortschritt und Werte werden live aktualisiert.", icon="⏳")
-    if wd_ocr_active:
-        st.info(
-            "**Watchdog steuert OCR.** Ergebnisse werden direkt aus dem JSON gelesen.",
-            icon="🤖",
-        )
 
     # ── Live-Progress Tabelle ─────────────────────────────────────────────────
     st.caption("Live-Progress (OCR-Werte je Update):")
@@ -373,6 +377,6 @@ def render(ns):
         else:
             st.caption(f"Letzter Lauf fehlgeschlagen: {str(last.get('error', ''))}")
 
-    if running or _is_running() or wd_ocr_active:
+    if running or _is_running() or wd_ocr_running:
         time.sleep(0.25)
         st.rerun()

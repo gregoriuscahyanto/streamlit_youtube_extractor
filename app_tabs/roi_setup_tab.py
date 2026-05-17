@@ -86,23 +86,26 @@ def render(ns):
             st.markdown('<div class="section-card">', unsafe_allow_html=True)
             st.markdown('<div id="roi-left-width-probe"></div>', unsafe_allow_html=True)
             _sc1, _sc2 = st.columns(2)
-            _min_gap = 1.0 / max(fps, 1.0)
-            _start_max = max(0.0, float(st.session_state.t_end) - _min_gap)
+            _min_gap = max(1.0 / max(fps, 1.0), step_s)
+            _dur = float(dur)
+            _start_max = max(0.0, min(float(st.session_state.t_end) - _min_gap, _dur - _min_gap))
+            _start_max = max(0.0, _start_max)  # never negative
             t_start = _sc1.slider(
                 "Start [s]",
                 0.0,
-                float(_start_max),
+                float(_start_max) if _start_max > 0.0 else 0.001,
                 float(min(max(st.session_state.t_start, 0.0), _start_max)),
                 step=step_s,
                 format="%d s",
                 key="sl_start",
             )
-            _end_min = min(float(dur), float(t_start) + _min_gap)
+            _end_min = float(t_start) + _min_gap
+            _end_max = max(_end_min + step_s, _dur)  # ensure max > min always
             t_end_raw = _sc2.slider(
                 "Ende [s]",
                 float(_end_min),
-                float(dur),
-                float(min(max(st.session_state.t_end, _end_min), float(dur))),
+                float(_end_max),
+                float(min(max(st.session_state.t_end, _end_min), float(_end_max))),
                 step=step_s,
                 format="%d s",
                 key="sl_end",

@@ -84,9 +84,12 @@ def _read_json_detail(jp: Path) -> dict:
         ocr_st = "teilweise"
     else:
         ocr_st = "nein"
-    # video_faulty: set during ROI setup when video is marked as defective
+    # video_faulty / no_roi_available: stamps set during ROI setup
     video_faulty = bool(ocr.get("video_faulty")) or bool(
         (meta.get("video_faulty") if isinstance(meta, dict) else False)
+    )
+    no_roi_available = bool(ocr.get("no_roi_available")) or bool(
+        (meta.get("no_roi_available") if isinstance(meta, dict) else False)
     )
 
     # Determine if track_minimap ROI is present in roi_table.
@@ -161,6 +164,7 @@ def _read_json_detail(jp: Path) -> dict:
         "audio_config": bool(rr.get("audio_config")),
         "validierung": bool(rr.get("audio_validation")),
         "video_faulty": video_faulty,
+        "no_roi_available": no_roi_available,
     }
     _DETAIL_CACHE[cache_key] = (mtime, detail)
     return detail

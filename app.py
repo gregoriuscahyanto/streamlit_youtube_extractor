@@ -581,6 +581,34 @@ if bool(st.session_state.get("roi_next_load_running", False)):
     _render_blocking_overlay("Nächste Datei wird geladen ...")
 
 
+def _activate_tab_once() -> None:
+    """Click the tab whose label matches tab_default, then clear it."""
+    label = str(st.session_state.get("tab_default") or "").strip()
+    if not label:
+        return
+    st.session_state.tab_default = None
+    if streamlit_js_eval is None:
+        return
+    js = f"""
+(function() {{
+  var label = {json.dumps(label)};
+  var doc = window.parent.document;
+  var tabs = doc.querySelectorAll('[role="tab"]');
+  for (var i = 0; i < tabs.length; i++) {{
+    if (tabs[i].textContent.trim() === label) {{
+      tabs[i].click();
+      return;
+    }}
+  }}
+}})();
+true
+"""
+    try:
+        streamlit_js_eval(js_expressions=js, key=f"_tab_switch_{int(time.time()*1000)}", want_output=False)
+    except Exception:
+        pass
+
+
 def _scroll_to_top_once(flag_key: str = "roi_scroll_top_once"):
     if not bool(st.session_state.get(flag_key, False)):
         return
@@ -5266,61 +5294,82 @@ def _invalidate_and_update_mat_selection_for_capture(capture_folder: str, mat_ke
     except Exception as e:
         set_status(f"MAT Selection konnte nicht aktualisiert werden: {e}", "warn")
 def _find_next_roi_setup_target() -> dict | None:
-    """Return next capture with reduced audio+video in cloud but without ROI parameters."""
-    rows = list(st.session_state.get("mat_overview_rows") or [])
-    if not rows and st.session_state.get("mat_targets"):
-        try:
-            _update_all_mat_overview_rows(st.session_state.mat_targets)
-            rows = list(st.session_state.get("mat_overview_rows") or [])
-        except Exception:
-            rows = []
+    """Return next local capture that has video + audio but no complete ROI."""
+    base_lp = str(st.session_state.get("local_base_path") or "").strip()
+    if not base_lp:
+        return None
+    base = Path(base_lp).expanduser().resolve()
+    res_dir = base / "results"
+    cap_root = base / "captures"
+    if not res_dir.exists():
+        return None
     current = _current_capture_folder()
-    candidates = []
-    for idx, row in enumerate(rows):
-        folder = str(row.get("mat_datei", "") or "").strip()
-        if not folder:
-            folder = _mat_capture_guess_from_key(str(row.get("remote_key", "") or ""))
-        if not folder or folder == current:
+    video_exts = {".mp4", ".mov", ".avi", ".mkv"}
+    audio_exts = {".wav", ".mp3", ".m4a", ".aac", ".flac"}
+    try:
+        from app_tabs.media_tab import _read_json_detail
+    except Exception:
+        _read_json_detail = None
+    for jp in sorted(res_dir.glob("results_*.json")):
+        folder = jp.stem.replace("results_", "", 1)
+        if folder == current:
             continue
-        media_ok = _overview_status_is_green(row.get("audio_video_vorhanden"))
-        no_roi_stamped = _overview_status_is_green(row.get("kein_roi_vorhanden"))
-        video_faulty_stamped = _overview_status_is_green(row.get("video_fehlerhaft"))
-        roi_missing = not _overview_status_is_green(row.get("roi_ausgewaehlt"))
-        if media_ok and roi_missing and not no_roi_stamped and not video_faulty_stamped:
-            candidates.append({"idx": idx, "folder": folder, "remote_key": str(row.get("remote_key", "") or "")})
-    if candidates:
-        return candidates[0]
-
-    for t in list(st.session_state.get("mat_targets") or []):
-        folder = str(t.get("folder", "") or "").strip()
-        if not folder or folder == current:
+        cap_dir = cap_root / folder
+        has_video = has_audio = False
+        if cap_dir.exists():
+            for f in cap_dir.iterdir():
+                if not f.is_file() or f.stat().st_size <= 0:
+                    continue
+                ext = f.suffix.lower()
+                if ext in video_exts:
+                    has_video = True
+                elif ext in audio_exts:
+                    has_audio = True
+        if not (has_video and has_audio):
             continue
-        key = str(t.get("mat_key", "") or "")
-        try:
-            summary = _get_mat_summary_from_r2(key) if key else _compute_folder_only_summary(folder, st.session_state.r2_client, st.session_state.r2_prefix.strip("/"))
-            if bool(summary.get("video_file_exists")) and bool(summary.get("audio_file_exists")) and not bool(summary.get("roi_selected")) and not bool(summary.get("no_roi_available")) and not bool(summary.get("video_faulty")):
-                return {"idx": -1, "folder": folder, "remote_key": key}
-        except Exception:
-            continue
+        if callable(_read_json_detail):
+            detail = _read_json_detail(jp)
+            if detail.get("video_faulty"):
+                continue
+            if detail.get("no_roi_available"):
+                continue
+            roi_status = detail.get("roi_status", "nein")
+            if roi_status == "vollständig":
+                continue
+        else:
+            try:
+                doc = json.loads(jp.read_text(encoding="utf-8", errors="ignore"))
+                rr = doc.get("recordResult") or {}
+                ocr = rr.get("ocr") or {}
+                meta = rr.get("metadata") or {}
+                if ocr.get("video_faulty") or meta.get("video_faulty"):
+                    continue
+                if ocr.get("no_roi_available") or meta.get("no_roi_available"):
+                    continue
+                if ocr.get("roi_table"):
+                    continue  # has ROI
+            except Exception:
+                continue
+        return {"folder": folder, "json_path": str(jp)}
     return None
 
 
 def _load_next_roi_setup_file() -> tuple[bool, str]:
-    if not st.session_state.get("r2_connected") or st.session_state.get("r2_client") is None:
-        return False, "Cloud ist nicht verbunden."
+    if not bool(st.session_state.get("local_connected")):
+        return False, "Lokale DB nicht verbunden. Bitte zuerst Ordner wählen."
     nxt = _find_next_roi_setup_target()
     if not nxt:
-        return False, "Keine nächste Datei gefunden (Audio+Video vorhanden und ROI fehlt)."
+        return False, "Keine nächste Datei gefunden (Video + Audio vorhanden, ROI fehlt oder unvollständig)."
     folder = str(nxt.get("folder") or "")
-    if not _try_load_video_for_capture_folder(folder):
-        return False, f"Reduzierte Datei konnte nicht geladen werden: {folder}"
-    st.session_state.capture_folder = str(st.session_state.get("_mat_last_video_capture_folder") or folder)
-    key = str(nxt.get("remote_key") or "")
-    if key:
-        st.session_state.mat_selected_key = key
-        st.session_state.mat_pending_selected_key = key
+    json_path_str = str(nxt.get("json_path") or "")
+    ok_vid = _try_load_video_for_capture_folder_with_fallback(folder)
+    if not ok_vid:
+        return False, f"Video konnte nicht geladen werden: {folder}"
+    st.session_state.capture_folder = folder
+    if json_path_str:
         try:
-            _analyze_mat_from_r2(key)
+            doc = json.loads(Path(json_path_str).read_text(encoding="utf-8", errors="ignore"))
+            load_json_config(doc)
         except Exception:
             pass
     st.session_state.tab_default = "ROI Setup"
@@ -7619,6 +7668,7 @@ _tab_labels = [
     "Audio Auswertung",
 ]
 _tabs = st.tabs(_tab_labels)
+_activate_tab_once()
 with _tabs[0]:
     setup_tab.render(globals())
 with _tabs[1]:
