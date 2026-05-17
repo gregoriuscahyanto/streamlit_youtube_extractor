@@ -279,104 +279,117 @@ def render(ns):
                 pass
         set_status("OCR-Stop angefordert ...", "warn")
 
-    prog = dict(st.session_state.get("video_ocr_full_progress") or {})
-    done_n = int(prog.get("done", 0) or 0)
-    total_n = int(max(1, int(prog.get("total", 1) or 1)))
-    t_s = float(prog.get("t_s", 0.0) or 0.0)
-    live_rows = list(st.session_state.get("video_ocr_full_live_rows") or [])
+    # ── Live section — wrapped in a fragment so only this part reruns ─────────
+    # st.fragment(run_every=...) reruns only this block every N seconds,
+    # without triggering a full-page rerun. Other tabs/dropdowns stay interactive.
+    def _live_section():
+        # Re-read all live state fresh on each fragment run.
+        try:
+            from app_tabs.youtube_tab import watchdog_snapshot as _wds
+            _snap = _wds()
+            _wd_run = bool(_snap.get("running"))
+            _wd_cur = str(_snap.get("current") or "")
+            _wd_ocr = bool(_wd_run and "OCR" in _wd_cur)
+        except Exception:
+            _snap = {}
+            _wd_ocr = False
 
-    # Pull live progress from _YT_WATCHDOG["ocr_live"] whenever watchdog is doing OCR
-    # (any folder — not just the one currently loaded in the UI).
-    if wd_ocr_running:
-        _wd_live = dict(wd_snap.get("ocr_live") or {})
-        if _wd_live.get("active"):
-            done_n = int(_wd_live.get("done", done_n) or done_n)
-            total_n = int(max(1, int(_wd_live.get("total", total_n) or total_n)))
-            t_s = float(_wd_live.get("t_s", t_s) or t_s)
-            _wd_rows = list(_wd_live.get("rows") or [])
-            if _wd_rows:
-                live_rows = _wd_rows
+        _manual = _is_running()
+        _prog = dict(st.session_state.get("video_ocr_full_progress") or {})
+        _done = int(_prog.get("done", 0) or 0)
+        _total = int(max(1, int(_prog.get("total", 1) or 1)))
+        _t_s = float(_prog.get("t_s", 0.0) or 0.0)
+        _rows = list(st.session_state.get("video_ocr_full_live_rows") or [])
 
-    st.progress(min(1.0, done_n / total_n), text=f"{done_n}/{total_n} Frames | t={t_s:.2f}s")
+        if _wd_ocr:
+            _live = dict(_snap.get("ocr_live") or {})
+            if _live.get("active"):
+                _done = int(_live.get("done", _done) or _done)
+                _total = int(max(1, int(_live.get("total", _total) or _total)))
+                _t_s = float(_live.get("t_s", _t_s) or _t_s)
+                _wd_rows = list(_live.get("rows") or [])
+                if _wd_rows:
+                    _rows = _wd_rows
 
-    if running or _is_running():
-        st.info("Video OCR läuft im Hintergrund. Fortschritt und Werte werden live aktualisiert.", icon="⏳")
+        st.progress(min(1.0, _done / _total), text=f"{_done}/{_total} Frames | t={_t_s:.2f}s")
 
-    # ── Live-Progress Tabelle ─────────────────────────────────────────────────
-    st.caption("Live-Progress (OCR-Werte je Update):")
-    if live_rows:
-        live_df = pd.DataFrame(live_rows)
-        st.dataframe(live_df, use_container_width=True, hide_index=True, height=260)
-    else:
-        live_df = pd.DataFrame(columns=["frame_idx", "time_s"])
-        st.dataframe(live_df, use_container_width=True, hide_index=True, height=120)
+        if _manual:
+            st.info("Video OCR läuft im Hintergrund. Fortschritt wird live aktualisiert.", icon="⏳")
 
-    # ── Live-Scope Diagramm ───────────────────────────────────────────────────
-    st.caption("Live-Scope: Diagramm der OCR-Werte")
-    _avail_cols = list(live_df.columns) if not live_df.empty else []
-    _numeric_cols = [
-        c for c in _avail_cols
-        if live_df[c].dtype.kind in "iufcb"  # int, uint, float, complex, bool
-    ] if not live_df.empty else []
-
-    if _avail_cols:
-        _sc1, _sc2 = st.columns([2, 3])
-        _x_default = "time_s" if "time_s" in _numeric_cols else (_numeric_cols[0] if _numeric_cols else _avail_cols[0])
-        _x_idx = _numeric_cols.index(_x_default) if _x_default in _numeric_cols else 0
-        _scope_x = _sc1.selectbox(
-            "X-Achse",
-            options=_numeric_cols or _avail_cols,
-            index=_x_idx,
-            key="ocr_scope_x",
-        )
-        _y_default = [c for c in _numeric_cols if c not in ("frame_idx", "time_s", "track_minimap_found")]
-        _scope_y = _sc2.multiselect(
-            "Y-Achse (mehrere möglich)",
-            options=[c for c in _numeric_cols if c != _scope_x],
-            default=[c for c in (_y_default or _numeric_cols) if c != _scope_x][:3],
-            key="ocr_scope_y",
-        )
-        if _scope_x and _scope_y and not live_df.empty:
-            try:
-                import plotly.graph_objects as go
-                _fig = go.Figure()
-                for _yc in _scope_y:
-                    _fig.add_trace(go.Scatter(
-                        x=live_df[_scope_x],
-                        y=live_df[_yc],
-                        mode="lines+markers",
-                        name=_yc,
-                        marker=dict(size=4),
-                    ))
-                _fig.update_layout(
-                    margin=dict(l=40, r=20, t=30, b=40),
-                    height=320,
-                    xaxis_title=_scope_x,
-                    yaxis_title="Wert",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    template="plotly_dark",
-                )
-                st.plotly_chart(_fig, use_container_width=True)
-            except Exception as _pe:
-                st.caption(f"Diagramm nicht verfügbar: {_pe}")
-        elif not _scope_y:
-            st.caption("Mindestens eine Y-Achse auswählen.")
+        st.caption("Live-Progress (OCR-Werte je Update):")
+        if _rows:
+            _df = pd.DataFrame(_rows)
+            # Coerce object columns to numeric — mixed rows (some empty strings, some numbers)
+            # would otherwise stay as object dtype and be excluded from the diagram selector.
+            for _col in _df.columns:
+                if _df[_col].dtype == object:
+                    _df[_col] = pd.to_numeric(_df[_col], errors="coerce")
+            st.dataframe(_df, use_container_width=True, hide_index=True, height=260)
         else:
-            st.caption("Warte auf Daten ...")
-    else:
-        st.caption("Noch keine Daten — Diagramm erscheint sobald OCR läuft.")
+            _df = pd.DataFrame(columns=["frame_idx", "time_s"])
+            st.dataframe(_df, use_container_width=True, hide_index=True, height=120)
 
-    last = st.session_state.get("video_ocr_full_result") or {}
-    if isinstance(last, dict) and last:
-        if bool(last.get("ok")):
-            st.caption(
-                f"Zuletzt: rows={int(last.get('rows', 0) or 0)} | "
-                f"frames={int(last.get('frames_processed', 0) or 0)}/{int(last.get('frames_total', 0) or 0)} | "
-                f"json={str(last.get('json_key', '') or '-')}"
+        # ── Live-Scope Diagramm ───────────────────────────────────────────────
+        st.caption("Live-Scope: Diagramm der OCR-Werte")
+        _avail = list(_df.columns) if not _df.empty else []
+        _num = [c for c in _avail if _df[c].dtype.kind in "iufcb"] if not _df.empty else []
+
+        if _avail:
+            _sc1, _sc2 = st.columns([2, 3])
+            _x_def = "time_s" if "time_s" in _num else (_num[0] if _num else _avail[0])
+            _x_idx = _num.index(_x_def) if _x_def in _num else 0
+            _sx = _sc1.selectbox("X-Achse", options=_num or _avail, index=_x_idx, key="ocr_scope_x")
+            _y_def = [c for c in _num if c not in ("frame_idx", "time_s", "track_minimap_found")]
+            _sy = _sc2.multiselect(
+                "Y-Achse (mehrere möglich)",
+                options=[c for c in _num if c != _sx],
+                default=[c for c in (_y_def or _num) if c != _sx][:3],
+                key="ocr_scope_y",
             )
+            if _sx and _sy and not _df.empty:
+                try:
+                    import plotly.graph_objects as go
+                    _fig = go.Figure()
+                    for _yc in _sy:
+                        _fig.add_trace(go.Scatter(
+                            x=_df[_sx], y=_df[_yc],
+                            mode="lines+markers", name=_yc, marker=dict(size=4),
+                        ))
+                    _fig.update_layout(
+                        margin=dict(l=40, r=20, t=30, b=40), height=320,
+                        xaxis_title=_sx, yaxis_title="Wert",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        template="plotly_dark",
+                    )
+                    st.plotly_chart(_fig, use_container_width=True)
+                except Exception as _pe:
+                    st.caption(f"Diagramm nicht verfügbar: {_pe}")
+            elif not _sy:
+                st.caption("Mindestens eine Y-Achse auswählen.")
+            else:
+                st.caption("Warte auf Daten ...")
         else:
-            st.caption(f"Letzter Lauf fehlgeschlagen: {str(last.get('error', ''))}")
+            st.caption("Noch keine Daten — Diagramm erscheint sobald OCR läuft.")
 
-    if running or _is_running() or wd_ocr_running:
-        time.sleep(0.25)
-        st.rerun()
+        _last = st.session_state.get("video_ocr_full_result") or {}
+        if isinstance(_last, dict) and _last:
+            if bool(_last.get("ok")):
+                st.caption(
+                    f"Zuletzt: rows={int(_last.get('rows', 0) or 0)} | "
+                    f"frames={int(_last.get('frames_processed', 0) or 0)}"
+                    f"/{int(_last.get('frames_total', 0) or 0)} | "
+                    f"json={str(_last.get('json_key', '') or '-')}"
+                )
+            else:
+                st.caption(f"Letzter Lauf fehlgeschlagen: {str(_last.get('error', ''))}")
+
+    # Use st.fragment with run_every so only this block auto-refreshes.
+    # Falls back to a plain call (+ full rerun) on older Streamlit versions.
+    try:
+        _frag_fn = st.fragment(_live_section, run_every=0.5)
+        _frag_fn()
+    except Exception:
+        _live_section()
+        if _is_running() or wd_ocr_running:
+            time.sleep(0.25)
+            st.rerun()

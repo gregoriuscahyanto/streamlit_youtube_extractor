@@ -582,29 +582,35 @@ if bool(st.session_state.get("roi_next_load_running", False)):
 
 
 def _activate_tab_once() -> None:
-    """Click the tab whose label matches tab_default, then clear it."""
+    """Click the tab whose label matches tab_default, then clear it.
+
+    Uses st.components.v1.html (always available) with a retry loop so the
+    click lands even when the tab DOM is not yet painted on first render.
+    """
     label = str(st.session_state.get("tab_default") or "").strip()
     if not label:
         return
     st.session_state.tab_default = None
-    if streamlit_js_eval is None:
-        return
-    js = f"""
+    js = f"""<script>
 (function() {{
-  var label = {json.dumps(label)};
-  var doc = window.parent.document;
-  var tabs = doc.querySelectorAll('[role="tab"]');
-  for (var i = 0; i < tabs.length; i++) {{
-    if (tabs[i].textContent.trim() === label) {{
-      tabs[i].click();
-      return;
+  var target = {json.dumps(label)};
+  var attempts = 0;
+  function tryClick() {{
+    var tabs = window.parent.document.querySelectorAll('[role="tab"]');
+    for (var i = 0; i < tabs.length; i++) {{
+      if (tabs[i].textContent.trim() === target) {{
+        tabs[i].click();
+        return;
+      }}
     }}
+    if (++attempts < 20) {{ setTimeout(tryClick, 80); }}
   }}
+  setTimeout(tryClick, 50);
 }})();
-true
-"""
+</script>"""
     try:
-        streamlit_js_eval(js_expressions=js, key=f"_tab_switch_{int(time.time()*1000)}", want_output=False)
+        import streamlit.components.v1 as _cv1
+        _cv1.html(js, height=0, scrolling=False)
     except Exception:
         pass
 
