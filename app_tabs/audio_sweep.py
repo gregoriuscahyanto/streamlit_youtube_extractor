@@ -1,4 +1,4 @@
-﻿"""Audio parameter sweep â€” find the best RPM-extraction parameters against a reference."""
+"""Audio parameter sweep - find the best RPM-extraction parameters against a reference."""
 from __future__ import annotations
 import math
 import threading
@@ -23,7 +23,7 @@ def _extract_t_rpm(ret):
         return t_audio, rpm_audio, extra
     raise TypeError(f"Unerwarteter Extractor-Rueckgabewert: {type(ret).__name__}")
 
-# â”€â”€ Physical plausibility check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Physical plausibility check ───────────────────────────────────────────────
 
 def _fundamental_hz(rpm_val: float, cyl: int, order: float, takt: int) -> float:
     """Fundamental firing frequency in Hz."""
@@ -37,12 +37,12 @@ def _combo_plausible(cyl: int, order: float, takt: int, fmax: float,
     f_hi = _fundamental_hz(rpm_max, cyl, order, takt)
     if f_hi < 20.0:      # below audio range
         return False
-    if f_lo > fmax:      # fundamental above fmax â†’ nothing visible
+    if f_lo > fmax:      # fundamental above fmax → nothing visible
         return False
     return True
 
 
-# â”€â”€ Reference file parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Reference file parsing ────────────────────────────────────────────────────
 
 def parse_ref_file(data: bytes, filename: str) -> dict:
     """
@@ -117,7 +117,7 @@ def load_ref_from_doc(doc: dict) -> dict | None:
     }
 
 
-# â”€â”€ Cross-correlation offset search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Cross-correlation offset search ───────────────────────────────────────────
 
 def cross_corr_offset(t_audio, rpm_audio, t_ref, rpm_ref,
                       search_lo: float = -10.0, search_hi: float = 10.0,
@@ -165,7 +165,7 @@ def cross_corr_offset(t_audio, rpm_audio, t_ref, rpm_ref,
     return best_offset
 
 
-# â”€â”€ Agreement scoring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Agreement scoring ──────────────────────────────────────────────────────────
 
 def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
                     offset_s: float,
@@ -175,7 +175,7 @@ def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
     """
     Compute agreement between rpm_audio and rpm_ref (shifted by offset_s).
     Returns dict with within_pct, rmse, mae, n, pearson_r.
-    Pure audio-based â€” no OCR speed influence.
+    Pure audio-based — no OCR speed influence.
     """
     import numpy as np
 
@@ -190,7 +190,7 @@ def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
     t_lo = max(t_a[0], t_r[0])
     t_hi = min(t_a[-1], t_r[-1])
     if t_hi - t_lo < 0.1:
-        return {"ok": False, "error": "keine Ãœberlappung"}
+        return {"ok": False, "error": "keine Überlappung"}
 
     n_pts = min(2000, max(50, int((t_hi - t_lo) * 4)))
     t_common = np.linspace(t_lo, t_hi, n_pts)
@@ -243,9 +243,9 @@ def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
     }
 
 
-# â”€â”€ Parameter grid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Parameter grid ─────────────────────────────────────────────────────────────
 
-# Valid cylinder counts (skip 7, 9, 11, 13, 14, 15 â€” physically uncommon)
+# Valid cylinder counts (skip 7, 9, 11, 13, 14, 15 — physically uncommon)
 CYL_OPTIONS = ["any", 1, 2, 3, 4, 5, 6, 8, 10, 12, 16]
 CYL_SWEEP_VALUES = [3, 4, 5, 6, 8, 10, 12]  # used when cyl="any"
 TAKT_OPTIONS = ["any", 2, 4]
@@ -356,7 +356,7 @@ def build_param_grid(cfg: dict) -> list[dict]:
     return grid
 
 
-# â”€â”€ Sweep runner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Sweep runner ──────────────────────────────────────────────────────────────
 
 def _eval_single_params(
     params: dict,
@@ -417,8 +417,8 @@ def _eval_single_params(
             fmax=params["fmax"], cyl=params["cyl"], takt=params["takt"],
             order=params["order"], rpm_min=params["rpm_min"], rpm_max=params["rpm_max"],
             method=params["method"],
-            cyl_mode="Fest auswÃ¤hlen", harmonic_mode="Fest auswÃ¤hlen",
-            drive_type="Verbrenner/Hybrid", stft_mode="Fest auswÃ¤hlen",
+            cyl_mode="Fest auswählen", harmonic_mode="Fest auswählen",
+            drive_type="Verbrenner/Hybrid", stft_mode="Fest auswählen",
             method_params=method_params,
         )
         t_audio, rpm_audio, _extra = _extract_t_rpm(_ret)
@@ -497,9 +497,9 @@ def run_sweep(
     Run the parameter sweep.
 
     For each grid entry:
-      1. Extract RPM with given params (no OCR speed â€” cyl_mode='Fest auswÃ¤hlen',
-         harmonic_mode='Fest auswÃ¤hlen', use_ocr_v=False)
-      2. Find best offset via cross-corr around offset_base Â± offset_range
+      1. Extract RPM with given params (no OCR speed — cyl_mode='Fest auswählen',
+         harmonic_mode='Fest auswählen', use_ocr_v=False)
+      2. Find best offset via cross-corr around offset_base ± offset_range
       3. Score with tolerance metric
     Returns top_n results sorted by combined_score descending.
     """
@@ -530,6 +530,10 @@ def run_sweep(
                 progress_cb(i + 1, n_total, params, result)
             except Exception:
                 pass
+        # Free intermediate arrays every 10 iterations
+        if i % 10 == 9:
+            import gc as _gc
+            _gc.collect()
 
     return _sort_and_rank(results, top_n)
 
@@ -582,7 +586,7 @@ def run_sweep_optuna(
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except ImportError:
         raise ImportError(
-            "optuna nicht installiert. Bitte 'pip install optuna' ausfÃ¼hren."
+            "optuna nicht installiert. Bitte 'pip install optuna' ausführen."
         )
 
     methods  = cfg.get("methods")  or ["Hybrid"]
@@ -640,6 +644,9 @@ def run_sweep_optuna(
                 progress_cb(trial_idx[0], n_trials, params, result)
             except Exception:
                 pass
+        if trial_idx[0] % 10 == 0:
+            import gc as _gc
+            _gc.collect()
 
         return float(result.get("combined_score", 0.0))
 
@@ -661,7 +668,7 @@ def run_sweep_optuna(
     return _sort_and_rank(results_all, top_n)
 
 
-# â”€â”€ Persist sweep results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Persist sweep results ─────────────────────────────────────────────────────
 
 def save_sweep_results(json_path: str, results: list[dict]) -> None:
     """Write top sweep results to recordResult.audio_sweep in the result JSON."""

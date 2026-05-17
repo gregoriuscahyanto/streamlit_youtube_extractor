@@ -1,4 +1,4 @@
-﻿"""RTK regression tests for audio sweep extractor compatibility and random-run wiring."""
+"""RTK regression tests for audio sweep extractor compatibility and random-run wiring."""
 
 from pathlib import Path
 
@@ -85,3 +85,34 @@ def test_audio_tab_sweep_log_includes_best_score_so_far():
     assert "_best_seen = {\"score\": float(\"-inf\"), \"within\": 0.0, \"rmse\": float(\"inf\")}" in txt
     assert "Best bisher: Score=" in txt
     assert "WARN " in txt
+
+
+def test_audio_tab_sweep_history_line_chart_exists():
+    txt = _read("app_tabs/audio_tab.py")
+    assert "st.session_state.audio_sweep_history_ref = _sweep_history" in txt
+    assert "_sweep_history.append({" in txt
+    assert "\"trial\": int(i)" in txt
+    assert "st.selectbox(" in txt and "Verlauf-Metrik" in txt
+    assert "st.line_chart(_plot_df.set_index(\"trial\"), height=220)" in txt
+
+
+def test_audio_tab_top1_rpm_over_time_plot_exists():
+    txt = _read("app_tabs/audio_tab.py")
+    assert "Top-1 RPM-Verlauf (gegen Referenz)" in txt
+    assert "audio_sweep_top1_plot" in txt
+    assert "Top-1 Verlauf wird berechnet..." in txt
+    assert "title=\"Top-1 RPM ueber Zeit\"" in txt
+    assert "name=\"Top-1 RPM\"" in txt
+    assert "name=\"Referenz RPM\"" in txt
+
+
+def test_no_mojibake_sequences_in_audio_tabs():
+    t1 = _read("app_tabs/audio_tab.py")
+    t2 = _read("app_tabs/audio_sweep.py")
+    bad_tokens = [
+        "VerknÃ", "Ã¤", "Ã¶", "Ã¼", "Ã„", "Ã–", "Ãœ", "ÃŸ",
+        "Â±", "Î”", "â€”", "â†’", "â€“", "Ã—",
+    ]
+    for tok in bad_tokens:
+        assert tok not in t1
+        assert tok not in t2
