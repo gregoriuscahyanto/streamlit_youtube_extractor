@@ -446,6 +446,109 @@ def _run_conv_thread(pending: list[Path], convert_fn) -> None:
     _conv_log("MAT→JSON fertig.")
 
 
+def _render_media_analysis(rows: list[dict]) -> None:
+    """Horizontal progress bars summarising pipeline status across all entries."""
+    import streamlit as _st
+    total = len(rows)
+    if total == 0:
+        return
+
+    def _pct(n: int) -> float:
+        return 100.0 * n / total if total else 0.0
+
+    n_av_ok    = sum(1 for r in rows if r.get("video_exists") and r.get("audio_exists"))
+    n_av_part  = sum(1 for r in rows if bool(r.get("video_exists")) != bool(r.get("audio_exists")))
+    n_av_miss  = total - n_av_ok - n_av_part
+    # ROI — four exclusive buckets:
+    #   green   = vollständig
+    #   yellow  = unvollständig (track_minimap calibration incomplete)
+    #   red     = manually stamped (kein_roi OR video_faulty) → always override
+    #   gray    = anstehend (roi_status "nein", not yet checked/stamped)
+    n_roi_ok   = sum(1 for r in rows
+                     if r.get("roi_status") == "vollständig"
+                     and not r.get("no_roi_available") and not r.get("video_faulty"))
+    n_roi_inc  = sum(1 for r in rows
+                     if r.get("roi_status") == "unvollständig"
+                     and not r.get("no_roi_available") and not r.get("video_faulty"))
+    n_roi_red  = sum(1 for r in rows
+                     if r.get("no_roi_available") or r.get("video_faulty"))
+    n_roi_pend = total - n_roi_ok - n_roi_inc - n_roi_red  # anstehend
+    n_ocr_ok   = sum(1 for r in rows
+                     if r.get("ocr") == "vollständig"
+                     and not r.get("no_roi_available") and not r.get("video_faulty"))
+    n_ocr_pt   = sum(1 for r in rows
+                     if r.get("ocr") == "teilweise"
+                     and not r.get("no_roi_available") and not r.get("video_faulty"))
+    n_ocr_red  = n_roi_red  # same stamp: kein ROI / video fehlerhaft
+    n_ocr_pend = total - n_ocr_ok - n_ocr_pt - n_ocr_red
+    n_acfg     = sum(1 for r in rows if r.get("audio_config"))
+    n_val      = sum(1 for r in rows if r.get("validierung"))
+
+    def _simple_bar(label: str, ok: int, color: str = "#4a90a4") -> str:
+        p = _pct(ok)
+        return (
+            f'<div class="mat-analysis-bar-row">'
+            f'<div>{label}</div>'
+            f'<div class="mat-analysis-bar-track">'
+            f'<div class="mat-analysis-bar-fill" style="width:{p:.1f}%;background:{color};"></div>'
+            f'</div>'
+            f'<div>{ok}/{total} · {p:.0f}%</div>'
+            f'</div>'
+        )
+
+    def _stacked_bar(label: str, segments: list[tuple[int, str]]) -> str:
+        """segments = [(count, color), ...]"""
+        inner = "".join(
+            f'<div style="width:{_pct(n):.1f}%;background:{c};height:100%;"></div>'
+            for n, c in segments if n > 0
+        )
+        legend = " · ".join(
+            f'<span style="color:{c};">{n}</span>'
+            for n, c in segments
+        )
+        return (
+            f'<div class="mat-analysis-bar-row">'
+            f'<div>{label}</div>'
+            f'<div class="mat-analysis-bar-track" style="display:flex;overflow:hidden;">{inner}</div>'
+            f'<div style="white-space:nowrap;">{legend} / {total}</div>'
+            f'</div>'
+        )
+
+    bar_html = ['<div class="mat-analysis-bars">']
+    bar_html.append(_stacked_bar("Audio + Video", [
+        (n_av_ok,   "#3ddc84"),   # beides vorhanden
+        (n_av_part, "#facc15"),   # nur audio oder nur video
+        (n_av_miss, "#ef4444"),   # beides fehlt (nicht heruntergeladen)
+    ]))
+    bar_html.append(_stacked_bar("ROI", [
+        (n_roi_ok,   "#3ddc84"),   # vollständig
+        (n_roi_inc,  "#facc15"),   # unvollständig
+        (n_roi_red,  "#ef4444"),   # kein ROI / video fehlerhaft (manuell gesetzt)
+        (n_roi_pend, "#4a5060"),   # anstehend (noch nicht geprüft)
+    ]))
+    bar_html.append(_stacked_bar("OCR", [
+        (n_ocr_ok,   "#3ddc84"),   # vollständig
+        (n_ocr_pt,   "#facc15"),   # teilweise
+        (n_ocr_red,  "#ef4444"),   # kein ROI / video fehlerhaft (manuell gesetzt)
+        (n_ocr_pend, "#4a5060"),   # anstehend
+    ]))
+    bar_html.append(_simple_bar("Audio-Konfig",  n_acfg, "#4a90a4"))
+    bar_html.append(_simple_bar("Validierung",   n_val,  "#4a90a4"))
+    bar_html.append('</div>')
+
+    legend = (
+        '<div class="mat-analysis-note" style="margin-top:.6rem;">'
+        '<span style="color:#3ddc84;">&#9632;</span> vollständig &nbsp;'
+        '<span style="color:#facc15;">&#9632;</span> unvollständig &nbsp;'
+        '<span style="color:#ef4444;">&#9632;</span> kein ROI / video fehlerhaft &nbsp;'
+        '<span style="color:#4a5060;">&#9632;</span> anstehend'
+        '</div>'
+    )
+    bar_html.append(legend)
+    with _st.expander("Analyse-Übersicht", expanded=True):
+        _st.markdown("".join(bar_html), unsafe_allow_html=True)
+
+
 # ── Render ────────────────────────────────────────────────────────────────────
 
 def render(ns: dict) -> None:
@@ -530,6 +633,9 @@ def render(ns: dict) -> None:
                 _write_db_entry(link)
                 st.success("Link hinzugefügt.")
                 st.rerun()
+
+    # ── Analyse-Übersicht ─────────────────────────────────────────────────────
+    _render_media_analysis(rows)
 
     # ── Tabelle ────────────────────────────────────────────────────────────────
     st.markdown(f"**{len(rows)} Einträge** | Basis: `{base}`")

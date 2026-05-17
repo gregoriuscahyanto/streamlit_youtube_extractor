@@ -319,20 +319,28 @@ def render(ns):
         st.caption("Live-Progress (OCR-Werte je Update):")
         if _rows:
             _df = pd.DataFrame(_rows)
-            # Coerce object columns to numeric — mixed rows (some empty strings, some numbers)
-            # would otherwise stay as object dtype and be excluded from the diagram selector.
-            for _col in _df.columns:
-                if _df[_col].dtype == object:
-                    _df[_col] = pd.to_numeric(_df[_col], errors="coerce")
-            st.dataframe(_df, use_container_width=True, hide_index=True, height=260)
         else:
             _df = pd.DataFrame(columns=["frame_idx", "time_s"])
-            st.dataframe(_df, use_container_width=True, hide_index=True, height=120)
+
+        # Build _num: try to_numeric on every column; include only those where at
+        # least one value converts successfully. This handles mixed string/empty columns
+        # (OCR outputs are always strings; empty = failed OCR for that frame).
+        _avail = list(_df.columns) if not _df.empty else []
+        _num: list[str] = []
+        if not _df.empty:
+            for _col in _avail:
+                try:
+                    _conv = pd.to_numeric(_df[_col], errors="coerce")
+                    if _conv.notna().any():
+                        _df[_col] = _conv
+                        _num.append(_col)
+                except Exception:
+                    pass
+
+        st.dataframe(_df, use_container_width=True, hide_index=True, height=260 if _rows else 120)
 
         # ── Live-Scope Diagramm ───────────────────────────────────────────────
         st.caption("Live-Scope: Diagramm der OCR-Werte")
-        _avail = list(_df.columns) if not _df.empty else []
-        _num = [c for c in _avail if _df[c].dtype.kind in "iufcb"] if not _df.empty else []
 
         if _avail:
             _sc1, _sc2 = st.columns([2, 3])
