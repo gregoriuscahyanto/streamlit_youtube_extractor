@@ -186,17 +186,19 @@ def render(ns: dict) -> None:
         for n in plaus_names:
             cur = plaus.get(n) or {}
             ms = cur.get("max_slope")
+            ig = cur.get("interp_max_gap_s")
             plaus_rows.append({
                 "ROI Name": n,
                 "Min": float(cur.get("min", 0.0)),
                 "Max": float(cur.get("max", 9999.0)),
                 "Max Steigung /s": float(ms) if ms is not None else None,
+                "Interp. Lücke max [s]": float(ig) if ig is not None else 30.0,
             })
         plaus_df = pd.DataFrame(plaus_rows) if plaus_rows else pd.DataFrame(
-            columns=["ROI Name", "Min", "Max", "Max Steigung /s"]
+            columns=["ROI Name", "Min", "Max", "Max Steigung /s", "Interp. Lücke max [s]"]
         )
         # Ensure float dtype so NumberColumn works even when all values are None
-        for _c in ("Min", "Max", "Max Steigung /s"):
+        for _c in ("Min", "Max", "Max Steigung /s", "Interp. Lücke max [s]"):
             plaus_df[_c] = pd.to_numeric(plaus_df[_c], errors="coerce")
 
         edited_plaus = st.data_editor(
@@ -208,6 +210,10 @@ def render(ns: dict) -> None:
                 "Max Steigung /s": st.column_config.NumberColumn(
                     "Max Steigung /s", width=130, format="%.1f",
                     help="Maximale Wertänderung pro Sekunde. Leer = kein Limit.",
+                ),
+                "Interp. Lücke max [s]": st.column_config.NumberColumn(
+                    "Interp. Lücke max [s]", width=160, format="%.1f",
+                    help="Gefilterte Lücken werden linear interpoliert wenn sie kürzer als dieser Wert sind. 0 = Interpolation deaktivieren.",
                 ),
             },
             num_rows="fixed",
@@ -230,6 +236,9 @@ def render(ns: dict) -> None:
                     ms_val = row.get("Max Steigung /s")
                     if ms_val is not None and not (isinstance(ms_val, float) and math.isnan(ms_val)):
                         entry["max_slope"] = float(ms_val)
+                    ig_val = row.get("Interp. Lücke max [s]")
+                    if ig_val is not None and not (isinstance(ig_val, float) and math.isnan(ig_val)):
+                        entry["interp_max_gap_s"] = float(ig_val)
                     plaus[n] = entry
                 except Exception:
                     pass

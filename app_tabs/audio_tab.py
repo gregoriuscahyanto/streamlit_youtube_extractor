@@ -800,12 +800,18 @@ def render(ns):
                     help="pYIN und CQT/Constant-Q benötigen: pip install librosa",
                 )
                 _sw_nfft = st.multiselect(
-                    "NFFT", options=[512, 1024, 2048, 4096, 8192],
-                    default=[512, 1024, 2048, 4096, 8192], key="sw_nfft",
+                    "NFFT",
+                    options=[128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+                    default=[512, 1024, 2048, 4096, 8192],
+                    key="sw_nfft",
+                    help="Fensterbreite für STFT. Kleinere Werte = bessere Zeitauflösung, größere = bessere Frequenzauflösung.",
                 )
                 _sw_overlap = st.multiselect(
-                    "Overlap [%]", options=[50.0, 75.0, 87.0],
-                    default=[50.0, 75.0, 87.0], key="sw_overlap",
+                    "Overlap [%]",
+                    options=[0.0, 25.0, 50.0, 62.5, 75.0, 87.5, 93.75],
+                    default=[50.0, 75.0, 87.5],
+                    key="sw_overlap",
+                    help="Überlappung der STFT-Fenster. Höhere Werte = feinere Zeitschritte, mehr Rechenaufwand.",
                 )
                 _sw_order = st.multiselect(
                     "Ordnung", options=[0.5, 1.0, 2.0, 3.0],

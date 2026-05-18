@@ -719,11 +719,38 @@ def render(ns: dict) -> None:
         str(p) for p in (base / "results").glob("results_*.json")
     ) if (base / "results").exists() else []
 
+    # Map folder name -> full path for selection widget
+    _nc_folder_to_path: dict[str, str] = {
+        Path(p).stem.replace("results_", "", 1): p for p in _result_json_paths
+    }
+    _nc_all_folders = list(_nc_folder_to_path.keys())
+
     with st.expander(f"Nachkorrektur ({len(_result_json_paths)} Dateien)", expanded=False):
         st.caption(
             "Kombinierte Nachkorrektur für bereits ausgewertete Dateien. "
             "Führt die Schritte aus die beim Auswerten fehlten oder durch Bugs fehlerhaft waren."
         )
+
+        # ── Dateiauswahl ──────────────────────────────────────────────────────
+        _nc_sel_all = st.checkbox(
+            "Alle auswählen",
+            value=True,
+            key="lib_nc_sel_all",
+        )
+        if _nc_sel_all:
+            _nc_selected_folders = _nc_all_folders
+            st.caption(f"Alle {len(_nc_all_folders)} Dateien ausgewählt.")
+        else:
+            _nc_selected_folders = st.multiselect(
+                "Dateien auswählen",
+                options=_nc_all_folders,
+                default=[],
+                key="lib_nc_multisel",
+                placeholder="Ordner auswählen…",
+            )
+            st.caption(f"{len(_nc_selected_folders)} von {len(_nc_all_folders)} ausgewählt.")
+
+        _nc_selected_paths = [_nc_folder_to_path[f] for f in _nc_selected_folders if f in _nc_folder_to_path]
 
         _nc1, _nc2 = st.columns(2)
 
@@ -736,8 +763,8 @@ def render(ns: dict) -> None:
                 "③ track_minimap neu berechnen wenn track_minimap_found überall 0"
             )
             if st.button(
-                f"Alle {len(_result_json_paths)} Dateien nachkorrigieren",
-                disabled=not _result_json_paths,
+                f"{len(_nc_selected_paths)} Datei(en) nachkorrigieren",
+                disabled=not _nc_selected_paths,
                 key="lib_retrofix_btn",
             ):
                 try:
@@ -747,7 +774,7 @@ def render(ns: dict) -> None:
                     _rf_ok, _rf_skip, _rf_err, _rf_track = 0, 0, 0, 0
                     _rf_needs_track: list[str] = []
                     _prog2 = st.progress(0.0, text="Nachkorrektur läuft…")
-                    for _ri, _rp in enumerate(_result_json_paths):
+                    for _ri, _rp in enumerate(_nc_selected_paths):
                         _ok, _msg, _tn = retrofix_result_json(_rp, _rf_catalog)
                         if _ok:
                             _rf_ok += 1
@@ -757,8 +784,8 @@ def render(ns: dict) -> None:
                             _rf_err += 1
                         if _tn:
                             _rf_needs_track.append(_rp)
-                        _prog2.progress((_ri + 1) / len(_result_json_paths),
-                                        text=f"Nachkorrektur… {_ri+1}/{len(_result_json_paths)}")
+                        _prog2.progress((_ri + 1) / len(_nc_selected_paths),
+                                        text=f"Nachkorrektur… {_ri+1}/{len(_nc_selected_paths)}")
                     _prog2.empty()
                     st.success(
                         f"Trim+Filter: {_rf_ok} geändert, {_rf_skip} ohne Daten"
@@ -787,8 +814,8 @@ def render(ns: dict) -> None:
             st.markdown("**Nur Plausibilität nachfiltern**")
             st.caption("Nur Min/Max + Steigung auf cleaned anwenden. Kein Trimmen, keine Track-Neuberechnung.")
             if st.button(
-                f"Alle {len(_result_json_paths)} Dateien nachfiltern",
-                disabled=not _result_json_paths,
+                f"{len(_nc_selected_paths)} Datei(en) nachfiltern",
+                disabled=not _nc_selected_paths,
                 key="lib_reclean_btn",
             ):
                 try:
@@ -797,7 +824,7 @@ def render(ns: dict) -> None:
                     _rc_catalog = st.session_state.get("roi_catalog") or _lc_lib()
                     _rc_ok, _rc_skip, _rc_err = 0, 0, 0
                     _prog = st.progress(0.0, text="Nachfiltern läuft…")
-                    for _ri, _rp in enumerate(_result_json_paths):
+                    for _ri, _rp in enumerate(_nc_selected_paths):
                         _ok, _msg = reclean_result_json(_rp, _rc_catalog)
                         if _ok:
                             _rc_ok += 1
@@ -805,8 +832,8 @@ def render(ns: dict) -> None:
                             _rc_skip += 1
                         else:
                             _rc_err += 1
-                        _prog.progress((_ri + 1) / len(_result_json_paths),
-                                       text=f"Nachfiltern… {_ri+1}/{len(_result_json_paths)}")
+                        _prog.progress((_ri + 1) / len(_nc_selected_paths),
+                                       text=f"Nachfiltern… {_ri+1}/{len(_nc_selected_paths)}")
                     _prog.empty()
                     st.success(
                         f"Fertig: {_rc_ok} gefiltert, {_rc_skip} ohne Daten übersprungen"

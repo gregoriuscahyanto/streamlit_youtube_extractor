@@ -44,6 +44,47 @@ def _empty(v) -> str | float:
 
 # ── plausibility / slope filter ───────────────────────────────────────────────
 
+def _interp_gaps(floats: list[float | None], time_s: list[float | None],
+                 max_gap_s: float = 30.0) -> list[float | None]:
+    """
+    Linear interpolation over None gaps in floats, using time_s as x-axis.
+    Only fills gaps whose total time span <= max_gap_s.
+    Returns a new list (does not modify in-place).
+    """
+    result = list(floats)
+    n = len(result)
+    i = 0
+    while i < n:
+        if result[i] is not None:
+            i += 1
+            continue
+        # find start of gap: last valid index before i
+        left = i - 1
+        while left >= 0 and result[left] is None:
+            left -= 1
+        # find end of gap: first valid index at/after i
+        right = i
+        while right < n and result[right] is None:
+            right += 1
+        # interpolate only if both anchors exist and gap is short enough
+        if left >= 0 and right < n:
+            t_left = time_s[left] if left < len(time_s) else None
+            t_right = time_s[right] if right < len(time_s) else None
+            if t_left is not None and t_right is not None and (t_right - t_left) <= max_gap_s:
+                v_left = result[left]
+                v_right = result[right]
+                span_t = t_right - t_left
+                for j in range(left + 1, right):
+                    t_j = time_s[j] if j < len(time_s) else None
+                    if t_j is not None and span_t > 0:
+                        frac = (t_j - t_left) / span_t
+                        result[j] = v_left + frac * (v_right - v_left)
+                    else:
+                        result[j] = v_left
+        i = right + 1
+    return result
+
+
 def filter_cols(cols: dict[str, list], catalog: dict) -> dict[str, list]:
     """
     Apply min/max bounds and max_slope from catalog plausibility to columnar data.
@@ -54,6 +95,9 @@ def filter_cols(cols: dict[str, list], catalog: dict) -> dict[str, list]:
 
     Slope is computed as |Δvalue / Δtime_s| and compared against max_slope [unit/s].
     The previous-valid-value is used so that NaN gaps don't suppress the check.
+
+    After filtering, gaps are filled by linear interpolation (up to interp_max_gap_s
+    per column, default 30 s; set to 0 in catalog to disable).
     """
     plaus: dict = catalog.get("plausibility") or {}
     time_raw = cols.get("time_s") or []
@@ -100,6 +144,16 @@ def filter_cols(cols: dict[str, list], catalog: dict) -> dict[str, list]:
                         continue  # keep prev_fv/t at last valid point
                 prev_fv = fv
                 prev_t = t
+
+        # ── Interpolation über gefilterte Lücken ──────────────────────────────
+        max_gap_s = bounds.get("interp_max_gap_s", 30.0)
+        if max_gap_s > 0 and any(fv is None for fv in floats):
+            interped = _interp_gaps(floats, time_s, max_gap_s=max_gap_s)
+            is_str = isinstance(values[0], str) if values else False
+            for i, fv in enumerate(interped):
+                if fv is not None and floats[i] is None:
+                    # write back interpolated value in original type
+                    filtered[i] = str(round(fv, 2)) if is_str else float(fv)
 
         cols[col] = filtered
 
