@@ -527,9 +527,10 @@ def _render_media_analysis(rows: list[dict]) -> None:
     def _pct(n: int) -> float:
         return 100.0 * n / total if total else 0.0
 
-    n_av_ok    = sum(1 for r in rows if r.get("video_exists") and r.get("audio_exists"))
-    n_av_part  = sum(1 for r in rows if bool(r.get("video_exists")) != bool(r.get("audio_exists")))
-    n_av_miss  = total - n_av_ok - n_av_part
+    n_av_faulty = sum(1 for r in rows if r.get("video_faulty"))
+    n_av_ok    = sum(1 for r in rows if r.get("video_exists") and r.get("audio_exists") and not r.get("video_faulty"))
+    n_av_part  = sum(1 for r in rows if bool(r.get("video_exists")) != bool(r.get("audio_exists")) and not r.get("video_faulty"))
+    n_av_miss  = total - n_av_ok - n_av_part - n_av_faulty
     # ROI — four exclusive buckets:
     #   green   = vollständig
     #   yellow  = unvollständig (track_minimap calibration incomplete)
@@ -588,9 +589,10 @@ def _render_media_analysis(rows: list[dict]) -> None:
 
     bar_html = ['<div class="mat-analysis-bars">']
     bar_html.append(_stacked_bar("Audio + Video", [
-        (n_av_ok,   "#3ddc84"),   # beides vorhanden
-        (n_av_part, "#facc15"),   # nur audio oder nur video
-        (n_av_miss, "#ef4444"),   # beides fehlt (nicht heruntergeladen)
+        (n_av_ok,     "#3ddc84"),   # beides vorhanden, nicht fehlerhaft
+        (n_av_part,   "#facc15"),   # nur audio oder nur video
+        (n_av_faulty, "#f97316"),   # video als fehlerhaft markiert (orange)
+        (n_av_miss,   "#ef4444"),   # beides fehlt (nicht heruntergeladen)
     ]))
     bar_html.append(_stacked_bar("ROI", [
         (n_roi_ok,   "#3ddc84"),   # vollständig
@@ -612,7 +614,8 @@ def _render_media_analysis(rows: list[dict]) -> None:
         '<div class="mat-analysis-note" style="margin-top:.6rem;">'
         '<span style="color:#3ddc84;">&#9632;</span> vollständig &nbsp;'
         '<span style="color:#facc15;">&#9632;</span> unvollständig &nbsp;'
-        '<span style="color:#ef4444;">&#9632;</span> kein ROI / video fehlerhaft &nbsp;'
+        '<span style="color:#f97316;">&#9632;</span> video fehlerhaft &nbsp;'
+        '<span style="color:#ef4444;">&#9632;</span> fehlt / kein ROI &nbsp;'
         '<span style="color:#4a5060;">&#9632;</span> anstehend'
         '</div>'
     )
@@ -670,7 +673,7 @@ def render(ns: dict) -> None:
         t.start()
         st.rerun()
 
-    # Herunterladen: video fehlt, audio fehlt, oder als fehlerhaft markiert
+    # Herunterladen: video fehlt, audio fehlt, fehlerhaft markiert, oder download-error
     def _needs_download(r: dict) -> bool:
         if not r.get("youtube_link"):
             return False
@@ -683,7 +686,12 @@ def render(ns: dict) -> None:
         return False
 
     pending_dl = [r for r in rows if _needs_download(r)]
-    dl_label = f"Herunterladen / Wiederholen ({len(pending_dl)})"
+    n_missing  = sum(1 for r in pending_dl if not r.get("video_exists") or not r.get("audio_exists"))
+    n_faulty   = sum(1 for r in pending_dl if r.get("video_faulty"))
+    _parts = []
+    if n_missing: _parts.append(f"{n_missing} fehlend")
+    if n_faulty:  _parts.append(f"{n_faulty} fehlerhaft")
+    dl_label = f"Herunterladen / Wiederholen ({' · '.join(_parts) if _parts else len(pending_dl)})"
     if col_dl.button(dl_label, disabled=not pending_dl,
                      use_container_width=True, key="lib_dl_btn"):
         for r in pending_dl:

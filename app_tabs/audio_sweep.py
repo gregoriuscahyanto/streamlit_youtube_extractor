@@ -254,6 +254,7 @@ TAKT_SWEEP_VALUES = [2, 4]  # used when takt="any"
 METHOD_OPTIONS = [
     "STFT/Ridge", "Viterbi", "Peak", "Autokorrelation/YIN",
     "Cepstrum", "Harmonic Comb/HPS", "CWT/Wavelet", "Hybrid",
+    "pYIN", "CQT/Constant-Q", "Harmonische Summe", "Bandpass/Autokorr",
 ]
 
 
@@ -492,6 +493,7 @@ def run_sweep(
     extract_rpm_fn: Callable,
     top_n: int = 20,
     errors_out: list | None = None,
+    pre_trial_cb: Callable | None = None,
 ) -> list[dict]:
     """
     Run the parameter sweep.
@@ -523,6 +525,11 @@ def run_sweep(
     for i, params in enumerate(grid):
         if stop_event is not None and stop_event.is_set():
             break
+        if callable(pre_trial_cb):
+            try:
+                pre_trial_cb(i, n_total, params)
+            except Exception:
+                pass
         result = _eval_single_params(params, **_kw)
         results.append(result)
         if callable(progress_cb):
@@ -548,6 +555,7 @@ def run_sweep_random(
     extract_rpm_fn: Callable,
     top_n: int = 20, n_trials: int = 200,
     errors_out: list | None = None,
+    pre_trial_cb: Callable | None = None,
 ) -> list[dict]:
     """Random search: shuffle the full grid, evaluate first n_trials entries."""
     import random as _rnd
@@ -566,6 +574,7 @@ def run_sweep_random(
         offset_base=offset_base, offset_range=offset_range, offset_step=offset_step,
         progress_cb=progress_cb, stop_event=stop_event,
         extract_rpm_fn=extract_rpm_fn, top_n=top_n, errors_out=errors_out,
+        pre_trial_cb=pre_trial_cb,
     )
 
 
@@ -579,6 +588,7 @@ def run_sweep_optuna(
     extract_rpm_fn: Callable,
     top_n: int = 20, n_trials: int = 80,
     errors_out: list | None = None,
+    pre_trial_cb: Callable | None = None,
 ) -> list[dict]:
     """Bayesian optimisation with Optuna (TPE sampler)."""
     try:
@@ -635,6 +645,11 @@ def run_sweep_optuna(
             "viterbi_jump_hz": 25.0, "viterbi_penalty": 1.2, "viterbi_smooth": 5,
             "comb_harmonics": 4, "hybrid_smooth": 9,
         }
+        if callable(pre_trial_cb):
+            try:
+                pre_trial_cb(trial_idx[0], n_trials, params)
+            except Exception:
+                pass
         result = _eval_single_params(params, **_kw)
         results_all.append(result)
 

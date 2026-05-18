@@ -7,6 +7,7 @@ causing the watchdog thread to disappear. Keeping the state here prevents that.
 from __future__ import annotations
 
 import threading
+from collections import deque, OrderedDict
 
 _YT_WATCHDOG_LOCK = threading.Lock()
 _YT_WATCHDOG: dict = {
@@ -16,7 +17,7 @@ _YT_WATCHDOG: dict = {
     "interval_sec": 10,
     "last_tick": "",
     "current": "",
-    "logs": [],
+    "logs": deque(maxlen=200),  # bounded — no manual slicing needed
     "errors": 0,
     "downloads": 0,
     "ocr": 0,
@@ -33,18 +34,23 @@ _YT_WATCHDOG: dict = {
 # Avoids re-reading large JSON files (with OCR tables) on every rerun.
 _JSON_ROW_CACHE: dict[str, tuple[float, dict]] = {}
 
-# Per-path write locks: str(path) -> threading.Lock()
-# Watchdog acquires before writing; UI tries non-blocking and shows warning if locked.
-_PATH_LOCKS: dict[str, threading.Lock] = {}
+# Per-path write locks — LRU-capped at 500 entries to prevent unbounded growth.
+_PATH_LOCKS: "OrderedDict[str, threading.Lock]" = OrderedDict()
 _PATH_LOCKS_REGISTRY_LOCK = threading.Lock()
+_PATH_LOCKS_MAX = 500
 
 
 def get_path_lock(path: str) -> threading.Lock:
-    """Return the shared Lock for a given file path (created on first access)."""
+    """Return the shared Lock for a given file path (LRU-capped dict)."""
     with _PATH_LOCKS_REGISTRY_LOCK:
-        if path not in _PATH_LOCKS:
-            _PATH_LOCKS[path] = threading.Lock()
-        return _PATH_LOCKS[path]
+        if path in _PATH_LOCKS:
+            _PATH_LOCKS.move_to_end(path)  # mark as recently used
+            return _PATH_LOCKS[path]
+        lock = threading.Lock()
+        _PATH_LOCKS[path] = lock
+        if len(_PATH_LOCKS) > _PATH_LOCKS_MAX:
+            _PATH_LOCKS.popitem(last=False)  # evict oldest
+        return lock
 
 
 def is_path_locked(path: str) -> bool:

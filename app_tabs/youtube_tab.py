@@ -27,7 +27,7 @@ def watchdog_snapshot() -> dict:
             "mat_json": int(_YT_WATCHDOG.get("mat_json", 0) or 0),
             "errors": int(_YT_WATCHDOG.get("errors", 0) or 0),
             "tasks": dict(_YT_WATCHDOG.get("tasks") or {}),
-            "logs": list(_YT_WATCHDOG.get("logs") or []),
+            "logs": list(_YT_WATCHDOG.get("logs") or []),  # snapshot deque as list
             "ocr_live": ocr_live,
         }
 
@@ -468,9 +468,7 @@ def render(ns):
             return
         line = f"{datetime.now().strftime('%H:%M:%S')} | {txt}"
         with _YT_WATCHDOG_LOCK:
-            logs = list(_YT_WATCHDOG.get("logs") or [])
-            logs.append(line)
-            _YT_WATCHDOG["logs"] = logs[-200:]
+            _YT_WATCHDOG["logs"].append(line)  # deque(maxlen=200) — kein manuelles Slicing
             _YT_WATCHDOG["last_tick"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             log_path = Path(str(st.session_state.get("local_base_path") or ".")).expanduser().resolve() / "logs" / "watchdog.log"

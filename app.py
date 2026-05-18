@@ -5985,6 +5985,111 @@ def _audio_cwt_like_line(seg, fs, t_video, flo, fhi):
     idx = np.nanargmax(env, axis=0)
     return np.asarray(_audio_smooth(freqs_grid[idx], 9), dtype=float).copy()
 
+def _audio_pyin_line(seg, fs, nfft_eff, noverlap, nt, flo, fhi):
+    """Probabilistic YIN (librosa.pyin) — works on time-domain signal directly."""
+    out = np.full(nt, np.nan, dtype=float)
+    try:
+        import librosa  # type: ignore
+        hop = max(1, nfft_eff - noverlap)
+        f0, _voiced, voiced_probs = librosa.pyin(
+            seg.astype(np.float64),
+            fmin=float(max(20.0, flo * 0.8)),
+            fmax=float(min(fs / 2.0, fhi * 1.2)),
+            sr=int(fs),
+            frame_length=nfft_eff,
+            hop_length=hop,
+            fill_na=np.nan,
+        )
+        t_p = np.arange(len(f0)) * hop / float(fs)
+        t_s = np.arange(nt) * hop / float(fs)
+        f0_i  = np.interp(t_s, t_p, f0, left=np.nan, right=np.nan)
+        vp_i  = np.interp(t_s, t_p, voiced_probs.astype(float), left=0.0, right=0.0)
+        mask = (vp_i > 0.4) & np.isfinite(f0_i) & (f0_i >= flo) & (f0_i <= fhi)
+        out[mask] = f0_i[mask]
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return out
+
+
+def _audio_cqt_line(seg, fs, nfft_eff, noverlap, nt, flo, fhi):
+    """CQT-based ridge: logarithmic frequency bins — better harmonic resolution at low freqs."""
+    out = np.full(nt, np.nan, dtype=float)
+    try:
+        import librosa  # type: ignore
+        hop = max(1, nfft_eff - noverlap)
+        octaves = max(0.5, np.log2(max(fhi, flo + 1) / max(flo, 1.0)))
+        n_bins = max(12, int(octaves * 48))
+        C = np.abs(librosa.cqt(
+            seg.astype(np.float32),
+            sr=int(fs),
+            hop_length=hop,
+            fmin=float(max(1.0, flo * 0.85)),
+            n_bins=n_bins,
+            bins_per_octave=48,
+        )).astype(np.float32)
+        cqt_freqs = librosa.cqt_frequencies(n_bins, fmin=float(max(1.0, flo * 0.85)), bins_per_octave=48)
+        sub = (cqt_freqs >= flo) & (cqt_freqs <= fhi)
+        if sub.sum() < 3:
+            return out
+        C_sub = C[sub, :]
+        fsub  = cqt_freqs[sub]
+        # Weighted centroid per frame
+        C_norm = C_sub / (C_sub.sum(axis=0, keepdims=True) + 1e-12)
+        f0 = (fsub[:, None] * C_norm).sum(axis=0)
+        t_c = np.arange(C_sub.shape[1]) * hop / float(fs)
+        t_s = np.arange(nt) * hop / float(fs)
+        f0_i = np.interp(t_s, t_c, f0)
+        valid = (f0_i >= flo) & (f0_i <= fhi)
+        out[valid] = f0_i[valid]
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return np.asarray(_audio_smooth(out, 7), dtype=float)
+
+
+def _audio_harmonic_sum_line(freqs, score, flo, fhi, n_harmonics=5):
+    """
+    Improved harmonic sum: for each candidate fundamental f in [flo, fhi], sum
+    the spectrogram dB energy at f, 2f, 3f, ... with 1/k weighting (lower harmonics
+    weighted more). More stable than the HPS product because dB space is additive.
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    nt = score.shape[1]
+    cand = (freqs >= flo) & (freqs <= fhi)
+    if cand.sum() < 2:
+        return np.full(nt, np.nan, dtype=float)
+    cfreqs = freqs[cand]
+    hscores = np.zeros((len(cfreqs), nt), dtype=float)
+    for ki, f in enumerate(cfreqs):
+        for k in range(1, n_harmonics + 1):
+            hf = k * f
+            idx = int(np.argmin(np.abs(freqs - hf)))
+            if abs(freqs[idx] - hf) / max(hf, 1.0) < 0.08:
+                hscores[ki] += score[idx, :] / k  # 1/k weighting
+    best = np.nanargmax(hscores, axis=0)
+    f0 = cfreqs[best]
+    return np.asarray(_audio_smooth(np.where((f0 >= flo) & (f0 <= fhi), f0, np.nan), 7), dtype=float)
+
+
+def _audio_bandpass_autocorr_line(seg, fs, nfft_eff, noverlap, nt, flo, fhi):
+    """Bandpass-filtered autocorrelation: narrow the signal to [flo, fhi] first,
+    then autocorrelate — more robust against broadband noise than full-band autocorr."""
+    try:
+        nyq = fs / 2.0
+        lo = max(flo * 0.85, 5.0) / nyq
+        hi = min(fhi * 1.15, nyq * 0.98) / nyq
+        if hi <= lo or hi >= 1.0:
+            return np.full(nt, np.nan, dtype=float)
+        b, a = signal.butter(3, [lo, hi], btype='band')
+        seg_bp = signal.filtfilt(b, a, seg.astype(np.float64)).astype(np.float32)
+        return _audio_autocorr_line(seg_bp, fs, nfft_eff, noverlap, nt, flo, fhi)
+    except Exception:
+        return np.full(nt, np.nan, dtype=float)
+
+
 def _audio_get_vehicle_title() -> str:
     obj = st.session_state.get("mat_selected_summary")
     dataset = ""
@@ -6352,7 +6457,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
     prog(0, total_jobs, "Audioanalyse vorbereitet")
 
     all_candidates = []
-    all_method_names = ["Hybrid", "STFT Ridge", "STFT Viterbi", "Original Peak", "Autokorrelation/YIN", "Cepstrum", "Harmonic Comb/HPS", "CWT/Wavelet"]
+    all_method_names = ["Hybrid", "STFT Ridge", "STFT Viterbi", "Original Peak", "Autokorrelation/YIN", "Cepstrum", "Harmonic Comb/HPS", "CWT/Wavelet", "pYIN", "CQT/Constant-Q", "Harmonische Summe", "Bandpass/Autokorr"]
     comb_harmonics = int(mp.get("comb_harmonics", 4) or 4)
     viterbi_jump_hz = float(mp.get("viterbi_jump_hz", 25.0) or 25.0)
     viterbi_penalty = float(mp.get("viterbi_penalty", 1.2) or 1.2)
@@ -6418,6 +6523,15 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                 # CWT/Wavelet ist sehr langsam; im Schnellmodus nur bei expliziter Auswahl.
                 if method_s == "CWT/Wavelet" or ((not fast_mode) and bool(mp.get("always_run_cwt", False))):
                     method_lines["CWT/Wavelet"] = _audio_cwt_like_line(seg, fs, t_video, flo, fhi)
+                # Neue Methoden (mittlere Genauigkeit / andere Ansätze)
+                if (not fast_mode) or method_s == "pYIN":
+                    method_lines["pYIN"] = _audio_pyin_line(seg, fs, nfft_eff, noverlap, sb.shape[1], flo, fhi)
+                if (not fast_mode) or method_s == "CQT/Constant-Q":
+                    method_lines["CQT/Constant-Q"] = _audio_cqt_line(seg, fs, nfft_eff, noverlap, sb.shape[1], flo, fhi)
+                if (not fast_mode) or method_s == "Harmonische Summe":
+                    method_lines["Harmonische Summe"] = _audio_harmonic_sum_line(freqs2, score, flo, fhi, n_harmonics=5)
+                if (not fast_mode) or method_s == "Bandpass/Autokorr":
+                    method_lines["Bandpass/Autokorr"] = _audio_bandpass_autocorr_line(seg, fs, nfft_eff, noverlap, sb.shape[1], flo, fhi)
 
                 scores = {name: _audio_line_score(line, freqs2, score, flo, fhi) for name, line in method_lines.items()}
                 valid = [(name, line) for name, line in method_lines.items() if np.isfinite(scores.get(name, np.nan)) and scores.get(name, -1e12) > -1e11]

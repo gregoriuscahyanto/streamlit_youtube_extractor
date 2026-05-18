@@ -93,16 +93,29 @@ def render(ns):
             step=1,
             disabled=is_running,
         ))
+        _sweep_active = bool(st.session_state.get("audio_sweep_running"))
+        _audio_active = st.session_state.get("audio_bg_future") is not None
+        _resource_busy = _sweep_active or _audio_active
         start_clicked = w2.form_submit_button(
             "Watchdog starten",
             type="primary",
             use_container_width=True,
-            disabled=is_running or bool(st.session_state.get("yt_bg_active")),
+            disabled=is_running or bool(st.session_state.get("yt_bg_active")) or _resource_busy,
         )
         stop_clicked = w3.form_submit_button(
             "Watchdog stoppen",
             use_container_width=True,
             disabled=not is_running,
+        )
+
+    if _resource_busy and not is_running:
+        _busy_reason = []
+        if _sweep_active: _busy_reason.append("Parameter-Sweep läuft")
+        if _audio_active: _busy_reason.append("Audio-Analyse läuft")
+        st.warning(
+            f"Watchdog gesperrt: {' + '.join(_busy_reason)}. "
+            "Tesseract (OCR) + FFT-Analyse gleichzeitig führt zu Speicherkonflikten und Abstürzen. "
+            "Bitte erst den laufenden Prozess abwarten oder stoppen."
         )
 
     if start_clicked:
