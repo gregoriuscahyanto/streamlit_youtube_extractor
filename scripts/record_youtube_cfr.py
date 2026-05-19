@@ -2,7 +2,7 @@ import argparse, time, threading, queue, subprocess, shutil, platform, sys, os, 
 import numpy as np
 import pyautogui
 import webbrowser
-import sounddevice as sd
+import pyaudiowpatch as paw
 import soundfile as sf
 import mss
 import cv2
@@ -71,44 +71,39 @@ def safe_sleep(s):
 def has_ffmpeg():
     return shutil.which("ffmpeg") is not None
 
-def find_stereo_mix_device():
-    devices = sd.query_devices()
-    for i, dev in enumerate(devices):
-        name = (dev.get("name") or "").lower()
-        max_in = dev.get("max_input_channels", 0)
+def find_loopback_device():
+    """Return pyaudiowpatch device index for the current default audio output's loopback.
 
-        # Stereo Mix muss Input-Kanäle haben
-        if max_in > 0 and (
-            "stereomix" in name or
-            "stereo mix" in name or
-            "stereo-input" in name
-        ):
-            print(f"[AUDIO] StereoMix found: index={i}, name={dev['name']}")
-            return i
-
-    print("[AUDIO] StereoMix not found.")
-    return None
-
-
-def find_default_output_device():
+    pyaudiowpatch exposes every WASAPI output as a '[Loopback]' input device.
+    Automatically selects the right loopback regardless of whether Realtek speakers
+    or Plantronics headphones are the active output.
+    """
+    p = paw.PyAudio()
     try:
-        devs = sd.query_devices()
-        _default_in, default_out = sd.default.device
-        if isinstance(default_out, int) and 0 <= default_out < len(devs):
-            d = devs[default_out]
-            print(f"[AUDIO] Default output device: index={default_out}, name={d.get('name','?')}")
-            return int(default_out)
-    except Exception:
-        pass
-    try:
-        devs = sd.query_devices()
-        for i, d in enumerate(devs):
-            if int(d.get("max_output_channels", 0) or 0) > 0:
-                print(f"[AUDIO] Fallback output device: index={i}, name={d.get('name','?')}")
-                return int(i)
-    except Exception:
-        pass
-    return None
+        wasapi_idx = next(
+            i for i in range(p.get_host_api_count())
+            if "WASAPI" in (p.get_host_api_info_by_index(i).get("name") or "")
+        )
+        default_out_idx = p.get_host_api_info_by_index(wasapi_idx)["defaultOutputDevice"]
+        out_name = p.get_device_info_by_index(default_out_idx)["name"]
+        print(f"[AUDIO] Active output: index={default_out_idx}, name={out_name}")
+        target_name = out_name + " [Loopback]"
+        # Pass 1: exact loopback match for the active output
+        for i in range(p.get_device_count()):
+            d = p.get_device_info_by_index(i)
+            if d.get("isLoopbackDevice") and d["name"] == target_name:
+                print(f"[AUDIO] Loopback device: index={i}, name={d['name']}")
+                return i
+        # Pass 2: any loopback fallback
+        for i in range(p.get_device_count()):
+            d = p.get_device_info_by_index(i)
+            if d.get("isLoopbackDevice") and d.get("maxInputChannels", 0) > 0:
+                print(f"[AUDIO] Fallback loopback: index={i}, name={d['name']}")
+                return i
+        print("[AUDIO] No loopback device found.")
+        return None
+    finally:
+        p.terminate()
 
 # ===================== NEW: Active window -> Monitor detection (Windows) =====================
 def get_active_window_rect():
@@ -162,84 +157,47 @@ class AudioRecorder:
     def __init__(self, sr=AUDIO_SR, ch=AUDIO_CH, dtype='int16'):
         self.sr = sr
         self.ch = ch
-        self.dtype = dtype
         self._queue = queue.Queue()
-        self._stop = threading.Event()
         self._start_event = threading.Event()
         self._stream = None
+        self._pa = None
         self.frames = 0
 
-    def _cb(self, indata, frames, time_info, status):
-        if not self._start_event.is_set():
-            return
-        # In Queue legen (kopieren, damit Buffer nicht überschrieben wird)
-        self._queue.put(indata.copy())
-        self.frames += frames
+    def _cb(self, in_data, frame_count, time_info, status):
+        if self._start_event.is_set():
+            data = np.frombuffer(in_data, dtype=np.int16).reshape(-1, self.ch)
+            self._queue.put(data.copy())
+            self.frames += frame_count
+        return (None, paw.paContinue)
 
-    # def start(self):
-    #     self._stream = sd.InputStream(samplerate=self.sr, channels=self.ch, dtype=self.dtype, callback=self._cb)
-    #     self._stream.start()
-
-    def start(self, device=None, extra_settings=None):
-        self._stream = sd.InputStream(
-            samplerate=self.sr,
+    def start(self, device=None):
+        self._pa = paw.PyAudio()
+        self._stream = self._pa.open(
+            format=paw.paInt16,
             channels=self.ch,
-            dtype=self.dtype,
-            callback=self._cb,
-            device=device,
-            extra_settings=extra_settings,
+            rate=self.sr,
+            input=True,
+            input_device_index=device,
+            frames_per_buffer=1024,
+            stream_callback=self._cb,
         )
-        self._stream.start()
-
+        self._stream.start_stream()
+        print(f"[AUDIO] input capture aktiv: dev={device}, sr={self.sr}, ch={self.ch}")
 
     def trigger(self):
         self._start_event.set()
 
     def stop(self):
-        self._stop.set()
         if self._stream:
-            self._stream.stop()
+            self._stream.stop_stream()
             self._stream.close()
+        if self._pa:
+            self._pa.terminate()
 
     def dump_to_wav(self, path):
-        # Queue rest leeren und schreiben
-        # Wir sammeln in Chunks, um RAM zu sparen
         with sf.SoundFile(path, mode='w', samplerate=self.sr, channels=self.ch, subtype=AUDIO_FMT) as f:
             while not self._queue.empty():
                 f.write(self._queue.get())
-
-
-def _device_sample_rates(device_index: int) -> list[int]:
-    out = []
-    try:
-        d = sd.query_devices(int(device_index))
-        dsr = int(float(d.get("default_samplerate") or 0))
-        if dsr > 0:
-            out.append(dsr)
-    except Exception:
-        pass
-    for sr in (AUDIO_SR, 48000, 44100):
-        s = int(sr)
-        if s > 0 and s not in out:
-            out.append(s)
-    return out
-
-
-def _try_start_audio(device_index: int, use_loopback: bool) -> tuple[AudioRecorder | None, str]:
-    last_err = ""
-    for sr in _device_sample_rates(int(device_index)):
-        for ch in (2, 1):
-            try:
-                rec = AudioRecorder(sr=int(sr), ch=int(ch), dtype='int16')
-                extra = sd.WasapiSettings(loopback=True) if use_loopback else None
-                rec.start(device=int(device_index), extra_settings=extra)
-                mode = "WASAPI loopback" if use_loopback else "input capture"
-                print(f"[AUDIO] {mode} aktiv: dev={device_index}, sr={sr}, ch={ch}")
-                return rec, ""
-            except Exception as e:
-                last_err = str(e)
-                print(f"[AUDIO] Start fehlgeschlagen: dev={device_index}, sr={sr}, ch={ch}, loopback={use_loopback}: {e}")
-    return None, last_err or "unbekannter audio-startfehler"
 
 # ===================== Video: CFR Grabber + Writer =====================
 class CFRVideoRecorder:
@@ -271,9 +229,20 @@ class CFRVideoRecorder:
 
         W, H = self.rect["width"], self.rect["height"]
 
+        # Downscale if the monitor resolution exceeds 1920×1080.
+        # 4K capture (3840×2160) is 4× more pixels than 1080p — too slow for 30fps XVID.
+        MAX_W, MAX_H = 1920, 1080
+        if W > MAX_W or H > MAX_H:
+            scale = min(MAX_W / W, MAX_H / H)
+            self.out_w = int(W * scale) & ~1  # ensure even (codec requirement)
+            self.out_h = int(H * scale) & ~1
+            print(f"[VIDEO] Downscale {W}×{H} → {self.out_w}×{self.out_h} (factor {scale:.2f})")
+        else:
+            self.out_w, self.out_h = W, H
+
         # jetzt: AVI mit XVID (oder alternativ "MJPG")
         fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        self.writer = cv2.VideoWriter(self.filename, fourcc, self.fps, (W, H))
+        self.writer = cv2.VideoWriter(self.filename, fourcc, self.fps, (self.out_w, self.out_h))
 
         self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
 
@@ -311,9 +280,10 @@ class CFRVideoRecorder:
 
                 grabbed = self.sct.grab(self.rect)  # BGRA
                 frame_bgr = cv2.cvtColor(np.array(grabbed), cv2.COLOR_BGRA2BGR)
+                if frame_bgr.shape[1] != self.out_w or frame_bgr.shape[0] != self.out_h:
+                    frame_bgr = cv2.resize(frame_bgr, (self.out_w, self.out_h), interpolation=cv2.INTER_LINEAR)
 
                 if self.q.full():
-                    # Drop oldest if overloaded
                     try:
                         self.q.get_nowait()
                     except queue.Empty:
@@ -323,9 +293,18 @@ class CFRVideoRecorder:
 
                 next_t += self.frame_dt
                 now2 = time.perf_counter()
-                if next_t < now2 - 2*self.frame_dt:
-                    while next_t < now2 - self.frame_dt:
+                # If capture is too slow, duplicate the last frame for each missed
+                # slot so that video duration stays in sync with the audio clock.
+                # Cap duplicates per iteration to avoid unbounded queue growth.
+                if next_t < now2 - 2 * self.frame_dt:
+                    max_dup = int(min((now2 - next_t) / self.frame_dt, self.fps * 2))
+                    for _ in range(max_dup):
+                        if next_t >= now2 - self.frame_dt:
+                            break
                         next_t += self.frame_dt
+                        if not self.q.full():
+                            self.q.put_nowait(frame_bgr.copy())
+                            self.nframes += 1
 
                 if elapsed - last_ui >= 1.0:
                     print("\rRecording " + progress_line(elapsed, record_duration), end="", flush=True)
@@ -923,30 +902,17 @@ def main():
 
     # 2) Recorder initialisieren
     print("🎤 Initialisiere Audio…")
-    audio = None
     device_index = args.audio_device
-    audio_errors = []
-
-    # Preferred path on Windows: WASAPI loopback from output device (real speaker output).
-    if (not args.no_loopback) and platform.system().lower() == "windows":
-        out_dev = device_index if device_index is not None else find_default_output_device()
-        if out_dev is not None:
-            audio, err = _try_start_audio(int(out_dev), use_loopback=True)
-            if audio is None:
-                audio_errors.append(f"WASAPI dev {out_dev}: {err}")
-
-    # Fallback: classic Stereo Mix input device.
-    if audio is None:
-        sm_dev = find_stereo_mix_device() if device_index is None else device_index
-        if sm_dev is not None:
-            audio, err = _try_start_audio(int(sm_dev), use_loopback=False)
-            if audio is None:
-                audio_errors.append(f"StereoMix dev {sm_dev}: {err}")
-
-    if audio is None:
+    if device_index is None:
+        device_index = find_loopback_device()
+    if device_index is None:
         raise RuntimeError(
-            "Kein echtes Audio-Capture verfuegbar. Details: " + "; ".join([e for e in audio_errors if e])
+            "Kein Loopback-Aufnahmegerät gefunden. "
+            "Bitte StereoMix in den Windows-Soundeinstellungen aktivieren oder "
+            "ein anderes Ausgabegerät wählen."
         )
+    audio = AudioRecorder(sr=AUDIO_SR, ch=AUDIO_CH)
+    audio.start(device=device_index)
 
     print(f"🎥 Initialisiere Video @ {fps:.2f} fps…")
     video = CFRVideoRecorder(filename=video_tmp, fps=fps, region=region)

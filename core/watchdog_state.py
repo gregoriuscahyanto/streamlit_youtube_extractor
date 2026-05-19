@@ -34,6 +34,11 @@ _YT_WATCHDOG: dict = {
 # Avoids re-reading large JSON files (with OCR tables) on every rerun.
 _JSON_ROW_CACHE: dict[str, tuple[float, dict]] = {}
 
+# Silence cache: str(wav_path) -> (mtime, is_silent: bool)
+# Shared between watchdog thread and Streamlit render thread.
+# Dict reads/writes are GIL-atomic so no extra lock needed.
+_AUDIO_SILENCE_CACHE: dict[str, tuple[float, bool]] = {}
+
 # Per-path write locks — LRU-capped at 500 entries to prevent unbounded growth.
 _PATH_LOCKS: "OrderedDict[str, threading.Lock]" = OrderedDict()
 _PATH_LOCKS_REGISTRY_LOCK = threading.Lock()

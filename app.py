@@ -1,4 +1,4 @@
-"""
+﻿"""
 OCR Extractor - Streamlit App v4
 Tab 1: Cloudflare R2-Verbindung, Prefix waehlen, Datei-Browser
 Tab 2: Video laden, Start/Ende, ROI-Auswahl
@@ -6692,7 +6692,7 @@ def _build_audio_rpm_struct_from_result(res: dict) -> dict:
                 fn = _matlab_field_name(k)
                 if fn not in all_keys:
                     all_keys.append(fn)
-        cand_tbl: dict = {}
+        cand_tbl: dict = {}0f
         for fn in all_keys:
             raw_key = next((k for k in (rows[0] or {}).keys() if _matlab_field_name(k) == fn), fn)
             vals = [(r or {}).get(raw_key, "") for r in rows]

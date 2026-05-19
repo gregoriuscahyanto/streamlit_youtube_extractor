@@ -24,6 +24,7 @@ _CONV: dict = {
 _DETAIL_CACHE: dict[str, tuple[float, dict]] = {}
 
 
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _conv_log(msg: str) -> None:
@@ -40,6 +41,49 @@ def _base() -> Path:
 
 def _lamp(ok: bool) -> str:
     return "🟢" if ok else "🔴"
+
+
+def _audio_is_silent(wav_path: Path) -> bool:
+    """Return True if the WAV contains no audible signal (peak < 0.01, i.e. -40 dBFS).
+
+    Uses the shared _AUDIO_SILENCE_CACHE from watchdog_state so the result is
+    consistent with the watchdog's media_ok check and is never recomputed twice.
+    """
+    from core.watchdog_state import _AUDIO_SILENCE_CACHE
+    key = str(wav_path)
+    try:
+        mtime = wav_path.stat().st_mtime
+    except Exception:
+        return False
+    if key in _AUDIO_SILENCE_CACHE and _AUDIO_SILENCE_CACHE[key][0] == mtime:
+        return _AUDIO_SILENCE_CACHE[key][1]
+    try:
+        import soundfile as sf
+        import numpy as np
+        peak = 0.0
+        with sf.SoundFile(key) as wav:
+            sr = wav.samplerate
+            total = wav.frames
+            check_s = sr
+            for pos in [0, max(0, total // 2 - check_s // 2), max(0, total - check_s)]:
+                wav.seek(pos)
+                chunk = wav.read(frames=check_s, dtype="float32", always_2d=True)
+                if chunk.size:
+                    peak = max(peak, float(np.abs(chunk).max()))
+        is_silent = peak < 0.01
+    except Exception:
+        is_silent = False
+    _AUDIO_SILENCE_CACHE[key] = (mtime, is_silent)
+    return is_silent
+
+
+def _lamp_audio(wav_path: Path | None, has_any_audio: bool) -> str:
+    """🟢 audio ok | 🔴 silent WAV | 🔴 no audio file."""
+    if not has_any_audio or wav_path is None or not wav_path.exists():
+        return "🔴"
+    if _audio_is_silent(wav_path):
+        return "🔴 stumm"
+    return "🟢"
 
 
 def _lamp3(status: str) -> str:
@@ -203,6 +247,7 @@ def _scan_rows(base: Path) -> list[dict]:
 
             cap_dir = cap_root / folder
             has_video = has_audio = False
+            canonical_wav = cap_dir / f"screen_{folder}_audio.wav"
             if cap_dir.exists():
                 for f in cap_dir.iterdir():
                     if not f.is_file() or f.stat().st_size <= 0:
@@ -223,6 +268,7 @@ def _scan_rows(base: Path) -> list[dict]:
                 "mat_exists": stem in mat_by_stem,
                 "video_exists": has_video,
                 "audio_exists": has_audio,
+                "canonical_wav": canonical_wav,
                 "video_faulty": detail.get("video_faulty", False),
                 "no_roi_available": detail.get("no_roi_available", False),
                 "download_status": "",
@@ -246,6 +292,7 @@ def _scan_rows(base: Path) -> list[dict]:
             "folder": folder, "title": "", "youtube_link": "", "upload_date": "",
             "duration": 0.0, "json_exists": False, "mat_exists": True,
             "video_exists": False, "audio_exists": False,
+            "canonical_wav": cap_root / folder / f"screen_{folder}_audio.wav",
             "video_faulty": False, "no_roi_available": False,
             "download_status": "", "downloaded_at": "", "last_error": "",
             "roi": False, "roi_status": "nein", "ocr": "nein",
@@ -296,6 +343,7 @@ def _scan_rows(base: Path) -> list[dict]:
             "duration": 0.0,
             "json_exists": False, "mat_exists": False,
             "video_exists": False, "audio_exists": False,
+            "canonical_wav": (cap_root / folder / f"screen_{folder}_audio.wav") if folder else None,
             "video_faulty": False, "no_roi_available": False,
             "download_status": str(db_row.get("download_status") or "pending"),
             "downloaded_at": str(db_row.get("downloaded_at") or ""),
@@ -320,7 +368,7 @@ def _build_df(rows: list[dict]):
         "JSON": _lamp(r["json_exists"]),
         "MAT": _lamp(r["mat_exists"]),
         "Video": _lamp(r["video_exists"]),
-        "Audio": _lamp(r["audio_exists"]),
+        "Audio": _lamp_audio(r.get("canonical_wav"), r["audio_exists"]),
         "ROI": _lamp3(r.get("roi_status", "nein" if not r["roi"] else "vollständig")),
         "ROI n.v.": _lamp(r.get("no_roi_available", False)),
         "Fehlerhaft": _lamp(r.get("video_faulty", False)),
@@ -657,6 +705,35 @@ def render(ns: dict) -> None:
         with st.expander("Letzter Konvertierungs-Log", expanded=False):
             st.code("\n".join(log_lines[-30:]), language="text")
 
+    # ── Nächste Datei ohne ROI laden ───────────────────────────────────────────
+    def _next_roi_candidate() -> dict | None:
+        """Find first row: video present, not faulty, not no_roi_available, no ROI yet."""
+        for r in rows:
+            if not r.get("video_exists"):
+                continue
+            if r.get("video_faulty"):
+                continue
+            if r.get("no_roi_available"):
+                continue
+            if r.get("roi"):  # already has ROI
+                continue
+            return r
+        return None
+
+    _next_roi = _next_roi_candidate()
+    _next_roi_btn_label = (
+        f"Nächste ohne ROI laden: {_next_roi['folder']}" if _next_roi else "Nächste ohne ROI laden"
+    )
+    if st.button(
+        _next_roi_btn_label,
+        disabled=_next_roi is None,
+        key="lib_next_roi_btn",
+        help="Lädt die erste Datei, die ein Video hat, nicht als fehlerhaft / kein ROI markiert ist, aber noch kein ROI besitzt.",
+    ):
+        st.session_state["lib_pending_load_folder"] = _next_roi["folder"]
+        st.session_state["lib_pending_load_json"] = _next_roi.get("json_path", "")
+        st.rerun()
+
     # ── Action bar ─────────────────────────────────────────────────────────────
     col_mat, col_dl, col_link = st.columns([2, 3, 3])
 
@@ -884,10 +961,27 @@ def render(ns: dict) -> None:
     # ── Ausgewählte Zeile: Aktionen ────────────────────────────────────────────
     sel_indices = (selection.selection.rows
                    if hasattr(selection, "selection") and selection.selection else [])
-    if not sel_indices:
+
+    # Auto-load triggered by "Nächste ohne ROI laden" button
+    _pending_folder = str(st.session_state.pop("lib_pending_load_folder", "") or "").strip()
+    _pending_json   = str(st.session_state.pop("lib_pending_load_json",   "") or "").strip()
+    if _pending_folder:
+        st.session_state["lib_autoload_folder"]   = _pending_folder
+        st.session_state["lib_autoload_json_path"] = _pending_json
+
+    if not sel_indices and not st.session_state.get("lib_autoload_folder"):
         return
 
-    sel_row = rows[sel_indices[0]]
+    if sel_indices:
+        sel_row = rows[sel_indices[0]]
+    else:
+        # Auto-load path: find row by folder name
+        _af = str(st.session_state.get("lib_autoload_folder") or "").strip()
+        sel_row = next((r for r in rows if r["folder"] == _af), None)
+        if sel_row is None:
+            st.session_state.pop("lib_autoload_folder", None)
+            st.session_state.pop("lib_autoload_json_path", None)
+            return
     st.divider()
 
     _hdr_c1, _hdr_c2 = st.columns([6, 1])
@@ -1198,6 +1292,19 @@ def render(ns: dict) -> None:
             st.session_state.moving_pt_color_range = _pending_color_range
 
         return msgs
+
+    # If triggered by "Nächste ohne ROI laden", auto-load now and clear the flag
+    _autoload_folder = str(st.session_state.get("lib_autoload_folder") or "").strip()
+    if _autoload_folder and _autoload_folder == sel_row["folder"]:
+        _autoload_json = str(st.session_state.pop("lib_autoload_json_path", "") or "").strip()
+        st.session_state.pop("lib_autoload_folder", None)
+        _auto_msgs = _load_folder(sel_row["folder"], _autoload_json or sel_row.get("json_path", ""))
+        for _am in _auto_msgs:
+            st.warning(_am)
+        st.success(
+            f"Geladen: **{sel_row['folder']}** – kein ROI vorhanden. "
+            "Bitte im Tab **ROI Setup** die ROIs konfigurieren."
+        )
 
     can_load = sel_row["json_exists"] or sel_row["video_exists"] or sel_row["audio_exists"]
     ra1, ra2, ra3, ra4 = st.columns(4)

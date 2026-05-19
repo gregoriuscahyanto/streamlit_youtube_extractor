@@ -17,6 +17,18 @@ def render(ns):
     # ── Aktive Aufgaben — immer editierbar, wirken beim nächsten Tick ─────────
     st.markdown("**Aktive Aufgaben**")
     st.caption("Änderungen werden beim nächsten Tick übernommen, ohne die laufende Aufgabe zu unterbrechen.")
+
+    # When the watchdog is running, use its live task state as the source of truth
+    # so that a Streamlit session reset / browser reconnect doesn't silently disable tasks.
+    if is_running:
+        with _YT_WATCHDOG_LOCK:
+            _live_tasks = dict(_YT_WATCHDOG.get("tasks") or {})
+        st.session_state.yt_watchdog_task_mat_json = bool(_live_tasks.get("mat_json", False))
+        st.session_state.yt_watchdog_task_download = bool(_live_tasks.get("download", False))
+        st.session_state.yt_watchdog_task_ocr     = bool(_live_tasks.get("ocr",      True))
+        st.session_state.yt_watchdog_task_reclean  = bool(_live_tasks.get("reclean",  False))
+        st.session_state.yt_watchdog_task_retrofix = bool(_live_tasks.get("retrofix", False))
+
     t1, t2 = st.columns(2)
     task_mat_json = t1.checkbox(
         "Konvertierung MAT → JSON",

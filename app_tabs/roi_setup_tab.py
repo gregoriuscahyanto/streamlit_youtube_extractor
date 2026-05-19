@@ -139,11 +139,15 @@ def render(ns):
             st.session_state._roi_prev_start = float(st.session_state.t_start)
             st.session_state._roi_prev_end = float(st.session_state.t_end)
 
+            _sl_min = float(st.session_state.t_start)
+            _sl_max = float(st.session_state.t_end)
+            if _sl_max <= _sl_min:
+                _sl_max = _sl_min + 1.0
             t_cur = st.slider(
                 "Position [s]",
-                float(st.session_state.t_start),
-                float(st.session_state.t_end),
-                float(min(max(st.session_state.t_current, st.session_state.t_start), st.session_state.t_end)),
+                _sl_min,
+                _sl_max,
+                float(min(max(st.session_state.t_current, _sl_min), _sl_max)),
                 step=step_s,
                 format="%d s",
                 key="sl_cur",

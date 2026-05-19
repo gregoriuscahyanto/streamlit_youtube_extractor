@@ -143,14 +143,78 @@ def render(ns):
         return datetime.now().strftime("%Y%m%d_%H%M%S")
 
     def _capture_media_paths(folder: str, base_override=None) -> tuple[Path, Path]:
+        """Return (video_path, audio_path) for a capture folder.
+
+        Canonical output paths for new downloads:
+          screen_{folder}_video.avi  — video
+          screen_{folder}_audio.wav  — audio
+
+        For existence checks use _find_existing_media() which also recognises
+        alternative extensions (mp4, mp3, etc.).
+        """
         folder = str(folder or "").strip()
         cap_dir = _capture_base(base_override=base_override) / "captures" / folder
-        stem = f"screen_{folder}_audio"
-        return cap_dir / f"{stem}.avi", cap_dir / f"{stem}.wav"
+        return cap_dir / f"screen_{folder}_video.avi", cap_dir / f"screen_{folder}_audio.wav"
+
+    def _find_existing_media(folder: str, base_override=None) -> tuple[Path | None, Path | None]:
+        """Return (video, audio) paths for any existing media in the capture folder.
+
+        Checks canonical names first, then falls back to any supported extension.
+        Returns None for each component that is missing or empty.
+        """
+        folder = str(folder or "").strip()
+        cap_dir = _capture_base(base_override=base_override) / "captures" / folder
+        stem = f"screen_{folder}"
+
+        video_exts = [".avi", ".mp4", ".mkv", ".mov"]
+        audio_exts = [".wav", ".mp3", ".m4a", ".aac", ".flac"]
+
+        def _pick(exts: list[str]) -> Path | None:
+            # Prefer canonical stem, then any file with matching extension
+            for ext in exts:
+                p = cap_dir / f"{stem}_video{ext}" if ext in video_exts else cap_dir / f"{stem}_audio{ext}"
+                if p.exists() and p.stat().st_size > 0:
+                    return p
+            # Fallback: any file in the folder with a matching extension
+            if cap_dir.exists():
+                for ext in exts:
+                    for p in cap_dir.glob(f"*{ext}"):
+                        if p.stat().st_size > 0:
+                            return p
+            return None
+
+        def _pick_video() -> Path | None:
+            for ext in video_exts:
+                p = cap_dir / f"{stem}_video{ext}"
+                if p.exists() and p.stat().st_size > 0:
+                    return p
+            if cap_dir.exists():
+                for ext in video_exts:
+                    for p in cap_dir.glob(f"*{ext}"):
+                        if p.stat().st_size > 0:
+                            return p
+            return None
+
+        def _pick_audio() -> Path | None:
+            for ext in audio_exts:
+                p = cap_dir / f"{stem}_audio{ext}"
+                if p.exists() and p.stat().st_size > 0:
+                    return p
+            if cap_dir.exists():
+                for ext in audio_exts:
+                    for p in cap_dir.glob(f"*{ext}"):
+                        if p.stat().st_size > 0:
+                            return p
+            return None
+
+        return _pick_video(), _pick_audio()
 
     def _capture_media_stem(folder: str) -> str:
+        """Base name passed as --out to the recording script.
+        The script appends _video.avi and _audio.wav to this stem.
+        """
         folder = str(folder or "").strip()
-        return f"screen_{folder}_audio"
+        return f"screen_{folder}"
 
     def _resolve_media_path_value(raw_path, *, base_override=None) -> Path | None:
         txt = str(raw_path or "").strip()
@@ -316,25 +380,40 @@ def render(ns):
         pub_v = str(meta.get("pubDate") or meta.get("upload_date") or "")
         desc_v = str(meta.get("desc") or "")
         chan_v = str(meta.get("chanName") or meta.get("channel_name") or "")
-        payload = {
-            "recordResult": {
-                "metadata": {
-                    "title": title_v,
-                    "video": video_v,
-                    "audio": audio_v,
-                    "url": url_v,
-                    "created_at": created_at_v,
-                    "outdir": outdir_v,
-                    "fps": float(fps_v),
-                    "duration": float(duration_v),
-                    "pubDate": pub_v,
-                    "desc": desc_v,
-                    "chanName": chan_v,
-                }
-            }
+        new_metadata = {
+            "title": title_v,
+            "video": video_v,
+            "audio": audio_v,
+            "url": url_v,
+            "created_at": created_at_v,
+            "outdir": outdir_v,
+            "fps": float(fps_v),
+            "duration": float(duration_v),
+            "pubDate": pub_v,
+            "desc": desc_v,
+            "chanName": chan_v,
         }
         path = res_dir / f"results_{folder}.json"
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Merge: preserve all existing data (OCR, ROI, etc.) — only update metadata section.
+        existing: dict = {}
+        if path.exists():
+            try:
+                raw_existing = path.read_text(encoding="utf-8", errors="replace")
+                existing = json.loads(raw_existing)
+                if not isinstance(existing, dict):
+                    existing = {}
+                else:
+                    # Backup before overwriting — keeps the last known-good state.
+                    try:
+                        path.with_suffix(".json.bak").write_text(raw_existing, encoding="utf-8")
+                    except Exception:
+                        pass
+            except Exception:
+                existing = {}
+        record = existing.get("recordResult") if isinstance(existing.get("recordResult"), dict) else {}
+        record["metadata"] = new_metadata
+        existing["recordResult"] = record
+        path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
         if not path.exists():
             return False, f"JSON nicht geschrieben: {path}"
         if not quiet:
@@ -343,25 +422,38 @@ def render(ns):
         return True, str(path)
 
     def _ensure_audio_file(folder: str, base_override=None) -> tuple[bool, str]:
-        out_video, out_audio = _capture_media_paths(folder, base_override=base_override)
-        if out_audio.exists() and out_audio.stat().st_size > 0:
-            return True, str(out_audio)
-        if not out_video.exists() or out_video.stat().st_size <= 0:
-            return False, "video fehlt"
+        from core.watchdog_state import _AUDIO_SILENCE_CACHE
+        _, out_audio = _find_existing_media(folder, base_override=base_override)
+        if out_audio is None:
+            return False, "audio fehlt (wav/mp3/m4a)"
+        key = str(out_audio)
         try:
-            ffmpeg_exe = __import__("shutil").which("ffmpeg")
+            mtime = out_audio.stat().st_mtime
         except Exception:
-            ffmpeg_exe = None
-        if ffmpeg_exe:
+            mtime = 0.0
+        if key in _AUDIO_SILENCE_CACHE and _AUDIO_SILENCE_CACHE[key][0] == mtime:
+            is_silent = _AUDIO_SILENCE_CACHE[key][1]
+        else:
             try:
-                cmd = [ffmpeg_exe, "-y", "-i", str(out_video), "-vn", "-ac", "1", "-ar", "48000", str(out_audio)]
-                p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                if p.returncode == 0 and out_audio.exists() and out_audio.stat().st_size > 0:
-                    return True, str(out_audio)
-                return False, "ffmpeg konnte kein Audio extrahieren"
-            except Exception:
-                return False, "ffmpeg-Aufruf fehlgeschlagen"
-        return False, "kein echtes Audio gefunden (kein Platzhalter erzeugt)"
+                import soundfile as sf
+                import numpy as np
+                peak = 0.0
+                with sf.SoundFile(key) as wav:
+                    sr = wav.samplerate
+                    total = wav.frames
+                    check_s = sr  # 1 s per sample point
+                    for pos in [0, max(0, total // 2 - check_s // 2), max(0, total - check_s)]:
+                        wav.seek(pos)
+                        chunk = wav.read(frames=check_s, dtype="float32", always_2d=True)
+                        if chunk.size:
+                            peak = max(peak, float(np.abs(chunk).max()))
+                is_silent = peak < 0.01
+            except Exception as e:
+                return False, f"audio.wav nicht lesbar: {e}"
+            _AUDIO_SILENCE_CACHE[key] = (mtime, is_silent)
+        if is_silent:
+            return False, "audio.wav ist stumm – Loopback-Gerät prüfen"
+        return True, str(out_audio)
 
     def _download_one(
         entry: dict,
@@ -370,6 +462,7 @@ def render(ns):
         base_override=None,
         open_new_window: bool | None = None,
         move_other_display: bool | None = None,
+        stop_event=None,
     ) -> tuple[bool, str, dict]:
         url = str(entry.get("youtube_link") or "").strip()
         if not url:
@@ -383,8 +476,17 @@ def render(ns):
         out_video, out_audio = _capture_media_paths(folder, base_override=base_override)
         cap_dir = out_video.parent
         cap_dir.mkdir(parents=True, exist_ok=True)
-        if (not force) and out_video.exists() and out_audio.exists() and out_video.stat().st_size > 0 and out_audio.stat().st_size > 0:
-            return True, "bereits vorhanden", {"RESULT_VIDEO": str(out_video), "RESULT_AUDIO": str(out_audio)}
+        _ex_vid, _ex_aud = _find_existing_media(folder, base_override=base_override)
+        _aud_already_ok, _ = _ensure_audio_file(folder, base_override=base_override)
+        if (not force) and _ex_vid is not None and _aud_already_ok:
+            return True, "bereits vorhanden", {"RESULT_VIDEO": str(_ex_vid), "RESULT_AUDIO": str(_ex_aud or out_audio)}
+
+        for _stale in (out_video, out_audio):
+            if _stale.exists():
+                try:
+                    _stale.unlink()
+                except Exception:
+                    pass
 
         cmd = [
             sys.executable,
@@ -404,22 +506,43 @@ def render(ns):
             cmd.append("--new-window")
         if use_other_display:
             cmd.append("--other-display")
-        run_kwargs = {
-            "capture_output": True,
+        log_dir = Path("logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"yt_job_{folder}_{int(time.time())}.log"
+        popen_kwargs: dict = {
             "text": True,
             "encoding": "utf-8",
             "errors": "replace",
         }
         if os.name == "nt":
-            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             si.wShowWindow = 0
-            run_kwargs["startupinfo"] = si
-        p = subprocess.run(cmd, **run_kwargs)
-        txt = (p.stdout or "") + "\n" + (p.stderr or "")
+            popen_kwargs["startupinfo"] = si
+        with log_file.open("w", encoding="utf-8") as lf:
+            popen_kwargs["stdout"] = lf
+            popen_kwargs["stderr"] = lf
+            p = subprocess.Popen(cmd, **popen_kwargs)
+        # Poll every 2 s so stop_event can interrupt a running download.
+        while True:
+            try:
+                rc = p.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                if stop_event is not None and stop_event.is_set():
+                    p.terminate()
+                    try:
+                        p.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                    return False, "Download abgebrochen (Watchdog gestoppt)", {}
+        try:
+            txt = log_file.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            txt = ""
         parsed = _parse_result_lines(txt)
-        if p.returncode != 0:
+        if rc != 0:
             return False, txt.strip()[-500:], parsed
 
         src_v = str(parsed.get("RESULT_VIDEO") or "").strip()
@@ -515,6 +638,54 @@ def render(ns):
         except Exception:
             pass
         return {}
+
+    def _wd_is_video_faulty(json_file: Path) -> bool:
+        """Return True if the results JSON marks the video as fehlerhaft."""
+        if not json_file.exists():
+            return False
+        try:
+            doc = json.loads(json_file.read_text(encoding="utf-8", errors="replace"))
+            rr = doc.get("recordResult") if isinstance(doc, dict) else None
+            if not isinstance(rr, dict):
+                return False
+            meta = rr.get("metadata") if isinstance(rr.get("metadata"), dict) else {}
+            ocr  = rr.get("ocr")      if isinstance(rr.get("ocr"),      dict) else {}
+            def _truthy(v) -> bool:
+                if isinstance(v, bool): return v
+                return str(v).strip().lower() in ("true", "1", "ja", "yes")
+            if _truthy(meta.get("video_faulty")) or _truthy(ocr.get("video_faulty")):
+                return True
+            if "video_fehlerhaft" in str(meta.get("video_status") or "").lower():
+                return True
+            if "video_fehlerhaft" in str(ocr.get("video_status") or "").lower():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _wd_clear_video_faulty_in_json(json_file: Path) -> None:
+        """Remove video_faulty / video_status flags from metadata and ocr sections."""
+        if not json_file.exists():
+            return
+        try:
+            doc = json.loads(json_file.read_text(encoding="utf-8", errors="replace"))
+            if not isinstance(doc, dict):
+                return
+            rr = doc.get("recordResult")
+            if not isinstance(rr, dict):
+                return
+            changed = False
+            for section in ("metadata", "ocr"):
+                s = rr.get(section)
+                if isinstance(s, dict):
+                    for field in ("video_faulty", "video_status", "video_note", "video_stamped_at"):
+                        if field in s:
+                            del s[field]
+                            changed = True
+            if changed:
+                json_file.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _wd_extract_ocr_rois(doc: dict) -> tuple[list[dict], bool]:
         rr = doc.get("recordResult") if isinstance(doc, dict) else {}
@@ -1633,7 +1804,7 @@ def render(ns):
 
         return False, "nichts offen"
 
-    def _wd_process_once(cfg: dict) -> bool:
+    def _wd_process_once(cfg: dict, stop_event=None) -> bool:
         base_override = cfg.get("local_base_path")
         # Always read from the live shared dict so UI changes take effect at the
         # next tick without stopping the watchdog mid-operation.
@@ -1689,7 +1860,9 @@ def render(ns):
                 folder = _default_capture_folder()
                 row = _wd_update_row(link, {"capture_folder": folder}) or {**row, "capture_folder": folder}
             out_video, out_audio = _capture_media_paths(folder, base_override=base_override)
-            media_ok = out_video.exists() and out_video.stat().st_size > 0 and out_audio.exists() and out_audio.stat().st_size > 0
+            _ex_video, _ = _find_existing_media(folder, base_override=base_override)
+            _aud_ok, _ = _ensure_audio_file(folder, base_override=base_override)
+            media_ok = _ex_video is not None and _aud_ok
             status = str(row.get("download_status") or "pending").strip().lower()
             json_path = str(row.get("json_path") or "").strip()
             json_file = Path(json_path) if json_path else _wd_json_path(folder, base_override=base_override)
@@ -1699,53 +1872,84 @@ def render(ns):
                 if not need_ocr:
                     _wd_log(f"OCR {folder}: {reason} – skip")
 
-            if task_download and (not media_ok):
-                _wd_set_current(f"Download: {folder}")
-                _wd_log(f"Download gestartet: {folder}")
-                _wd_update_row(link, {"download_status": "downloading", "last_error": ""})
-                ok_dl, msg_dl, parsed = _download_one(
-                    row,
-                    force=False,
-                    base_override=base_override,
-                    open_new_window=bool(cfg.get("open_new_window", True)),
-                    move_other_display=bool(cfg.get("move_other_display", False)),
-                )
-                if not ok_dl:
-                    _wd_update_row(link, {"download_status": "error", "last_error": str(msg_dl or "Download-Fehler")})
-                    _wd_inc("errors")
-                    _wd_log(f"Download Fehler: {folder} -> {msg_dl}")
-                    return True
-                meta_url = _fetch_metadata_for_url(link)
-                title_now = str(parsed.get("RESULT_TITLE") or meta_url.get("title") or row.get("title") or "")
-                pub_now = str(parsed.get("RESULT_PUBDATE") or meta_url.get("pubDate") or row.get("upload_date") or "")
-                ok_meta, msg_meta = _write_capture_metadata_json(
-                    folder,
-                    {
-                        "youtube_url": link,
-                        "video_title": title_now,
-                        "video_name": str(folder),
-                        "upload_date": pub_now,
-                        "desc": str(parsed.get("RESULT_DESC") or meta_url.get("desc") or ""),
-                        "channel_name": str(parsed.get("RESULT_CHANNAME") or meta_url.get("chanName") or ""),
+            if task_download:
+                video_faulty = _wd_is_video_faulty(json_file)
+                with _YT_WATCHDOG_LOCK:
+                    faulty_tried: set = _YT_WATCHDOG.setdefault("faulty_tried", set())
+                    silent_skip: set = _YT_WATCHDOG.setdefault("silent_skip", set())
+
+                # If audio exists but is silent and we already tried once this
+                # session, skip → move to next folder instead of retrying forever.
+                _, _aud_msg = _ensure_audio_file(folder, base_override=base_override)
+                _audio_is_silent_result = "stumm" in str(_aud_msg).lower()
+                if _audio_is_silent_result and folder in silent_skip:
+                    _wd_log(f"Download skip (Audio stumm, bereits probiert): {folder}")
+                    continue
+
+                need_download = (not media_ok) or (video_faulty and folder not in faulty_tried)
+                dl_force = video_faulty and media_ok  # files exist but marked faulty → force
+                if need_download:
+                    if video_faulty:
+                        with _YT_WATCHDOG_LOCK:
+                            _YT_WATCHDOG["faulty_tried"].add(folder)
+                        _wd_log(f"Video fehlerhaft, erzwinge Re-Download: {folder}")
+                    _wd_set_current(f"Download: {folder}")
+                    _wd_log(f"Download gestartet: {folder}")
+                    _wd_update_row(link, {"download_status": "downloading", "last_error": ""})
+                    ok_dl, msg_dl, parsed = _download_one(
+                        row,
+                        force=dl_force,
+                        base_override=base_override,
+                        open_new_window=bool(cfg.get("open_new_window", True)),
+                        move_other_display=bool(cfg.get("move_other_display", False)),
+                        stop_event=stop_event,
+                    )
+                    if not ok_dl:
+                        _wd_update_row(link, {"download_status": "error", "last_error": str(msg_dl or "Download-Fehler")})
+                        _wd_inc("errors")
+                        _wd_log(f"Download Fehler: {folder} -> {msg_dl}")
+                        return True
+                    meta_url = _fetch_metadata_for_url(link)
+                    title_now = str(parsed.get("RESULT_TITLE") or meta_url.get("title") or row.get("title") or "")
+                    pub_now = str(parsed.get("RESULT_PUBDATE") or meta_url.get("pubDate") or row.get("upload_date") or "")
+                    ok_meta, msg_meta = _write_capture_metadata_json(
+                        folder,
+                        {
+                            "youtube_url": link,
+                            "video_title": title_now,
+                            "video_name": str(folder),
+                            "upload_date": pub_now,
+                            "desc": str(parsed.get("RESULT_DESC") or meta_url.get("desc") or ""),
+                            "channel_name": str(parsed.get("RESULT_CHANNAME") or meta_url.get("chanName") or ""),
+                            "downloaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                        base_override=base_override,
+                        quiet=True,
+                    )
+                    patch = {
+                        "download_status": "downloaded",
+                        "last_error": "" if ok_meta else f"metadata.json Fehler: {msg_meta}",
                         "downloaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    },
-                    base_override=base_override,
-                    quiet=True,
-                )
-                patch = {
-                    "download_status": "downloaded",
-                    "last_error": "" if ok_meta else f"metadata.json Fehler: {msg_meta}",
-                    "downloaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "title": title_now,
-                    "upload_date": pub_now,
-                }
-                if ok_meta:
-                    patch["json_path"] = msg_meta
-                    json_file = Path(msg_meta)
-                _wd_update_row(link, patch)
-                _wd_inc("downloads")
-                _wd_log(f"Download abgeschlossen: {folder}")
-                return True
+                        "title": title_now,
+                        "upload_date": pub_now,
+                    }
+                    if ok_meta:
+                        patch["json_path"] = msg_meta
+                        json_file = Path(msg_meta)
+                    _wd_update_row(link, patch)
+                    _wd_inc("downloads")
+                    _wd_log(f"Download abgeschlossen: {folder}")
+                    _wd_clear_video_faulty_in_json(json_file)
+                    with _YT_WATCHDOG_LOCK:
+                        _YT_WATCHDOG.setdefault("clear_faulty_folders", set()).add(folder)
+                    # Check if new audio is still silent → add to silent_skip so
+                    # the watchdog moves on instead of retrying the same folder.
+                    _aud_ok_post, _aud_msg_post = _ensure_audio_file(folder, base_override=base_override)
+                    if not _aud_ok_post and "stumm" in str(_aud_msg_post).lower():
+                        with _YT_WATCHDOG_LOCK:
+                            _YT_WATCHDOG.setdefault("silent_skip", set()).add(folder)
+                        _wd_log(f"Audio stumm nach Download – überspringe {folder} (Loopback prüfen)")
+                    return True
 
             if status != "downloaded":
                 _wd_update_row(link, {"download_status": "downloaded", "last_error": ""})
@@ -1823,7 +2027,7 @@ def render(ns):
         _wd_log("Watchdog gestartet")
         while not stop_event.is_set():
             try:
-                progressed = _wd_process_once(cfg)
+                progressed = _wd_process_once(cfg, stop_event=stop_event)
                 with _YT_WATCHDOG_LOCK:
                     _YT_WATCHDOG["last_tick"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 sleep_s = 1 if progressed else max(2, int(cfg.get("interval_sec", 20) or 20))
@@ -1869,6 +2073,8 @@ def render(ns):
             _YT_WATCHDOG["interval_sec"] = int(interval_sec)
             _YT_WATCHDOG["current"] = ""
             _YT_WATCHDOG["tasks"] = dict(tasks_cfg)
+            _YT_WATCHDOG["faulty_tried"] = set()   # reset per session
+            _YT_WATCHDOG["silent_skip"] = set()    # reset per session
             th.start()
 
     def _wd_stop() -> None:
@@ -1966,6 +2172,20 @@ def render(ns):
 
     st.caption("Watchdog-Steuerung und Dashboard sind im separaten Tab `Watchdog`.")
 
+    # Flush folders successfully re-downloaded by the watchdog thread.
+    with _YT_WATCHDOG_LOCK:
+        _wd_cleared = set(_YT_WATCHDOG.pop("clear_faulty_folders", set()))
+    if _wd_cleared:
+        ov_rows = list(st.session_state.get("mat_overview_rows") or [])
+        _ov_changed = False
+        for _i, _rr in enumerate(ov_rows):
+            if str(_rr.get("mat_datei") or "").strip() in _wd_cleared:
+                if _rr.get("video_fehlerhaft") not in ("", None, "Nein", "False", "false", "0"):
+                    ov_rows[_i] = {**_rr, "video_fehlerhaft": ""}
+                    _ov_changed = True
+        if _ov_changed:
+            st.session_state.mat_overview_rows = ov_rows
+
     faulty_folders = set()
     for rr in list(st.session_state.get("mat_overview_rows") or []):
         try:
@@ -1978,6 +2198,21 @@ def render(ns):
 
     progress_slot = st.empty()
     state_slot = st.empty()
+
+    def _clear_mat_overview_faulty(folder: str) -> None:
+        """Clear video_fehlerhaft in session-state mat_overview_rows for a given folder."""
+        folder = str(folder or "").strip()
+        if not folder:
+            return
+        ov_rows = list(st.session_state.get("mat_overview_rows") or [])
+        changed = False
+        for i, rr in enumerate(ov_rows):
+            if str(rr.get("mat_datei") or "").strip() == folder:
+                if rr.get("video_fehlerhaft") not in ("", None, "Nein", "False", "false", "0"):
+                    ov_rows[i] = {**rr, "video_fehlerhaft": ""}
+                    changed = True
+        if changed:
+            st.session_state.mat_overview_rows = ov_rows
 
     def _bg_pick_indices(select_fn) -> list[int]:
         out = []
@@ -2049,7 +2284,9 @@ def render(ns):
             cap_dir = out_video.parent
             cap_dir.mkdir(parents=True, exist_ok=True)
             force = bool(st.session_state.get("yt_bg_force"))
-            if (not force) and out_video.exists() and out_audio.exists() and out_video.stat().st_size > 0 and out_audio.stat().st_size > 0:
+            _ex_vid2, _ = _find_existing_media(folder)
+            _aud_ok, _ = _ensure_audio_file(folder)
+            if (not force) and _ex_vid2 is not None and _aud_ok:
                 meta_url = _fetch_metadata_for_url(url)
                 rows[idx]["title"] = str(rows[idx].get("title") or meta_url.get("title") or "")
                 rows[idx]["upload_date"] = str(rows[idx].get("upload_date") or meta_url.get("pubDate") or "")
@@ -2072,6 +2309,7 @@ def render(ns):
                     rows[idx]["json_path"] = _meta_msg
                 else:
                     rows[idx]["last_error"] = f"metadata.json Fehler: {_meta_msg}"
+                _clear_mat_overview_faulty(folder)
                 q.pop(0)
                 st.session_state.yt_bg_queue = q
                 st.session_state.yt_bg_done = int(st.session_state.get("yt_bg_done", 0) or 0) + 1
@@ -2103,6 +2341,7 @@ def render(ns):
                     )
                     if _ok_meta:
                         rows[idx]["json_path"] = _meta_msg
+                    _clear_mat_overview_faulty(folder)
                     q.pop(0)
                     st.session_state.yt_bg_queue = q
                     st.session_state.yt_bg_done = int(st.session_state.get("yt_bg_done", 0) or 0) + 1
@@ -2211,6 +2450,7 @@ def render(ns):
                     rows[idx]["json_path"] = _meta_msg
                 else:
                     rows[idx]["last_error"] = f"metadata.json Fehler: {_meta_msg}"
+                _clear_mat_overview_faulty(folder_now)
             else:
                 rows[idx]["download_status"] = "error"
                 rows[idx]["last_error"] = "record_youtube_cfr.py failed (siehe Logdatei)"

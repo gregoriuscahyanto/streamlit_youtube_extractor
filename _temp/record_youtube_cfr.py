@@ -2,7 +2,7 @@ import argparse, time, threading, queue, subprocess, shutil, platform, sys, os
 import numpy as np
 import pyautogui
 import webbrowser
-import sounddevice as sd
+import pyaudiowpatch as paw
 import soundfile as sf
 import mss
 import cv2
@@ -71,23 +71,43 @@ def safe_sleep(s):
 def has_ffmpeg():
     return shutil.which("ffmpeg") is not None
 
-def find_stereo_mix_device():
-    devices = sd.query_devices()
-    for i, dev in enumerate(devices):
-        name = (dev.get("name") or "").lower()
-        max_in = dev.get("max_input_channels", 0)
+def find_loopback_device():
+    """Return the pyaudiowpatch device index for the current default audio output's loopback.
 
-        # Stereo Mix muss Input-Kanäle haben
-        if max_in > 0 and (
-            "stereomix" in name or
-            "stereo mix" in name or
-            "stereo-input" in name
-        ):
-            print(f"[AUDIO] StereoMix found: index={i}, name={dev['name']}")
-            return i
+    pyaudiowpatch exposes every WASAPI output as a virtual '[Loopback]' input device.
+    We simply find the default output, then look up its matching loopback by name.
+    This works automatically for any output device (Realtek speakers, Plantronics
+    headphones, etc.) — no manual configuration needed.
+    """
+    p = paw.PyAudio()
+    try:
+        wasapi_idx = next(
+            i for i in range(p.get_host_api_count())
+            if "WASAPI" in (p.get_host_api_info_by_index(i).get("name") or "")
+        )
+        default_out_idx = p.get_host_api_info_by_index(wasapi_idx)["defaultOutputDevice"]
+        out_name = p.get_device_info_by_index(default_out_idx)["name"]
+        print(f"[AUDIO] Active output: index={default_out_idx}, name={out_name}")
 
-    print("[AUDIO] StereoMix not found.")
-    return None
+        target_name = out_name + " [Loopback]"
+        # Pass 1: exact match for the active output's loopback
+        for i in range(p.get_device_count()):
+            d = p.get_device_info_by_index(i)
+            if d.get("isLoopbackDevice") and d["name"] == target_name:
+                print(f"[AUDIO] Loopback device: index={i}, name={d['name']}")
+                return i
+
+        # Pass 2: any loopback (fallback)
+        for i in range(p.get_device_count()):
+            d = p.get_device_info_by_index(i)
+            if d.get("isLoopbackDevice") and d.get("maxInputChannels", 0) > 0:
+                print(f"[AUDIO] Fallback loopback: index={i}, name={d['name']}")
+                return i
+
+        print("[AUDIO] No loopback device found.")
+        return None
+    finally:
+        p.terminate()
 
 # ===================== NEW: Active window -> Monitor detection (Windows) =====================
 def get_active_window_rect():
@@ -141,47 +161,43 @@ class AudioRecorder:
     def __init__(self, sr=AUDIO_SR, ch=AUDIO_CH, dtype='int16'):
         self.sr = sr
         self.ch = ch
-        self.dtype = dtype
         self._queue = queue.Queue()
-        self._stop = threading.Event()
         self._start_event = threading.Event()
         self._stream = None
+        self._pa = None
         self.frames = 0
 
-    def _cb(self, indata, frames, time_info, status):
-        if not self._start_event.is_set():
-            return
-        # In Queue legen (kopieren, damit Buffer nicht überschrieben wird)
-        self._queue.put(indata.copy())
-        self.frames += frames
-
-    # def start(self):
-    #     self._stream = sd.InputStream(samplerate=self.sr, channels=self.ch, dtype=self.dtype, callback=self._cb)
-    #     self._stream.start()
+    def _cb(self, in_data, frame_count, time_info, status):
+        if self._start_event.is_set():
+            data = np.frombuffer(in_data, dtype=np.int16).reshape(-1, self.ch)
+            self._queue.put(data.copy())
+            self.frames += frame_count
+        return (None, paw.paContinue)
 
     def start(self, device=None):
-        self._stream = sd.InputStream(
-            samplerate=self.sr,
+        self._pa = paw.PyAudio()
+        self._stream = self._pa.open(
+            format=paw.paInt16,
             channels=self.ch,
-            dtype=self.dtype,
-            callback=self._cb,
-            device=device
+            rate=self.sr,
+            input=True,
+            input_device_index=device,
+            frames_per_buffer=1024,
+            stream_callback=self._cb,
         )
-        self._stream.start()
-
+        self._stream.start_stream()
 
     def trigger(self):
         self._start_event.set()
 
     def stop(self):
-        self._stop.set()
         if self._stream:
-            self._stream.stop()
+            self._stream.stop_stream()
             self._stream.close()
+        if self._pa:
+            self._pa.terminate()
 
     def dump_to_wav(self, path):
-        # Queue rest leeren und schreiben
-        # Wir sammeln in Chunks, um RAM zu sparen
         with sf.SoundFile(path, mode='w', samplerate=self.sr, channels=self.ch, subtype=AUDIO_FMT) as f:
             while not self._queue.empty():
                 f.write(self._queue.get())
@@ -664,9 +680,12 @@ def main():
 
     device_index = args.audio_device
     if device_index is None:
-        device_index = find_stereo_mix_device()
+        device_index = find_loopback_device()
     if device_index is None:
-        raise RuntimeError("No StereoMix device found. Please enable it in Windows.")
+        raise RuntimeError(
+            "Kein Loopback-Aufnahmegerät gefunden. "
+            "Bitte StereoMix in den Windows-Soundeinstellungen aktivieren."
+        )
     audio.start(device=device_index)
 
     print(f"🎥 Initialisiere Video @ {fps:.2f} fps…")

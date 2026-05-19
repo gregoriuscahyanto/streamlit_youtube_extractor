@@ -8,7 +8,10 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Read(//c/Users/Cahyanto/Documents/GitHub/Youtube-Hotlap-Extractor/results/**)",
-      "Read(//c/Users/Cahyanto/Documents/GitHub/Youtube-Hotlap-Extractor/**)"
+      "Read(//c/Users/Cahyanto/Documents/GitHub/Youtube-Hotlap-Extractor/**)",
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import sounddevice as sd, json; apis = sd.query_hostapis\\(\\); print\\('HostAPIs:', json.dumps\\(list\\(apis\\), indent=2, default=str\\)\\)\")",
+      "Bash(ls ~/.claude/projects/ | head -20)",
+      "Read(//c/Users/Cahyanto/.claude/projects/**)"
     ]
   }
 }
