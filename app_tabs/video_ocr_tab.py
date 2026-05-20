@@ -230,6 +230,14 @@ def render(ns):
             "centerline_px": (lambda _c: _c.tolist() if hasattr(_c, "tolist") else (list(_c) if _c is not None else []))(st.session_state.get("centerline_px")),
             "roi_global_scale": float(st.session_state.get("roi_global_scale", 1.2) or 1.2),
             "progress_step_frames": int(st.session_state.get("video_ocr_live_progress_step_frames", 2) or 2),
+            # Time boundaries — session state is inaccessible in background threads,
+            # so snapshot here in the main thread.
+            "t_start": float(st.session_state.get("t_start") or 0.0),
+            "t_end":   float(st.session_state.get("t_end")   or 0.0),
+            # Pre-resolve the results directory so _save_ocr_progress can write to the
+            # correct path from the background thread (st.session_state / _server_results_dir
+            # are not accessible from non-Streamlit threads).
+            "results_dir": str(_server_results_dir()),
         }
         st.session_state.video_ocr_full_running = True
         st.session_state.roi_ocr_full_running = True
@@ -270,7 +278,7 @@ def render(ns):
 
         st.session_state.video_ocr_full_stop_event = stop_event
         st.session_state.video_ocr_full_future = _video_ocr_executor().submit(_worker)
-        running = True
+        st.rerun()
 
     if stop_clicked and running:
         st.session_state.video_ocr_full_stop_requested = True

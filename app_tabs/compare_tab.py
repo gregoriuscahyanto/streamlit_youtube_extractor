@@ -333,7 +333,7 @@ def render(ns: dict) -> None:
 
             # Render this chart
             if chart["y_col"] and all_cols:
-                _render_chart(chart, st.session_state.cmp_files, cmp_data)
+                _render_chart(chart, st.session_state.cmp_files, cmp_data, ci)
             else:
                 st.caption("Y-Achse auswählen um das Diagramm anzuzeigen.")
 
@@ -394,13 +394,46 @@ def render(ns: dict) -> None:
     _render_config_section()
 
 
-def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict]) -> None:
+def _safe_sheet_name(label: str) -> str:
+    """Sanitize a string for use as an Excel sheet name (max 31 chars, no /\?*:[]')."""
+    import re
+    name = re.sub(r'[/\\?*:\[\]\']', "_", str(label or "Kurve"))
+    return name[:31] or "Kurve"
+
+
+def _build_excel_bytes(traces: list[dict], x_col: str, y_col: str) -> bytes:
+    """Build an Excel workbook: one sheet per trace + one combined sheet."""
+    import io
+    import pandas as pd
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        combined_parts: list[pd.DataFrame] = []
+        for trace in traces:
+            df = pd.DataFrame({x_col: trace["xs"], y_col: trace["ys"]})
+            df.to_excel(writer, sheet_name=_safe_sheet_name(trace["label"]), index=False)
+            combined_parts.append(
+                df.rename(columns={x_col: f"{x_col}_{trace['label'][:20]}",
+                                   y_col: f"{y_col}_{trace['label'][:20]}"})
+            )
+        if len(combined_parts) > 1:
+            import functools
+            combined = functools.reduce(
+                lambda a, b: pd.concat([a.reset_index(drop=True), b.reset_index(drop=True)], axis=1),
+                combined_parts,
+            )
+            combined.to_excel(writer, sheet_name="Kombiniert", index=False)
+    return buf.getvalue()
+
+
+def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], chart_idx: int = 0) -> None:
     try:
         import plotly.graph_objects as go
         fig = go.Figure()
         x_col = chart["x_col"]
         y_col = chart["y_col"]
         mode = "lines" if chart.get("plot_type") == "line" else "markers"
+        traces: list[dict] = []
 
         for f in files:
             data = cmp_data.get(f["path"], {})
@@ -414,6 +447,7 @@ def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict]) -> 
                 name=f["label"],
                 marker=dict(size=4) if mode == "markers" else {},
             ))
+            traces.append({"label": f["label"], "xs": list(xs), "ys": list(ys)})
 
         fig.update_layout(
             title=chart.get("title", ""),
@@ -425,6 +459,23 @@ def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict]) -> 
             template="plotly_dark",
         )
         st.plotly_chart(fig, use_container_width=True)
+
+        if traces:
+            try:
+                excel_bytes = _build_excel_bytes(traces, x_col, y_col)
+                safe_title = "".join(
+                    c if c.isalnum() or c in " ._-" else "_"
+                    for c in chart.get("title", f"Diagramm_{chart_idx + 1}")
+                ).strip() or f"Diagramm_{chart_idx + 1}"
+                st.download_button(
+                    label="⬇ Als Excel herunterladen",
+                    data=excel_bytes,
+                    file_name=f"{safe_title}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"cmp_dl_{chart_idx}",
+                )
+            except Exception as dl_err:
+                st.caption(f"Excel-Export nicht verfügbar: {dl_err}")
     except Exception as e:
         st.caption(f"Diagramm-Fehler: {e}")
 

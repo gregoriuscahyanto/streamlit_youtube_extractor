@@ -1684,11 +1684,11 @@ def _run_video_ocr_fullvideo_framewise_now(
             target_fps = 2.0
         frame_step = max(1, int(round(fps / target_fps)))
 
-    # Read start_s / end_s from current session state (t_start / t_end set by ROI Setup).
-    # These are the absolute boundaries; OCR must not go outside them.
+    # Read start_s / end_s — prefer track_params_override (snapshotted in main thread
+    # before background launch) because st.session_state is inaccessible from threads.
     _dur_full = float(frame_count) / max(fps, 1e-9)
-    _start_s = float(st.session_state.get("t_start") or 0.0)
-    _end_s = float(st.session_state.get("t_end") or _dur_full)
+    _start_s = float(_tpo.get("t_start") if "t_start" in _tpo else (st.session_state.get("t_start") or 0.0))
+    _end_s   = float(_tpo.get("t_end")   if "t_end"   in _tpo else (st.session_state.get("t_end")   or _dur_full))
     _start_s = max(0.0, min(_start_s, _dur_full))
     _end_s = max(_start_s + 0.1, min(_end_s, _dur_full))
     _start_frame = int(_start_s * fps)
@@ -1781,11 +1781,26 @@ def _run_video_ocr_fullvideo_framewise_now(
     save_error = ""
 
     def _save_ocr_progress(partial: bool) -> tuple[bool, str]:
-        rr_doc_local = _build_save_mat_struct(build_result_json(), no_roi=False, video_faulty=False).get("recordResult", {})
-        rr_doc_local = _mat_struct_to_plain(rr_doc_local)
-        if not isinstance(rr_doc_local, dict):
-            rr_doc_local = {}
-        ocr_doc_local = rr_doc_local.get("ocr", {}) if isinstance(rr_doc_local.get("ocr", {}), dict) else {}
+        # Do NOT call build_result_json() here — st.session_state is inaccessible from
+        # background threads. Read the existing JSON file directly for the ocr baseline.
+        cf_local = str(capture_folder or "").strip()
+        safe_cf_local = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in cf_local).strip("._") or "output"
+        json_name_local = f"results_{safe_cf_local}.json"
+        # Use results_dir snapshotted in the main thread before this background thread
+        # was launched (via track_params_override["results_dir"]).
+        _rd = str(_tpo.get("results_dir") or "").strip()
+        json_path_local = (Path(_rd) / json_name_local) if _rd else None
+
+        existing_ocr: dict = {}
+        if json_path_local and json_path_local.exists():
+            try:
+                _edoc = json.loads(json_path_local.read_text(encoding="utf-8", errors="ignore"))
+                _err = _edoc.get("recordResult", {}) if isinstance(_edoc, dict) else {}
+                existing_ocr = _err.get("ocr", {}) if isinstance(_err, dict) and isinstance(_err.get("ocr"), dict) else {}
+            except Exception:
+                existing_ocr = {}
+
+        ocr_doc_local: dict = dict(existing_ocr) if existing_ocr else {}
         ocr_doc_local["table"] = list(raw_rows)
         ocr_doc_local["cleaned"] = list(clean_rows)
         ocr_doc_local["created"] = datetime.now().isoformat(timespec="seconds")
@@ -1794,17 +1809,18 @@ def _run_video_ocr_fullvideo_framewise_now(
         ocr_doc_local["frame_step"] = int(max(1, frame_step))
         ocr_doc_local["fps_mode"] = str(fps_mode)
         _params = ocr_doc_local.get("params") if isinstance(ocr_doc_local.get("params"), dict) else {}
-        _params.setdefault("start_s", 0.0)
-        _params["end_s"] = float(raw_rows[-1]["time_s"]) if raw_rows else 0.0
+        _params["start_s"] = float(_start_s)
+        _params["end_s"] = float(raw_rows[-1]["time_s"]) if raw_rows else float(_start_s)
         if partial:
             _params["partial"] = True
         else:
             _params.pop("partial", None)
         ocr_doc_local["params"] = _params
-        rr_doc_local["ocr"] = ocr_doc_local
 
-        cf_local = str(capture_folder or "").strip()
-        ok_local, msg_local, _json_bytes_local = _save_fields_to_local_json({"ocr": ocr_doc_local}, cf_local, base_rr=rr_doc_local)
+        _jp_str = str(json_path_local) if json_path_local else None
+        ok_local, msg_local, _ = _save_fields_to_local_json(
+            {"ocr": ocr_doc_local}, cf_local, base_rr=None, json_path_override=_jp_str
+        )
         if not ok_local:
             return False, str(msg_local)
         return True, str(msg_local)
@@ -2415,19 +2431,27 @@ def _save_fields_to_local_json(
     replace_fields: dict,
     capture_folder: str,
     base_rr: dict | None = None,
+    json_path_override: str | None = None,
 ) -> tuple[bool, str, bytes]:
     """Merge replace_fields into local results JSON, preserving all other sections.
 
     Same format as MAT-to-JSON conversion: _normalize_sidecar_json_payload + indent=2.
     Returns (ok, message, json_bytes).
+    json_path_override: if given, use this exact path instead of deriving from capture_folder +
+    _server_results_dir(). Pass a pre-resolved path when calling from a background thread so that
+    st.session_state (used by _server_results_dir) is never touched from the thread.
     """
     from core.watchdog_state import get_path_lock, _JSON_ROW_CACHE
 
-    safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(capture_folder)).strip("._") or "output"
-    json_name = f"results_{safe_cf}.json"
-    res_dir = _server_results_dir()
-    res_dir.mkdir(parents=True, exist_ok=True)
-    json_path = res_dir / json_name
+    if json_path_override:
+        json_path = Path(json_path_override)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        safe_cf = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(capture_folder)).strip("._") or "output"
+        json_name = f"results_{safe_cf}.json"
+        res_dir = _server_results_dir()
+        res_dir.mkdir(parents=True, exist_ok=True)
+        json_path = res_dir / json_name
 
     doc: dict = {}
     if json_path.exists():
@@ -5596,6 +5620,9 @@ def _load_mat_from_r2(remote_key, preloaded_doc: dict | None = None):
             mcr = trk.get("moving_pt_color_range") if isinstance(trk.get("moving_pt_color_range"), dict) else _marker_to_color_range(trk.get("marker"))
             if isinstance(mcr, dict) and mcr:
                 st.session_state.moving_pt_color_range = mcr
+            cl_px_raw = trk.get("centerline_px")
+            if isinstance(cl_px_raw, (list, tuple)) and len(cl_px_raw) >= 2:
+                st.session_state.centerline_px = cl_px_raw
         _track_name = ""
         if isinstance(ocr, dict):
             trk_name = ocr.get("track")

@@ -1111,6 +1111,7 @@ def render(ns: dict) -> None:
         _pending_ref_pts = None
         _pending_minimap_pts = None
         _pending_color_range = None
+        _pending_centerline_px = None
 
         def _json_candidates_for_folder() -> list[Path]:
             cands: list[Path] = []
@@ -1257,6 +1258,11 @@ def render(ns: dict) -> None:
                                 _pending_color_range = _cr
                         except Exception:
                             pass
+                _cl_px_raw = trk.get("centerline_px")
+                if isinstance(_cl_px_raw, (list, tuple)) and len(_cl_px_raw) >= 2:
+                    _parsed_cl = _parse_pts(_cl_px_raw)
+                    if len(_parsed_cl) >= 2:
+                        _pending_centerline_px = _parsed_cl
 
         except Exception as e:
             msgs.append(f"JSON verarbeiten: {e}")
@@ -1290,6 +1296,8 @@ def render(ns: dict) -> None:
             st.session_state.minimap_next_pt_idx = len(_pending_minimap_pts)
         if isinstance(_pending_color_range, dict) and _pending_color_range:
             st.session_state.moving_pt_color_range = _pending_color_range
+        if isinstance(_pending_centerline_px, list) and len(_pending_centerline_px) >= 2:
+            st.session_state.centerline_px = _pending_centerline_px
 
         return msgs
 
