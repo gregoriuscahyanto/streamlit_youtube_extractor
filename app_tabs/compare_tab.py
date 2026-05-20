@@ -4,6 +4,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+# mtime-keyed cache so we only re-read files that changed on disk.
+# key = absolute path str  →  value = {mtime, folder, title, has_ocr, has_audio}
+_SCAN_FILE_CACHE: dict[str, dict] = {}
+
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
@@ -39,7 +43,12 @@ def _watchdog_active_paths() -> set[str]:
 
 
 def _scan_available_jsons() -> list[dict]:
-    """Return list of result JSONs that have OCR or audio data."""
+    """Return list of result JSONs that have OCR or audio data.
+
+    Uses a module-level mtime cache so each file is only re-read when it
+    actually changed on disk.  Reduces per-rerun I/O from O(N × read+parse)
+    to O(N × stat).
+    """
     base = _base()
     res_dir = base / "results"
     if not res_dir.exists():
@@ -47,13 +56,21 @@ def _scan_available_jsons() -> list[dict]:
     locked = _watchdog_active_paths()
     out: list[dict] = []
     for jp in sorted(res_dir.glob("results_*.json"), reverse=True):
-        folder = jp.stem.replace("results_", "", 1)
         path_str = str(jp.resolve())
         is_busy = path_str in locked or _is_locked(path_str)
         try:
+            mtime = jp.stat().st_mtime
+            cached = _SCAN_FILE_CACHE.get(path_str)
+            if cached and cached.get("mtime") == mtime:
+                if cached.get("skip"):
+                    continue
+                out.append({**cached, "busy": is_busy})
+                continue
+            # File is new or changed — parse it
             doc = json.loads(jp.read_text(encoding="utf-8", errors="ignore"))
             rr = doc.get("recordResult") if isinstance(doc, dict) else {}
             if not isinstance(rr, dict):
+                _SCAN_FILE_CACHE[path_str] = {"mtime": mtime, "skip": True}
                 continue
             meta = rr.get("metadata") or {}
             title = str(
@@ -71,15 +88,19 @@ def _scan_available_jsons() -> list[dict]:
                 and arpm["processed"].get("t_s")
             )
             if not (has_ocr or has_audio):
+                _SCAN_FILE_CACHE[path_str] = {"mtime": mtime, "skip": True}
                 continue
-            out.append({
-                "folder": folder,
+            entry = {
+                "mtime": mtime,
+                "skip": False,
+                "folder": jp.stem.replace("results_", "", 1),
                 "path": path_str,
                 "title": title,
                 "has_ocr": has_ocr,
                 "has_audio": has_audio,
-                "busy": is_busy,
-            })
+            }
+            _SCAN_FILE_CACHE[path_str] = entry
+            out.append({**entry, "busy": is_busy})
         except Exception:
             continue
     return out
