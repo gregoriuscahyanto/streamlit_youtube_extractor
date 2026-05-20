@@ -386,15 +386,76 @@ def _press_play_toggle_robust(attempt_idx=1):
         key('space')
     safe_sleep(0.12)
 
+def wait_for_stable_pause(timeout=12.0, stable_s=0.6, still_thresh=1.5, play_thresh=4.0):
+    """Wait until the screen is completely static (spinner gone, video paused).
+
+    Returns (stable: bool, already_playing: bool).
+    Exits early with already_playing=True if sustained video motion is detected —
+    so the caller can skip the play toggle and avoid accidentally pausing the video.
+    """
+    rect = get_active_window_rect()
+    if not rect:
+        return False, False
+    sct = mss.mss()
+    prev = None
+    stable_since = None
+    play_hits = 0
+    t0 = time.perf_counter()
+    while (time.perf_counter() - t0) < timeout:
+        img = np.array(sct.grab(rect))[:, :, :3]
+        small = cv2.resize(img, (320, 180))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        if prev is not None:
+            mad = float(np.mean(cv2.absdiff(gray, prev)))
+            if mad >= play_thresh:
+                play_hits += 1
+                if play_hits >= 4:   # sustained motion → video is playing
+                    return False, True
+                stable_since = None
+            elif mad < still_thresh:
+                play_hits = 0
+                if stable_since is None:
+                    stable_since = time.perf_counter()
+                elif (time.perf_counter() - stable_since) >= stable_s:
+                    return True, False
+            else:
+                play_hits = 0
+                stable_since = None
+        prev = gray
+        safe_sleep(0.08)
+    return False, False
+
+
 def ensure_playing(max_tries=3, motion_timeout=4.0):
+    """Start playback robustly.
+
+    Strategy:
+      1. Check if already playing → done, no toggle.
+      2. Wait for stable paused frame (spinner gone). If motion detected during
+         wait → video started on its own, done.
+      3. Toggle play, verify motion.
+      4. Retry up to max_tries.
     """
-    Versucht Play zu starten und wartet auf echte Bewegung.
-    Wenn nach motion_timeout keine Motion: nochmal toggle (Retry).
-    """
+    # Step 1: already playing?
+    if wait_for_playback_motion(timeout=2.0):
+        print("[SYNC] Already playing — no toggle needed.")
+        return True
+
     for i in range(1, max_tries + 1):
+        # Step 2: wait for stable pause; bail early if video starts on its own
+        print(f"[SYNC] Try {i}/{max_tries}: waiting for stable pause…")
+        stable, already_playing = wait_for_stable_pause(timeout=10.0)
+        if already_playing:
+            print("[SYNC] Video started during wait — no toggle needed.")
+            return True
+        if not stable:
+            print("[SYNC] Stable pause timeout — pressing anyway.")
+
         print(f"[SYNC] Try {i}/{max_tries}: toggling play…")
         _press_play_toggle_robust(i)
+        safe_sleep(0.3)
 
+        # Step 3: verify motion
         ok = wait_for_playback_motion(timeout=motion_timeout)
         if not ok:
             ok = wait_for_playback_motion_fullframe(timeout=max(2.0, motion_timeout))
@@ -405,8 +466,6 @@ def ensure_playing(max_tries=3, motion_timeout=4.0):
         if ok:
             return True
 
-        # Falls Overlay/Spinner/Focus: nochmal klicken bevor nächster Versuch
-        # click_active_window_center()
         safe_sleep(0.25)
 
     return False
@@ -930,8 +989,7 @@ def main():
     # a short moment for focus/overlay handling.
     def _start_playback_worker():
         safe_sleep(0.12)
-        # Avoid accidental re-toggle pauses: start once, then wait longer for motion.
-        ok = ensure_playing(max_tries=1, motion_timeout=8.0)
+        ok = ensure_playing(max_tries=3, motion_timeout=8.0)
         print(f"[INFO] Playback started: {ok}")
 
     play_thread = threading.Thread(target=_start_playback_worker, daemon=True)

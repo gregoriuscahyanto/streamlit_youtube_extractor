@@ -6692,7 +6692,7 @@ def _build_audio_rpm_struct_from_result(res: dict) -> dict:
                 fn = _matlab_field_name(k)
                 if fn not in all_keys:
                     all_keys.append(fn)
-        cand_tbl: dict = {}0f
+        cand_tbl: dict = {}
         for fn in all_keys:
             raw_key = next((k for k in (rows[0] or {}).keys() if _matlab_field_name(k) == fn), fn)
             vals = [(r or {}).get(raw_key, "") for r in rows]
