@@ -829,97 +829,56 @@ def render(ns: dict) -> None:
 
         _nc_selected_paths = [_nc_folder_to_path[f] for f in _nc_selected_folders if f in _nc_folder_to_path]
 
-        _nc1, _nc2 = st.columns(2)
-
-        # ── Button 1: Vollständige Nachkorrektur ──────────────────────────────
-        with _nc1:
-            st.markdown("**Vollständige Nachkorrektur**")
-            st.caption(
-                "① Zeilen außerhalb start_s/end_s löschen  \n"
-                "② Min/Max + Steigung aus ROI-Katalog filtern  \n"
-                "③ track_minimap neu berechnen wenn track_minimap_found überall 0"
-            )
-            if st.button(
-                f"{len(_nc_selected_paths)} Datei(en) nachkorrigieren",
-                disabled=not _nc_selected_paths,
-                key="lib_retrofix_btn",
-            ):
-                try:
-                    from app_tabs.plausibility_filter import retrofix_result_json, needs_track_rerun
-                    from app_tabs.roi_catalog_tab import load_catalog as _lc_lib2
-                    _rf_catalog = st.session_state.get("roi_catalog") or _lc_lib2()
-                    _rf_ok, _rf_skip, _rf_err, _rf_track = 0, 0, 0, 0
-                    _rf_needs_track: list[str] = []
-                    _prog2 = st.progress(0.0, text="Nachkorrektur läuft…")
-                    for _ri, _rp in enumerate(_nc_selected_paths):
-                        _ok, _msg, _tn = retrofix_result_json(_rp, _rf_catalog)
-                        if _ok:
-                            _rf_ok += 1
-                        elif any(x in _msg for x in ("keine Tabelle", "kein ocr", "kein recordResult", "keine Änderungen")):
-                            _rf_skip += 1
-                        else:
-                            _rf_err += 1
-                        if _tn:
-                            _rf_needs_track.append(_rp)
-                        _prog2.progress((_ri + 1) / len(_nc_selected_paths),
-                                        text=f"Nachkorrektur… {_ri+1}/{len(_nc_selected_paths)}")
-                    _prog2.empty()
-                    st.success(
-                        f"Trim+Filter: {_rf_ok} geändert, {_rf_skip} ohne Daten"
-                        + (f", {_rf_err} Fehler" if _rf_err else "") + "."
-                        + (f"  \n{len(_rf_needs_track)} Datei(en) benötigen Track-Nachkorrektur (siehe unten)." if _rf_needs_track else "")
-                    )
-                    if _rf_needs_track:
-                        st.session_state["_retrofix_track_queue"] = _rf_needs_track
-                    st.session_state.cmp_data = {}
-                    st.session_state.pop("_detail_cache", None)
-                except Exception as _rfe:
-                    st.error(f"Nachkorrektur fehlgeschlagen: {_rfe}")
-
-            # Track-Minimap re-run info (shown after retrofix identified candidates)
-            _track_queue = list(st.session_state.get("_retrofix_track_queue") or [])
-            if _track_queue:
-                st.info(
-                    f"**{len(_track_queue)} Datei(en)** benötigen Track-Minimap-Nachkorrektur "
-                    f"(track_minimap_found war überall 0 → Bug behoben).  \n"
-                    f"Da dies Video-Zugriff erfordert, bitte im **Watchdog-Tab** die Aufgabe "
-                    f"**'Nachkorrektur'** aktivieren und den Watchdog starten."
+        st.caption(
+            "① Zeilen außerhalb start_s/end_s löschen (nur wenn Parameter vorhanden)  \n"
+            "② Min/Max + Steigung aus ROI-Katalog filtern → cleaned neu ableiten aus table  \n"
+            "③ track_minimap neu berechnen wenn track_minimap_found überall 0"
+        )
+        if st.button(
+            f"{len(_nc_selected_paths)} Datei(en) nachkorrigieren & nachfiltern",
+            disabled=not _nc_selected_paths,
+            key="lib_retrofix_btn",
+        ):
+            try:
+                from app_tabs.plausibility_filter import retrofix_result_json
+                from app_tabs.roi_catalog_tab import load_catalog as _lc_lib2
+                _rf_catalog = st.session_state.get("roi_catalog") or _lc_lib2()
+                _rf_ok, _rf_skip, _rf_err = 0, 0, 0
+                _rf_needs_track: list[str] = []
+                _prog2 = st.progress(0.0, text="Nachkorrektur & Nachfiltern läuft…")
+                for _ri, _rp in enumerate(_nc_selected_paths):
+                    _ok, _msg, _tn = retrofix_result_json(_rp, _rf_catalog)
+                    if _ok:
+                        _rf_ok += 1
+                    elif any(x in _msg for x in ("keine Tabelle", "kein ocr", "kein recordResult", "keine Änderungen")):
+                        _rf_skip += 1
+                    else:
+                        _rf_err += 1
+                    if _tn:
+                        _rf_needs_track.append(_rp)
+                    _prog2.progress((_ri + 1) / len(_nc_selected_paths),
+                                    text=f"Nachkorrektur… {_ri+1}/{len(_nc_selected_paths)}")
+                _prog2.empty()
+                st.success(
+                    f"{_rf_ok} geändert, {_rf_skip} ohne Daten"
+                    + (f", {_rf_err} Fehler" if _rf_err else "") + "."
+                    + (f"  \n{len(_rf_needs_track)} Datei(en) benötigen Track-Nachkorrektur (Watchdog-Tab)." if _rf_needs_track else "")
                 )
+                if _rf_needs_track:
+                    st.session_state["_retrofix_track_queue"] = _rf_needs_track
+                st.session_state.cmp_data = {}
+                st.session_state.pop("_detail_cache", None)
+            except Exception as _rfe:
+                st.error(f"Nachkorrektur fehlgeschlagen: {_rfe}")
 
-        # ── Button 2: Nur Plausibilität nachfiltern ───────────────────────────
-        with _nc2:
-            st.markdown("**Nur Plausibilität nachfiltern**")
-            st.caption("Nur Min/Max + Steigung auf cleaned anwenden. Kein Trimmen, keine Track-Neuberechnung.")
-            if st.button(
-                f"{len(_nc_selected_paths)} Datei(en) nachfiltern",
-                disabled=not _nc_selected_paths,
-                key="lib_reclean_btn",
-            ):
-                try:
-                    from app_tabs.plausibility_filter import reclean_result_json
-                    from app_tabs.roi_catalog_tab import load_catalog as _lc_lib
-                    _rc_catalog = st.session_state.get("roi_catalog") or _lc_lib()
-                    _rc_ok, _rc_skip, _rc_err = 0, 0, 0
-                    _prog = st.progress(0.0, text="Nachfiltern läuft…")
-                    for _ri, _rp in enumerate(_nc_selected_paths):
-                        _ok, _msg = reclean_result_json(_rp, _rc_catalog)
-                        if _ok:
-                            _rc_ok += 1
-                        elif any(x in _msg for x in ("keine Tabelle", "kein ocr", "kein recordResult")):
-                            _rc_skip += 1
-                        else:
-                            _rc_err += 1
-                        _prog.progress((_ri + 1) / len(_nc_selected_paths),
-                                       text=f"Nachfiltern… {_ri+1}/{len(_nc_selected_paths)}")
-                    _prog.empty()
-                    st.success(
-                        f"Fertig: {_rc_ok} gefiltert, {_rc_skip} ohne Daten übersprungen"
-                        + (f", {_rc_err} Fehler" if _rc_err else "") + "."
-                    )
-                    st.session_state.cmp_data = {}
-                    st.session_state.pop("_detail_cache", None)
-                except Exception as _rce:
-                    st.error(f"Nachfiltern fehlgeschlagen: {_rce}")
+        # Track-Minimap re-run info (shown after retrofix identified candidates)
+        _track_queue = list(st.session_state.get("_retrofix_track_queue") or [])
+        if _track_queue:
+            st.info(
+                f"**{len(_track_queue)} Datei(en)** benötigen Track-Minimap-Nachkorrektur "
+                f"(track_minimap_found war überall 0).  \n"
+                f"Bitte im **Watchdog-Tab** die Aufgabe **'Nachkorrektur'** aktivieren."
+            )
 
     # ── Analyse-Übersicht ─────────────────────────────────────────────────────
     _render_media_analysis(rows)

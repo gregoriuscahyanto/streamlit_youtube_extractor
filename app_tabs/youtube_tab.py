@@ -1766,44 +1766,6 @@ def render(ns):
             _aw_final(json_path, doc)
         return True, f"{folder}: {found_count}/{n} Frames mit Track-Punkt"
 
-    def _wd_reclean_one(base_override=None) -> tuple[bool, str]:
-        """Filter one result JSON with current catalog plausibility + slope bounds.
-        Tracks processed files in _YT_WATCHDOG['reclean_skip'] for this session."""
-        try:
-            from app_tabs.plausibility_filter import reclean_result_json
-            from app_tabs.roi_catalog_tab import load_catalog as _lc_rc
-        except Exception as e:
-            return False, f"Import fehlgeschlagen: {e}"
-
-        base = _capture_base(base_override=base_override)
-        res_dir = base / "results"
-        if not res_dir.exists():
-            return False, "nichts offen"
-
-        with _YT_WATCHDOG_LOCK:
-            skip: set = set(_YT_WATCHDOG.get("reclean_skip") or set())
-
-        catalog = _lc_rc()
-        if not (catalog.get("plausibility")):
-            return False, "kein Katalog"
-
-        for jp in sorted(res_dir.glob("results_*.json")):
-            jp_str = str(jp)
-            if jp_str in skip:
-                continue
-            ok, msg = reclean_result_json(jp_str, catalog)
-            # Mark done AFTER processing — interrupted files will be retried
-            with _YT_WATCHDOG_LOCK:
-                _YT_WATCHDOG.setdefault("reclean_skip", set()).add(jp_str)
-            if ok:
-                return True, msg
-            # file had no usable table — not an error, continue to next
-            if "keine Tabelle" in msg or "kein recordResult" in msg or "kein ocr" in msg:
-                continue
-            return False, msg
-
-        return False, "nichts offen"
-
     def _wd_process_once(cfg: dict, stop_event=None) -> bool:
         base_override = cfg.get("local_base_path")
         # Always read from the live shared dict so UI changes take effect at the
@@ -1813,10 +1775,9 @@ def render(ns):
         task_mat_json = bool(tasks.get("mat_json", False))
         task_download = bool(tasks.get("download", True))
         task_ocr = bool(tasks.get("ocr", True))
-        task_reclean = bool(tasks.get("reclean", False))
-        task_retrofix = bool(tasks.get("retrofix", False))
+        task_retrofix = bool(tasks.get("retrofix", False) or tasks.get("reclean", False))
 
-        _wd_log(f"Tick | Aufgaben: MAT-JSON={task_mat_json} Download={task_download} OCR={task_ocr} Nachfiltern={task_reclean} Nachkorrektur={task_retrofix}")
+        _wd_log(f"Tick | Aufgaben: MAT-JSON={task_mat_json} Download={task_download} OCR={task_ocr} Nachkorrektur={task_retrofix}")
 
         if task_mat_json:
             _wd_set_current("MAT->JSON")
@@ -2001,24 +1962,11 @@ def render(ns):
                 _wd_log(f"Track-Nachkorrektur Fehler: {msg_tr}")
                 return True
 
-        # ── Nachfiltern ───────────────────────────────────────────────────────
-        if task_reclean:
-            _wd_set_current("Nachfiltern")
-            ok_rc, msg_rc = _wd_reclean_one(base_override=base_override)
-            if ok_rc:
-                _wd_log(f"Nachfiltern: {msg_rc}")
-                return True
-            if "nichts offen" not in str(msg_rc).lower() and "kein katalog" not in str(msg_rc).lower():
-                _wd_inc("errors")
-                _wd_log(f"Nachfiltern Fehler: {msg_rc}")
-                return True
-
         _wd_log("Tick abgeschlossen: nichts zu tun – starte Suche neu (ocr_skip zurückgesetzt)")
         _wd_set_current("")
         # Reset skip-sets so the next pass re-evaluates all folders from scratch.
         with _YT_WATCHDOG_LOCK:
             _YT_WATCHDOG["ocr_skip"] = set()
-            _YT_WATCHDOG["reclean_skip"] = set()
             _YT_WATCHDOG["retrofix_skip"] = set()
             _YT_WATCHDOG["retro_track_skip"] = set()
         return False

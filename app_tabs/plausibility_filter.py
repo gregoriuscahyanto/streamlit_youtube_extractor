@@ -264,21 +264,19 @@ def needs_track_rerun(doc: dict) -> bool:
     return True
 
 
-# ── combined retrofix ─────────────────────────────────────────────────────────
+# ── unified post-processing ───────────────────────────────────────────────────
 
-def retrofix_result_json(
-    json_path: str,
-    catalog: dict,
-    do_trim: bool = True,
-    do_filter: bool = True,
-) -> tuple[bool, str, bool]:
-    """
-    Combined retroactive correction:
-      1. Trim rows outside ocr.params.start_s / end_s (if do_trim)
-      2. Apply plausibility + slope filter (if do_filter)
+def retrofix_result_json(json_path: str, catalog: dict) -> tuple[bool, str, bool]:
+    """Unified post-processing: source is always ocr.table (raw OCR).
+
+    Per-file automatic decisions:
+      - Trim: only if ocr.params contains start_s > 0 or end_s. Trimmed result
+              is written back to ocr.table so the raw table stays consistent.
+      - Filter: only if catalog has plausibility rules. Plausibility + slope
+                filter applied to the (possibly trimmed) table copy.
+      - ocr.cleaned is always (re-)derived from the processed table and overwritten.
 
     Returns (changed, message, needs_track_rerun).
-    Track re-run detection is always performed and reported in the third return value.
     """
     import json as _json
     import copy
@@ -298,37 +296,36 @@ def retrofix_result_json(
         return False, "kein ocr", False
 
     track_needed = needs_track_rerun(doc)
+
+    table = ocr.get("table")
+    if not isinstance(table, dict) or not table.get("time_s"):
+        return False, "keine Tabelle", track_needed
+
     changed = False
     msgs: list[str] = []
+    working = copy.deepcopy(table)
 
-    # ── 1. Time-bounds trimming ───────────────────────────────────────────────
-    if do_trim:
-        params = ocr.get("params") or {}
-        start_s = float(params.get("start_s") or 0.0)
-        end_s_raw = params.get("end_s")
-        end_s = float(end_s_raw) if end_s_raw is not None and float(end_s_raw) > 0 else None
+    # ── 1. Time-bounds trimming (auto: only when params define a window) ──────
+    params = ocr.get("params") or {}
+    start_s = float(params.get("start_s") or 0.0)
+    end_s_raw = params.get("end_s")
+    end_s = float(end_s_raw) if end_s_raw is not None and float(end_s_raw) > 0 else None
 
-        if start_s > 0.0 or end_s is not None:
-            for key in ("table", "cleaned"):
-                tbl = ocr.get(key)
-                if isinstance(tbl, dict) and tbl.get("time_s"):
-                    trimmed, n_rm = _trim_tbl(tbl, start_s, end_s)
-                    if n_rm > 0:
-                        ocr[key] = trimmed
-                        changed = True
-                        msgs.append(f"trim {key}: -{n_rm} Zeilen")
+    if start_s > 0.0 or end_s is not None:
+        working, n_rm = _trim_tbl(working, start_s, end_s)
+        if n_rm > 0:
+            ocr["table"] = copy.deepcopy(working)  # keep table consistent with cleaned
+            changed = True
+            msgs.append(f"trim: -{n_rm} Zeilen")
 
-    # ── 2. Plausibility + slope filter ───────────────────────────────────────
-    if do_filter and catalog.get("plausibility"):
-        for key in ("table", "cleaned"):
-            tbl = ocr.get(key)
-            if isinstance(tbl, dict) and tbl.get("time_s"):
-                src = copy.deepcopy(tbl)
-                filter_cols(src, catalog)
-                ocr[key] = src
-                changed = True
-                msgs.append(f"filter {key}")
+    # ── 2. Plausibility + slope filter (auto: only when catalog has rules) ────
+    if catalog.get("plausibility"):
+        filter_cols(working, catalog)
+        changed = True
+        msgs.append("filter")
 
+    # Always re-derive cleaned from (possibly trimmed+filtered) table
+    ocr["cleaned"] = working
     if not changed:
         return False, "keine Änderungen", track_needed
 
@@ -338,46 +335,3 @@ def retrofix_result_json(
         return False, f"Schreiben fehlgeschlagen: {e}", track_needed
 
     return True, f"{path.name}: {', '.join(msgs)}", track_needed
-
-
-def reclean_result_json(json_path: str, catalog: dict) -> tuple[bool, str]:
-    """
-    Re-apply plausibility + slope filter to a result JSON's cleaned table.
-    Source: ocr.cleaned (preferred) or ocr.table. Result written to ocr.cleaned.
-    """
-    import json as _json
-    import copy
-    from pathlib import Path
-
-    path = Path(json_path)
-    try:
-        doc = _json.loads(path.read_text(encoding="utf-8", errors="ignore"))
-    except Exception as e:
-        return False, f"Lesen fehlgeschlagen: {e}"
-
-    rr = doc.get("recordResult") if isinstance(doc, dict) else None
-    if not isinstance(rr, dict):
-        return False, "kein recordResult"
-    ocr = rr.get("ocr")
-    if not isinstance(ocr, dict):
-        return False, "kein ocr"
-
-    src = None
-    for key in ("cleaned", "table"):
-        tbl = ocr.get(key)
-        if isinstance(tbl, dict) and tbl.get("time_s"):
-            src = tbl
-            break
-    if src is None:
-        return False, "keine Tabelle"
-
-    cleaned = copy.deepcopy(src)
-    filter_cols(cleaned, catalog)
-    ocr["cleaned"] = cleaned
-
-    try:
-        _atomic_write(path, doc)
-    except Exception as e:
-        return False, f"Schreiben fehlgeschlagen: {e}"
-
-    return True, path.name

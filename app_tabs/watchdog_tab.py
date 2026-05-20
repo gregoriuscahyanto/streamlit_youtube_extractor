@@ -26,8 +26,9 @@ def render(ns):
         st.session_state.yt_watchdog_task_mat_json = bool(_live_tasks.get("mat_json", False))
         st.session_state.yt_watchdog_task_download = bool(_live_tasks.get("download", False))
         st.session_state.yt_watchdog_task_ocr     = bool(_live_tasks.get("ocr",      True))
-        st.session_state.yt_watchdog_task_reclean  = bool(_live_tasks.get("reclean",  False))
-        st.session_state.yt_watchdog_task_retrofix = bool(_live_tasks.get("retrofix", False))
+        st.session_state.yt_watchdog_task_retrofix = bool(
+            _live_tasks.get("retrofix", False) or _live_tasks.get("reclean", False)
+        )
 
     t1, t2 = st.columns(2)
     task_mat_json = t1.checkbox(
@@ -45,36 +46,26 @@ def render(ns):
         value=bool(st.session_state.get("yt_watchdog_task_ocr", True)),
         key="wd_task_ocr_cb",
     )
-    task_reclean = st.checkbox(
-        "Nachfiltern (Plausibilität + Steigung auf cleaned anwenden)",
-        value=bool(st.session_state.get("yt_watchdog_task_reclean", False)),
-        key="wd_task_reclean_cb",
-        help="Wendet Min/Max und Max-Steigung aus dem ROI-Katalog auf alle result-JSONs an. "
-             "Jede Datei wird pro Watchdog-Session einmal verarbeitet.",
-    )
     task_retrofix = st.checkbox(
-        "Nachkorrektur (Zeitgrenzen trimmen + Plausibilität + Track-Minimap neu berechnen)",
+        "Nachkorrektur & Nachfiltern",
         value=bool(st.session_state.get("yt_watchdog_task_retrofix", False)),
         key="wd_task_retrofix_cb",
-        help="Kombinierte Nachkorrektur pro Datei: "
-             "(1) Zeilen außerhalb start_s/end_s löschen, "
-             "(2) Min/Max + Steigung filtern, "
-             "(3) track_minimap neu auswerten wenn track_minimap_found überall 0 war "
-             "(behebt den list-vs-dict Bug).",
+        help="Pro Datei automatisch: "
+             "(1) Zeilen außerhalb start_s/end_s löschen (nur wenn Parameter vorhanden), "
+             "(2) Plausibilität + Steigung filtern — cleaned wird neu aus table abgeleitet, "
+             "(3) track_minimap neu auswerten wenn track_minimap_found überall 0 war.",
     )
 
     # Persist to session state and push live to the running watchdog thread.
     st.session_state.yt_watchdog_task_mat_json = task_mat_json
     st.session_state.yt_watchdog_task_download = task_download
     st.session_state.yt_watchdog_task_ocr = task_ocr
-    st.session_state.yt_watchdog_task_reclean = task_reclean
     st.session_state.yt_watchdog_task_retrofix = task_retrofix
     if is_running:
         _new_tasks = {
             "mat_json": task_mat_json,
             "download": task_download,
             "ocr": task_ocr,
-            "reclean": task_reclean,
             "retrofix": task_retrofix,
         }
         with _YT_WATCHDOG_LOCK:

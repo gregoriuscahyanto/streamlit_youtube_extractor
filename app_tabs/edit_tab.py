@@ -64,7 +64,18 @@ def _scan_editable_jsons() -> list[dict]:
 
 
 def _load_cleaned(json_path: str) -> dict[str, list]:
-    """Load cleaned table as {col: [float|nan]}."""
+    """Load cleaned table as {col: [float|nan]}. All values are coerced to float."""
+    def _to_f(x) -> float:
+        """Coerce any value to float; unknown types become NaN."""
+        if x is None or x == "":
+            return float("nan")
+        if isinstance(x, (list, tuple)):
+            return _to_f(x[0]) if len(x) == 1 else float("nan")
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return float("nan")
+
     try:
         doc = json.loads(Path(json_path).read_text(encoding="utf-8", errors="ignore"))
         rr = doc.get("recordResult") if isinstance(doc, dict) else {}
@@ -81,10 +92,7 @@ def _load_cleaned(json_path: str) -> dict[str, list]:
         for k, v in cleaned.items():
             if not isinstance(v, list) or len(v) != n:
                 continue
-            try:
-                out[k] = [float(x) if x not in ("", None) else float("nan") for x in v]
-            except Exception:
-                out[k] = list(v)
+            out[k] = [_to_f(x) for x in v]
         return out
     except Exception:
         return {}
@@ -127,38 +135,55 @@ def _interpolate_column(
     remove_idx: set[int],
     method: str,
 ) -> list[float]:
-    """Return ys with values at remove_idx replaced by interpolation on xs."""
+    """Return ys with marked indices AND existing NaN values filled by interpolation.
+
+    Points outside the valid source range (before first / after last finite source
+    value) are set to NaN — no extrapolation.
+    """
     import numpy as np
 
     n = len(xs)
     xs_arr = np.array(xs, dtype=float)
     ys_arr = np.array(ys, dtype=float)
 
+    # Source: non-marked AND finite positions
     keep = np.ones(n, dtype=bool)
     for i in remove_idx:
         if 0 <= i < n:
             keep[i] = False
-
     xs_k = xs_arr[keep]
     ys_k = ys_arr[keep]
     valid = np.isfinite(xs_k) & np.isfinite(ys_k)
     if valid.sum() < 2:
         return ys
 
+    # Positions that need filling: manually marked + existing NaN in the data
+    need_fill = (~keep) | (~np.isfinite(ys_arr))
+
+    # No extrapolation: clamp to [x_min, x_max] of the source — set NaN outside
+    x_min = float(xs_k[valid].min())
+    x_max = float(xs_k[valid].max())
+    in_range = need_fill & np.isfinite(xs_arr) & (xs_arr >= x_min) & (xs_arr <= x_max)
+    out_of_range = need_fill & ~in_range
+
+    result = ys_arr.copy()
+    result[out_of_range] = float("nan")
+
+    if not in_range.any():
+        return result.tolist()
+
     try:
         if method == "akima":
             from scipy.interpolate import Akima1DInterpolator
             f = Akima1DInterpolator(xs_k[valid], ys_k[valid])
-            result = ys_arr.copy()
-            result[~keep] = f(xs_arr[~keep])
+            result[in_range] = f(xs_arr[in_range])
         else:
             from scipy.interpolate import interp1d
             kind = {"linear": "linear", "quadratic": "quadratic",
                     "cubic": "cubic", "nearest": "nearest"}.get(method, "linear")
             f = interp1d(xs_k[valid], ys_k[valid], kind=kind,
-                         bounds_error=False, fill_value="extrapolate")
-            result = ys_arr.copy()
-            result[~keep] = f(xs_arr[~keep])
+                         bounds_error=False, fill_value=float("nan"))
+            result[in_range] = f(xs_arr[in_range])
         return result.tolist()
     except Exception:
         return ys
@@ -300,7 +325,7 @@ def render(ns: dict) -> None:
         # ── threshold batch-remove ────────────────────────────────────────────
         with st.expander("Schwellenwert-Filter (Batch-Entfernung)", expanded=False):
             st.caption(f"Alle {_y_col}-Werte außerhalb des Bereichs markieren.")
-            _valid_ys = [v for v in _ys_work if _np.isfinite(v)]
+            _valid_ys = [v for v in _ys_work if isinstance(v, (int, float)) and _np.isfinite(v)]
             _y_min_data = float(min(_valid_ys)) if _valid_ys else 0.0
             _y_max_data = float(max(_valid_ys)) if _valid_ys else 1.0
             _tc1, _tc2, _tc3 = st.columns([2, 2, 2])
@@ -309,7 +334,7 @@ def render(ns: dict) -> None:
             if _tc3.button("Markieren", key="edit_thr_apply"):
                 _new_marked: set[int] = set()
                 for _i2, _y2 in enumerate(_ys_work):
-                    if _np.isfinite(_y2) and (_y2 < _thr_lo or _y2 > _thr_hi):
+                    if isinstance(_y2, (int, float)) and _np.isfinite(_y2) and (_y2 < _thr_lo or _y2 > _thr_hi):
                         _new_marked.add(_i2)
                 st.session_state["edit_threshold_marked"] = _new_marked
                 st.rerun(scope="fragment")
@@ -375,7 +400,11 @@ def render(ns: dict) -> None:
         # merge threshold-filter marks
         _marked |= st.session_state.pop("edit_threshold_marked", set())
         _n_marked = len(_marked)
-        st.caption(f"**{_n_marked}** Punkt(e) markiert (rot)")
+        _n_nans = sum(1 for v in _ys_work if isinstance(v, float) and _np.isnan(v))
+        _caption = f"**{_n_marked}** Punkt(e) markiert (rot)"
+        if _n_nans:
+            _caption += f" · **{_n_nans}** NaN-Wert(e) in der Spalte (werden beim Anwenden mitgefüllt)"
+        st.caption(_caption)
 
         # ── changed-points count (for save button style + warning) ────────────
         _ys_orig_b = _orig.get(_y_col, [])
@@ -394,7 +423,7 @@ def render(ns: dict) -> None:
         _ba, _bb, _bc, _bd, _be = st.columns(5)
         _apply = _ba.button(
             "✂ Entfernen & interpolieren", type="primary",
-            key="edit_apply", disabled=_n_marked == 0, use_container_width=True,
+            key="edit_apply", disabled=(_n_marked == 0 and _n_nans == 0), use_container_width=True,
         )
         _clear = _bb.button(
             "↩ Selektion löschen",
