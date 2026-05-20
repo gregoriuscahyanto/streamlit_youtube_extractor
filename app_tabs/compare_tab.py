@@ -85,8 +85,8 @@ def _scan_available_jsons() -> list[dict]:
     return out
 
 
-def _load_file_data(json_path: str, offset_s: float) -> dict[str, list]:
-    """Load OCR cleaned + audio RPM into {col: [values]} with time offset applied."""
+def _load_file_data(json_path: str, offset_s: float, offset_m: float = 0.0) -> dict[str, list]:
+    """Load OCR cleaned + audio RPM into {col: [values]} with time and distance offsets applied."""
     try:
         doc = json.loads(Path(json_path).read_text(encoding="utf-8", errors="ignore"))
     except Exception:
@@ -107,9 +107,10 @@ def _load_file_data(json_path: str, offset_s: float) -> dict[str, list]:
             if isinstance(v, list) and len(v) == n:
                 if k == "time_s":
                     cols["time_s"] = [float(x) + offset_s for x in v]
+                elif k == "s_m" and offset_m != 0.0:
+                    cols["s_m"] = [float(x) + offset_m if x not in ("", None) else float("nan") for x in v]
                 else:
                     try:
-                        import numpy as _np
                         cols[k] = [float(x) if x not in ("", None) else float("nan") for x in v]
                     except Exception:
                         cols[k] = list(v)
@@ -233,7 +234,7 @@ def render(ns: dict) -> None:
             # prefer title; folder as fallback so label is always human-readable
             _a = next((a for a in available if a["path"] == p), {})
             _lbl = _a.get("title") or _a.get("folder") or Path(p).stem
-            new_files.append({"path": p, "label": _lbl, "offset_s": 0.0})
+            new_files.append({"path": p, "label": _lbl, "offset_s": 0.0, "offset_m": 0.0})
     st.session_state.cmp_files = new_files
 
     if not st.session_state.cmp_files:
@@ -241,17 +242,24 @@ def render(ns: dict) -> None:
         _render_config_section()
         return
 
-    # Per-file label + offset
+    # Per-file label + offsets
     for i, f in enumerate(st.session_state.cmp_files):
-        c1, c2, c3 = st.columns([3, 2, 1])
+        f.setdefault("offset_m", 0.0)
+        c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
         f["label"] = c1.text_input(
             "Label", value=f["label"], key=f"cmp_lbl_{i}", label_visibility="collapsed"
         )
         f["offset_s"] = c2.number_input(
             "Zeitversatz [s]", value=float(f["offset_s"]),
-            step=0.001, format="%.3f", key=f"cmp_off_{i}", label_visibility="collapsed"
+            step=0.001, format="%.3f", key=f"cmp_off_{i}", label_visibility="collapsed",
+            help="Zeitversatz: wird auf time_s addiert",
         )
-        c3.caption(f"Versatz: {f['offset_s']:+.3f}s")
+        f["offset_m"] = c3.number_input(
+            "Streckenversatz [m]", value=float(f["offset_m"]),
+            step=1.0, format="%.1f", key=f"cmp_offm_{i}", label_visibility="collapsed",
+            help="Streckenversatz: wird auf s_m addiert (nur wenn s_m im JSON vorhanden)",
+        )
+        c4.caption(f"{f['offset_s']:+.3f}s / {f['offset_m']:+.0f}m")
 
     # Build a short hash of the current plausibility catalog so that changes
     # to bounds/slopes invalidate the cache and trigger a reload+refilter.
@@ -264,14 +272,15 @@ def render(ns: dict) -> None:
     except Exception:
         _plaus_hash = "0"
 
-    # Load data (cache by path + offset + catalog hash)
+    # Load data (cache by path + offsets + catalog hash)
     cmp_data: dict[str, dict] = {}
     for f in st.session_state.cmp_files:
-        key = f"{f['path']}::{f['offset_s']}::{_plaus_hash}"
+        f.setdefault("offset_m", 0.0)
+        key = f"{f['path']}::{f['offset_s']}::{f['offset_m']}::{_plaus_hash}"
         cached = st.session_state.cmp_data.get(key)
         if cached is None:
             import copy as _copy
-            cached = _load_file_data(f["path"], f["offset_s"])
+            cached = _load_file_data(f["path"], f["offset_s"], f["offset_m"])
             # Apply plausibility + slope filter using current catalog
             if _cmp_catalog and cached:
                 try:
@@ -493,7 +502,8 @@ def _render_config_section() -> None:
         if st.button("Speichern", key="cmp_save_btn"):
             cfg = {
                 "files": [
-                    {"path": f["path"], "label": f["label"], "offset_s": f["offset_s"]}
+                    {"path": f["path"], "label": f["label"],
+                     "offset_s": f["offset_s"], "offset_m": f.get("offset_m", 0.0)}
                     for f in st.session_state.cmp_files
                 ],
                 "charts": list(st.session_state.cmp_charts),
