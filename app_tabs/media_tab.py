@@ -705,52 +705,21 @@ def render(ns: dict) -> None:
         with st.expander("Letzter Konvertierungs-Log", expanded=False):
             st.code("\n".join(log_lines[-30:]), language="text")
 
-    # ── Nächste Datei ohne ROI laden ───────────────────────────────────────────
+    # ── Schnellaktionen ────────────────────────────────────────────────────────
     def _next_roi_candidate() -> dict | None:
-        """Find first row: video present, not faulty, not no_roi_available, no ROI yet."""
         for r in rows:
-            if not r.get("video_exists"):
-                continue
-            if r.get("video_faulty"):
-                continue
-            if r.get("no_roi_available"):
-                continue
-            if r.get("roi"):  # already has ROI
-                continue
-            return r
+            if r.get("video_exists") and not r.get("video_faulty") and not r.get("no_roi_available") and not r.get("roi"):
+                return r
         return None
 
     _next_roi = _next_roi_candidate()
-    _next_roi_btn_label = (
-        f"Nächste ohne ROI laden: {_next_roi['folder']}" if _next_roi else "Nächste ohne ROI laden"
-    )
-    if st.button(
-        _next_roi_btn_label,
-        disabled=_next_roi is None,
-        key="lib_next_roi_btn",
-        help="Lädt die erste Datei, die ein Video hat, nicht als fehlerhaft / kein ROI markiert ist, aber noch kein ROI besitzt.",
-    ):
-        st.session_state["lib_pending_load_folder"] = _next_roi["folder"]
-        st.session_state["lib_pending_load_json"] = _next_roi.get("json_path", "")
-        st.rerun()
 
-    # ── Action bar ─────────────────────────────────────────────────────────────
-    col_mat, col_dl, col_link = st.columns([2, 3, 3])
-
-    # MAT → JSON (alle ausstehenden)
     pending_mats = [
         Path(r["mat_path"]) for r in rows
         if r["mat_exists"] and not r["json_exists"] and r["mat_path"]
     ]
     convert_fn = globals().get("_convert_one_mat") or _inline_convert_one_mat
-    mat_btn_label = f"MAT→JSON ({len(pending_mats)})"
-    if col_mat.button(mat_btn_label, disabled=running or not pending_mats,
-                      use_container_width=True, key="lib_mat_all_btn"):
-        t = threading.Thread(target=_run_conv_thread, args=(pending_mats, convert_fn), daemon=True)
-        t.start()
-        st.rerun()
 
-    # Herunterladen: video fehlt, audio fehlt, fehlerhaft markiert, oder download-error
     def _needs_download(r: dict) -> bool:
         if not r.get("youtube_link"):
             return False
@@ -765,120 +734,111 @@ def render(ns: dict) -> None:
     pending_dl = [r for r in rows if _needs_download(r)]
     n_missing  = sum(1 for r in pending_dl if not r.get("video_exists") or not r.get("audio_exists"))
     n_faulty   = sum(1 for r in pending_dl if r.get("video_faulty"))
-    _parts = []
-    if n_missing: _parts.append(f"{n_missing} fehlend")
-    if n_faulty:  _parts.append(f"{n_faulty} fehlerhaft")
-    dl_label = f"Herunterladen / Wiederholen ({' · '.join(_parts) if _parts else len(pending_dl)})"
-    if col_dl.button(dl_label, disabled=not pending_dl,
-                     use_container_width=True, key="lib_dl_btn"):
+    _dl_parts  = []
+    if n_missing: _dl_parts.append(f"{n_missing} fehlend")
+    if n_faulty:  _dl_parts.append(f"{n_faulty} fehlerhaft")
+
+    # Files eligible for retrofix: have JSON with OCR data
+    _retrofix_paths = [
+        r["json_path"] for r in rows
+        if r.get("json_exists") and r.get("json_path") and r.get("ocr") != "nein"
+    ]
+
+    _qa1, _qa2, _qa3, _qa4 = st.columns(4)
+
+    _next_roi_label = (
+        f"Nächste ohne ROI: {_next_roi['folder']}" if _next_roi else "Nächste ohne ROI laden"
+    )
+    if _qa1.button(
+        _next_roi_label,
+        disabled=_next_roi is None,
+        use_container_width=True,
+        key="lib_next_roi_btn",
+        help="Lädt die erste Datei mit Video, die noch kein ROI hat und nicht als fehlerhaft markiert ist.",
+    ):
+        st.session_state["lib_pending_load_folder"] = _next_roi["folder"]
+        st.session_state["lib_pending_load_json"] = _next_roi.get("json_path", "")
+        st.rerun()
+
+    if _qa2.button(
+        f"MAT→JSON ({len(pending_mats)} ausstehend)",
+        disabled=running or not pending_mats,
+        use_container_width=True,
+        key="lib_mat_all_btn",
+        help="Konvertiert alle MAT-Dateien, für die noch keine JSON existiert.",
+    ):
+        t = threading.Thread(target=_run_conv_thread, args=(pending_mats, convert_fn), daemon=True)
+        t.start()
+        st.rerun()
+
+    if _qa3.button(
+        f"Herunterladen / Wiederholen ({' · '.join(_dl_parts) if _dl_parts else len(pending_dl)})",
+        disabled=not pending_dl,
+        use_container_width=True,
+        key="lib_dl_btn",
+        help="Startet den Watchdog-Download für alle Einträge, bei denen Video/Audio fehlt oder fehlerhaft ist.",
+    ):
         for r in pending_dl:
             _update_db_status(r["folder"], r["youtube_link"], "pending", "")
         st.session_state.yt_watchdog_task_download = True
         st.session_state.yt_watchdog_cmd = "start"
         st.rerun()
 
-    # Neuer YouTube-Link
-    with col_link:
-        new_link = st.text_input("Neuer YouTube-Link", key="lib_new_link",
-                                 placeholder="https://www.youtube.com/watch?v=...", label_visibility="collapsed")
-        if st.button("+ Link", key="lib_add_btn", disabled=not str(new_link or "").strip()):
-            link = str(new_link).strip()
-            existing = {r["youtube_link"] for r in rows}
-            if link in existing:
+    if _qa4.button(
+        f"Nachkorr. & Nachfilt. ({len(_retrofix_paths)})",
+        disabled=not _retrofix_paths,
+        use_container_width=True,
+        key="lib_retrofix_all_btn",
+        help="① Trim start/end  ② Plausibilität filtern  ③ cleaned aus table neu ableiten — für alle Dateien mit OCR-Daten.",
+    ):
+        try:
+            from app_tabs.plausibility_filter import retrofix_result_json as _rfj_all
+            from app_tabs.roi_catalog_tab import load_catalog as _lc_all
+            _all_catalog = st.session_state.get("roi_catalog") or _lc_all()
+            _all_ok, _all_skip, _all_err, _all_track = 0, 0, 0, []
+            _prog_all = st.progress(0.0, text="Nachkorrektur & Nachfiltern läuft…")
+            for _ai, _ap in enumerate(_retrofix_paths):
+                _aok, _amsg, _atn = _rfj_all(_ap, _all_catalog)
+                if _aok:
+                    _all_ok += 1
+                elif any(x in _amsg for x in ("keine Tabelle", "kein ocr", "kein recordResult", "keine Änderungen")):
+                    _all_skip += 1
+                else:
+                    _all_err += 1
+                if _atn:
+                    _all_track.append(_ap)
+                _prog_all.progress((_ai + 1) / len(_retrofix_paths),
+                                   text=f"Nachkorrektur… {_ai+1}/{len(_retrofix_paths)}")
+            _prog_all.empty()
+            st.success(
+                f"{_all_ok} geändert, {_all_skip} ohne Änderungen"
+                + (f", {_all_err} Fehler" if _all_err else "") + "."
+                + (f"  \n{len(_all_track)} Datei(en) benötigen Track-Nachkorrektur → Watchdog-Tab." if _all_track else "")
+            )
+            if _all_track:
+                st.session_state["_retrofix_track_queue"] = _all_track
+            st.session_state.cmp_data = {}
+            st.session_state.pop("_detail_cache", None)
+        except Exception as _rfall:
+            st.error(f"Nachkorrektur fehlgeschlagen: {_rfall}")
+
+    # ── YouTube-Link hinzufügen (Enter zum Bestätigen) ─────────────────────────
+    with st.form("lib_link_form", clear_on_submit=True, border=False):
+        _lc1, _lc2 = st.columns([5, 1])
+        _new_link = _lc1.text_input(
+            "link", placeholder="YouTube-Link hinzufügen…",
+            label_visibility="collapsed", key="lib_new_link_input",
+        )
+        _link_submitted = _lc2.form_submit_button("＋", use_container_width=True)
+        if _link_submitted and _new_link.strip():
+            _link = _new_link.strip()
+            _existing = {r["youtube_link"] for r in rows}
+            if _link in _existing:
                 st.warning("Link bereits vorhanden.")
             else:
-                _write_db_entry(link)
+                _write_db_entry(_link)
                 st.success("Link hinzugefügt.")
                 st.rerun()
-
-    # ── Nachkorrektur / Nachfiltern ────────────────────────────────────────────
-    _result_json_paths = sorted(
-        str(p) for p in (base / "results").glob("results_*.json")
-    ) if (base / "results").exists() else []
-
-    # Map folder name -> full path for selection widget
-    _nc_folder_to_path: dict[str, str] = {
-        Path(p).stem.replace("results_", "", 1): p for p in _result_json_paths
-    }
-    _nc_all_folders = list(_nc_folder_to_path.keys())
-
-    with st.expander(f"Nachkorrektur ({len(_result_json_paths)} Dateien)", expanded=False):
-        st.caption(
-            "Kombinierte Nachkorrektur für bereits ausgewertete Dateien. "
-            "Führt die Schritte aus die beim Auswerten fehlten oder durch Bugs fehlerhaft waren."
-        )
-
-        # ── Dateiauswahl ──────────────────────────────────────────────────────
-        _nc_sel_all = st.checkbox(
-            "Alle auswählen",
-            value=True,
-            key="lib_nc_sel_all",
-        )
-        if _nc_sel_all:
-            _nc_selected_folders = _nc_all_folders
-            st.caption(f"Alle {len(_nc_all_folders)} Dateien ausgewählt.")
-        else:
-            _nc_selected_folders = st.multiselect(
-                "Dateien auswählen",
-                options=_nc_all_folders,
-                default=[],
-                key="lib_nc_multisel",
-                placeholder="Ordner auswählen…",
-            )
-            st.caption(f"{len(_nc_selected_folders)} von {len(_nc_all_folders)} ausgewählt.")
-
-        _nc_selected_paths = [_nc_folder_to_path[f] for f in _nc_selected_folders if f in _nc_folder_to_path]
-
-        st.caption(
-            "① Zeilen außerhalb start_s/end_s löschen (nur wenn Parameter vorhanden)  \n"
-            "② Min/Max + Steigung aus ROI-Katalog filtern → cleaned neu ableiten aus table  \n"
-            "③ track_minimap neu berechnen wenn track_minimap_found überall 0"
-        )
-        if st.button(
-            f"{len(_nc_selected_paths)} Datei(en) nachkorrigieren & nachfiltern",
-            disabled=not _nc_selected_paths,
-            key="lib_retrofix_btn",
-        ):
-            try:
-                from app_tabs.plausibility_filter import retrofix_result_json
-                from app_tabs.roi_catalog_tab import load_catalog as _lc_lib2
-                _rf_catalog = st.session_state.get("roi_catalog") or _lc_lib2()
-                _rf_ok, _rf_skip, _rf_err = 0, 0, 0
-                _rf_needs_track: list[str] = []
-                _prog2 = st.progress(0.0, text="Nachkorrektur & Nachfiltern läuft…")
-                for _ri, _rp in enumerate(_nc_selected_paths):
-                    _ok, _msg, _tn = retrofix_result_json(_rp, _rf_catalog)
-                    if _ok:
-                        _rf_ok += 1
-                    elif any(x in _msg for x in ("keine Tabelle", "kein ocr", "kein recordResult", "keine Änderungen")):
-                        _rf_skip += 1
-                    else:
-                        _rf_err += 1
-                    if _tn:
-                        _rf_needs_track.append(_rp)
-                    _prog2.progress((_ri + 1) / len(_nc_selected_paths),
-                                    text=f"Nachkorrektur… {_ri+1}/{len(_nc_selected_paths)}")
-                _prog2.empty()
-                st.success(
-                    f"{_rf_ok} geändert, {_rf_skip} ohne Daten"
-                    + (f", {_rf_err} Fehler" if _rf_err else "") + "."
-                    + (f"  \n{len(_rf_needs_track)} Datei(en) benötigen Track-Nachkorrektur (Watchdog-Tab)." if _rf_needs_track else "")
-                )
-                if _rf_needs_track:
-                    st.session_state["_retrofix_track_queue"] = _rf_needs_track
-                st.session_state.cmp_data = {}
-                st.session_state.pop("_detail_cache", None)
-            except Exception as _rfe:
-                st.error(f"Nachkorrektur fehlgeschlagen: {_rfe}")
-
-        # Track-Minimap re-run info (shown after retrofix identified candidates)
-        _track_queue = list(st.session_state.get("_retrofix_track_queue") or [])
-        if _track_queue:
-            st.info(
-                f"**{len(_track_queue)} Datei(en)** benötigen Track-Minimap-Nachkorrektur "
-                f"(track_minimap_found war überall 0).  \n"
-                f"Bitte im **Watchdog-Tab** die Aufgabe **'Nachkorrektur'** aktivieren."
-            )
 
     # ── Analyse-Übersicht ─────────────────────────────────────────────────────
     _render_media_analysis(rows)
@@ -932,6 +892,8 @@ def render(ns: dict) -> None:
         return
 
     if sel_indices:
+        if sel_indices[0] >= len(rows):
+            return  # stale selection after delete — next rerun will have fresh indices
         sel_row = rows[sel_indices[0]]
     else:
         # Auto-load path: find row by folder name
@@ -1314,9 +1276,53 @@ def render(ns: dict) -> None:
         st.session_state.yt_watchdog_cmd = "start"
         st.info("Download wird vom Watchdog gestartet.")
 
-    # ── Details ────────────────────────────────────────────────────────────────
-    with ra4:
-        with st.expander("Details", expanded=False):
-            display = {k: v for k, v in sel_row.items() if k not in ("duration",)}
-            st.json(display)
+    # ── Nachkorrigieren & Nachfiltern (nur diese Zeile) ───────────────────────
+    if ra4.button(
+        "Nachkorr. & Nachfilt.",
+        disabled=not sel_row["json_exists"],
+        use_container_width=True, key="lib_row_retrofix_btn",
+        help="① trim start/end · ② Plausibilität filtern · cleaned aus table neu ableiten",
+    ):
+        try:
+            from app_tabs.plausibility_filter import retrofix_result_json as _rfj
+            from app_tabs.roi_catalog_tab import load_catalog as _lc_row
+            _row_catalog = st.session_state.get("roi_catalog") or _lc_row()
+            _row_ok, _row_msg, _row_tn = _rfj(sel_row["json_path"], _row_catalog)
+            if _row_ok:
+                _DETAIL_CACHE.pop(sel_row["json_path"], None)
+                st.success(f"✅ {_row_msg}")
+                if _row_tn:
+                    st.session_state["_track_rerun_pending"] = sel_row["json_path"]
+                    st.info("Track-Minimap-Nachkorrektur nötig.")
+            else:
+                st.warning(_row_msg)
+        except Exception as _rfe:
+            st.error(f"Fehler: {_rfe}")
+
+    # ── Track-Minimap nachkorrigieren (direkt, ohne Watchdog) ────────────────
+    if st.session_state.get("_track_rerun_pending") == sel_row.get("json_path"):
+        if st.button(
+            "🗺 Track-Minimap nachkorrigieren",
+            key="lib_track_rerun_btn",
+            type="primary",
+            use_container_width=True,
+            help="Minimap-Tracking für diese Datei direkt neu berechnen (kein Watchdog nötig)",
+        ):
+            from app_tabs import youtube_tab as _yt_mod
+            _track_fn = getattr(_yt_mod, "_track_only_fn", None)
+            if callable(_track_fn):
+                with st.spinner("Track-Minimap wird nachkorrigiert (kann mehrere Minuten dauern)…"):
+                    try:
+                        _tr_ok, _tr_msg = _track_fn(Path(sel_row["json_path"]))
+                    except Exception as _tre:
+                        _tr_ok, _tr_msg = False, str(_tre)
+                if _tr_ok:
+                    _DETAIL_CACHE.pop(sel_row["json_path"], None)
+                    st.session_state.pop("_track_rerun_pending", None)
+                    st.success(f"✅ {_tr_msg}")
+                else:
+                    st.error(f"Track-Fehler: {_tr_msg}")
+            else:
+                st.error("Track-Rerun-Funktion nicht verfügbar (youtube_tab.render noch nicht aufgerufen?).")
+
 

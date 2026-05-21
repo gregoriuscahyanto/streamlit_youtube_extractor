@@ -293,11 +293,15 @@ def render(ns: dict) -> None:
     except Exception:
         _plaus_hash = "0"
 
-    # Load data (cache by path + offsets + catalog hash)
+    # Load data (cache by path + offsets + catalog hash + mtime)
     cmp_data: dict[str, dict] = {}
     for f in st.session_state.cmp_files:
         f.setdefault("offset_m", 0.0)
-        key = f"{f['path']}::{f['offset_s']}::{f['offset_m']}::{_plaus_hash}"
+        try:
+            _mtime = Path(f["path"]).stat().st_mtime
+        except Exception:
+            _mtime = 0
+        key = f"{f['path']}::{f['offset_s']}::{f['offset_m']}::{_plaus_hash}::{_mtime}"
         cached = st.session_state.cmp_data.get(key)
         if cached is None:
             import copy as _copy
@@ -339,30 +343,50 @@ def render(ns: dict) -> None:
                 to_remove = ci
 
             col_a, col_b, col_c = st.columns([2, 2, 2])
-            x_opts = ["time_s"] + [c for c in all_cols if c != "time_s"]
-            x_def = chart.get("x_col", "time_s")
-            x_idx = x_opts.index(x_def) if x_def in x_opts else 0
-            chart["x_col"] = col_a.selectbox(
-                "X-Achse", options=x_opts, index=x_idx,
-                key=f"cmp_cx_{ci}"
-            )
-            y_opts = [c for c in all_cols if c != chart["x_col"]]
-            y_def = chart.get("y_col", "")
-            y_idx = y_opts.index(y_def) if y_def in y_opts else 0
-            chart["y_col"] = col_b.selectbox(
-                "Y-Achse", options=y_opts, index=y_idx if y_opts else 0,
-                key=f"cmp_cy_{ci}"
-            ) if y_opts else ""
+
+            _type_opts = ["line", "scatter", "geoplot"]
+            _type_labels = {"line": "Linie", "scatter": "Punkte", "geoplot": "Geoplot"}
+            _cur_type = chart.get("plot_type", "line")
+            if _cur_type not in _type_opts:
+                _cur_type = "line"
             chart["plot_type"] = col_c.selectbox(
-                "Darstellung",
-                options=["line", "scatter"],
-                index=0 if chart.get("plot_type", "line") == "line" else 1,
-                format_func=lambda v: "Linie" if v == "line" else "Punkte",
-                key=f"cmp_ctype_{ci}"
+                "Darstellung", options=_type_opts, index=_type_opts.index(_cur_type),
+                format_func=lambda v: _type_labels.get(v, v),
+                key=f"cmp_ctype_{ci}",
             )
 
+            if chart["plot_type"] == "geoplot":
+                # Color variable selector; X/Y are fixed to track_xy_x / track_xy_y
+                _geo_opts = [""] + [c for c in all_cols if c not in ("track_xy_x", "track_xy_y")]
+                _gc_def = chart.get("color_col", "v_Fzg_kmph")
+                _gc_idx = _geo_opts.index(_gc_def) if _gc_def in _geo_opts else 0
+                chart["color_col"] = col_a.selectbox(
+                    "Farbvariable", options=_geo_opts, index=_gc_idx,
+                    format_func=lambda v: "(keine)" if v == "" else v,
+                    key=f"cmp_cgeo_{ci}",
+                )
+                col_b.caption("X: `track_xy_x`  ·  Y: `track_xy_y`")
+                chart["x_col"] = "track_xy_x"
+                chart["y_col"] = "track_xy_y"
+            else:
+                x_opts = ["time_s"] + [c for c in all_cols if c != "time_s"]
+                x_def = chart.get("x_col", "time_s")
+                x_idx = x_opts.index(x_def) if x_def in x_opts else 0
+                chart["x_col"] = col_a.selectbox(
+                    "X-Achse", options=x_opts, index=x_idx, key=f"cmp_cx_{ci}",
+                )
+                y_opts = [c for c in all_cols if c != chart["x_col"]]
+                y_def = chart.get("y_col", "")
+                y_idx = y_opts.index(y_def) if y_def in y_opts else 0
+                chart["y_col"] = (
+                    col_b.selectbox("Y-Achse", options=y_opts, index=y_idx if y_opts else 0, key=f"cmp_cy_{ci}")
+                    if y_opts else ""
+                )
+
             # Render this chart
-            if chart["y_col"] and all_cols:
+            if chart["plot_type"] == "geoplot":
+                _render_geoplot_chart(chart, st.session_state.cmp_files, cmp_data, ci)
+            elif chart["y_col"] and all_cols:
                 _render_chart(chart, st.session_state.cmp_files, cmp_data, ci)
             else:
                 st.caption("Y-Achse auswählen um das Diagramm anzuzeigen.")
@@ -381,46 +405,6 @@ def render(ns: dict) -> None:
         st.rerun()
 
     st.divider()
-
-    # ── Geoplot (nur wenn track_xy vorhanden) ────────────────────────────────
-    _geo_traces = []
-    _centerline_xy = None
-    for _f in st.session_state.cmp_files:
-        _d = cmp_data.get(_f["path"], {})
-        _xs = _d.get("track_xy_x")
-        _ys = _d.get("track_xy_y")
-        if _xs and _ys and len(_xs) == len(_ys):
-            _geo_traces.append({
-                "name": _f["label"],
-                "xs": _xs,
-                "ys": _ys,
-                "ts": _d.get("time_s"),
-            })
-            # Load centerline from the first file that has track data
-            if _centerline_xy is None:
-                try:
-                    from app_tabs.track_geoplot import transform_centerline
-                    _trk = _load_trkCalSlim(_f["path"])
-                    _cl_px = _trk.get("centerline_px")
-                    _mini = _trk.get("minimap_pts")
-                    _ref = _trk.get("ref_pts")
-                    if _cl_px and _mini and _ref:
-                        _centerline_xy = transform_centerline(_cl_px, _mini, _ref)
-                except Exception:
-                    pass
-
-    if _geo_traces:
-        st.markdown("### Geoplot")
-        try:
-            from app_tabs.track_geoplot import make_geoplot_figure
-            st.plotly_chart(
-                make_geoplot_figure(_geo_traces, _centerline_xy),
-                use_container_width=True,
-            )
-        except Exception as _ge:
-            st.caption(f"Geoplot nicht verfügbar: {_ge}")
-        st.divider()
-
     _render_config_section()
 
 
@@ -508,6 +492,92 @@ def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], cha
                 st.caption(f"Excel-Export nicht verfügbar: {dl_err}")
     except Exception as e:
         st.caption(f"Diagramm-Fehler: {e}")
+
+
+def _render_geoplot_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], chart_idx: int) -> None:
+    """Render a tiled geoplot — one subplot per file, side by side."""
+    color_col = chart.get("color_col") or None
+    if color_col == "":
+        color_col = None
+
+    # ── Build file traces ─────────────────────────────────────────────────────
+    file_traces: list[dict] = []
+    for f in files:
+        d = cmp_data.get(f["path"], {})
+        xs = d.get("track_xy_x")
+        ys = d.get("track_xy_y")
+        if not xs or not ys or len(xs) != len(ys):
+            continue
+        cl = None
+        try:
+            trk = _load_trkCalSlim(f["path"])
+            cl_raw = trk.get("centerline_px")
+            if isinstance(cl_raw, (list, tuple)) and len(cl_raw) >= 2:
+                cl = [
+                    [float(p[0]), float(p[1])]
+                    for p in cl_raw
+                    if isinstance(p, (list, tuple)) and len(p) >= 2
+                ]
+                if len(cl) < 2:
+                    cl = None
+        except Exception:
+            pass
+        file_traces.append({
+            "name": f["label"],
+            "xs": xs,
+            "ys": ys,
+            "cs": list(d.get(color_col) or []) if color_col else None,
+            "ts": list(d.get("time_s") or []),
+            "centerline": cl,
+        })
+
+    if not file_traces:
+        st.caption("Keine track_xy-Daten in den ausgewählten Dateien vorhanden.")
+        return
+
+    # ── Delta options (only when multiple files and color column selected) ────
+    is_delta = False
+    if color_col and len(file_traces) > 1:
+        _gd1, _gd2 = st.columns([1, 3])
+        chart["show_delta"] = _gd1.checkbox(
+            "Delta zur Referenz",
+            value=bool(chart.get("show_delta", False)),
+            key=f"cmp_gdelta_{chart_idx}",
+            help="Zeigt Differenz (Datei − Referenz) der Farbvariable statt Absolutwert.",
+        )
+        if chart["show_delta"]:
+            _ref_labels = [tr["name"] for tr in file_traces]
+            _ref_def = chart.get("ref_label", _ref_labels[0])
+            _ref_sel = _gd2.selectbox(
+                "Referenzdatei", options=_ref_labels,
+                index=_ref_labels.index(_ref_def) if _ref_def in _ref_labels else 0,
+                key=f"cmp_gref_{chart_idx}",
+                label_visibility="collapsed",
+            )
+            chart["ref_label"] = _ref_sel
+            ref_i = _ref_labels.index(_ref_sel)
+
+            # Compute delta: interpolate reference values at each file's time points
+            import numpy as _np
+            ref_ts = _np.array(file_traces[ref_i].get("ts") or [], dtype=float)
+            ref_cs = _np.array(file_traces[ref_i].get("cs") or [], dtype=float)
+            if len(ref_ts) >= 2 and len(ref_cs) == len(ref_ts):
+                for j, tr in enumerate(file_traces):
+                    tr_ts = _np.array(tr.get("ts") or [], dtype=float)
+                    tr_cs = _np.array(tr.get("cs") or [], dtype=float)
+                    if len(tr_ts) > 0 and len(tr_cs) == len(tr_ts):
+                        interp_ref = _np.interp(tr_ts, ref_ts, ref_cs)
+                        tr["cs"] = (tr_cs - interp_ref).tolist()
+                    else:
+                        tr["cs"] = None
+                is_delta = True
+
+    try:
+        from app_tabs.track_geoplot import make_geoplot_tiled
+        fig = make_geoplot_tiled(file_traces, color_col=color_col, is_delta=is_delta)
+        st.plotly_chart(fig, use_container_width=True, key=f"cmp_geo_{chart_idx}")
+    except Exception as e:
+        st.caption(f"Geoplot-Fehler: {e}")
 
 
 def _render_config_section() -> None:

@@ -379,13 +379,22 @@ def render(ns):
                     _cur_type = _plot_type_opts[0]
 
                 if _cur_type == "geoplot":
-                    # type selector spans full row for geoplot
-                    _chart["plot_type"] = st.selectbox(
+                    _gc1, _gc2 = st.columns([2, 3])
+                    _chart["plot_type"] = _gc1.selectbox(
                         "Art",
                         options=_plot_type_opts,
                         index=_plot_type_opts.index(_cur_type),
                         format_func=_plot_type_labels.get,
                         key=f"ls_ctype_{_ci}",
+                        label_visibility="collapsed",
+                    )
+                    _geo_color_opts = [""] + [c for c in _num if c not in ("track_xy_x", "track_xy_y")]
+                    _gc_def = _chart.get("color_col", "v_Fzg_kmph")
+                    _gc_idx = _geo_color_opts.index(_gc_def) if _gc_def in _geo_color_opts else 0
+                    _chart["color_col"] = _gc2.selectbox(
+                        "Farbvariable", options=_geo_color_opts, index=_gc_idx,
+                        format_func=lambda v: "(keine)" if v == "" else v,
+                        key=f"ls_cgeo_{_ci}",
                         label_visibility="collapsed",
                     )
                 else:
@@ -417,23 +426,33 @@ def render(ns):
                 if _ptype == "geoplot":
                     if _has_geo:
                         try:
-                            from app_tabs.track_geoplot import transform_centerline, make_geoplot_figure
+                            from app_tabs.track_geoplot import make_geoplot_tiled
                             _xs = _df["track_xy_x"].tolist()
                             _ys = _df["track_xy_y"].tolist()
-                            _ts = _df["time_s"].tolist() if "time_s" in _df.columns else None
-                            _cl_xy = None
-                            _cl_px = st.session_state.get("centerline_px")
-                            _mini = st.session_state.get("minimap_pts")
-                            _ref = st.session_state.get("ref_track_pts")
-                            if _cl_px is not None and _mini and _ref:
-                                _cl_px_l = _cl_px.tolist() if hasattr(_cl_px, "tolist") else list(_cl_px)
-                                _cl_xy = transform_centerline(_cl_px_l, _mini, _ref)
+                            _geo_col = _chart.get("color_col") or None
+                            if _geo_col == "":
+                                _geo_col = None
+                            _cs = _df[_geo_col].tolist() if (_geo_col and _geo_col in _df.columns) else None
+                            # Centerline: centerline_px is in the same pixel space as track_xy
+                            _cl = None
+                            _cl_raw = st.session_state.get("centerline_px")
+                            if _cl_raw is not None:
+                                _cl_list = _cl_raw.tolist() if hasattr(_cl_raw, "tolist") else list(_cl_raw)
+                                _cl = [
+                                    [float(p[0]), float(p[1])]
+                                    for p in _cl_list
+                                    if isinstance(p, (list, tuple)) and len(p) >= 2
+                                ]
+                                if len(_cl) < 2:
+                                    _cl = None
                             st.plotly_chart(
-                                make_geoplot_figure(
-                                    [{"name": "Fahrzeug", "xs": _xs, "ys": _ys, "ts": _ts}],
-                                    centerline_xy=_cl_xy,
+                                make_geoplot_tiled(
+                                    [{"name": "Fahrzeug", "xs": _xs, "ys": _ys,
+                                      "cs": _cs, "centerline": _cl}],
+                                    color_col=_geo_col,
                                 ),
                                 use_container_width=True,
+                                key=f"ls_geo_{_ci}",
                             )
                         except Exception as _ge:
                             st.caption(f"Geoplot-Fehler: {_ge}")

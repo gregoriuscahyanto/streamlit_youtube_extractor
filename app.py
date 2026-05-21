@@ -7835,6 +7835,10 @@ st.markdown(
 
 # Main areas. Native tabs render every tab body on each rerun so all
 # components are initialized and visible from app startup.
+# youtube_tab runs headless (no UI) on every rerun to process watchdog commands
+# and populate globals (_wd_start, _wd_stop, download queue, etc.).
+youtube_tab.render(globals(), headless=True)
+
 _tab_labels = [
     "Cloud Connection & Root",
     "Medienbibliothek",
@@ -7852,11 +7856,6 @@ with _tabs[0]:
     setup_tab.render(globals())
 with _tabs[1]:
     media_tab.render(globals())
-    # youtube_tab renders hidden: processes watchdog commands + populates globals.
-    # Streamlit renders all tab contents on every rerun regardless of active tab,
-    # so this runs even when the user is on a different tab.
-    with st.expander("YouTube Download (erweitert)", expanded=False):
-        youtube_tab.render(globals())
 with _tabs[2]:
     watchdog_tab.render(globals())
 with _tabs[3]:

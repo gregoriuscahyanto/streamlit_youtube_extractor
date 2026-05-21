@@ -32,8 +32,49 @@ def watchdog_snapshot() -> dict:
         }
 
 
-def render(ns):
+def render(ns, headless: bool = False):
     globals().update(ns)
+
+    if headless:
+        # Replace st with a no-op mock so no widgets are rendered.
+        # st.session_state is kept real so watchdog commands and session flags work.
+        import streamlit as _real_st
+
+        class _NoOp:
+            """Silently absorbs any attribute access, call, or context-manager use."""
+            def __call__(self, *a, **kw):
+                # Support: a, b = st.columns(2)  or  a, b, c = st.columns([1,2,3])
+                n = None
+                if len(a) == 1:
+                    if isinstance(a[0], int) and a[0] > 0:
+                        n = a[0]
+                    elif isinstance(a[0], (list, tuple)):
+                        n = len(a[0])
+                if n:
+                    _items = [_NoOp() for _ in range(n)]
+                    class _Sized(_NoOp):
+                        def __iter__(self_): return iter(_items)
+                        def __len__(self_): return n
+                    return _Sized()
+                return _NoOp()
+            def __getattr__(self, n): return _NoOp()
+            def __enter__(self): return _NoOp()
+            def __exit__(self, *a): pass
+            def __iter__(self): return iter([])
+            def __bool__(self): return False
+            def __int__(self): return 0
+            def __float__(self): return 0.0
+            def __str__(self): return ""
+            def __len__(self): return 0
+
+        class _MockSt(_NoOp):
+            @property
+            def session_state(self):
+                return _real_st.session_state
+
+        st = _MockSt()  # shadows the module-level st for all code below,
+                        # including closures (_wd_start, _wd_stop, …)
+
     st.markdown('<div class="section-title">YouTube Download Manager</div>', unsafe_allow_html=True)
     st.caption("Rein Python: Download über scripts/record_youtube_cfr.py (kein MATLAB, kein yt-dlp im App-Flow).")
     st.session_state.setdefault("yt_open_new_window", True)
@@ -1766,6 +1807,9 @@ def render(ns):
             _aw_final(json_path, doc)
         return True, f"{folder}: {found_count}/{n} Frames mit Track-Punkt"
 
+    # Expose for single-file track rerun from Medienbibliothek
+    globals()['_track_only_fn'] = _wd_run_track_only
+
     def _wd_process_once(cfg: dict, stop_event=None) -> bool:
         base_override = cfg.get("local_base_path")
         # Always read from the live shared dict so UI changes take effect at the
@@ -2450,22 +2494,23 @@ def render(ns):
 
     _bg_step()
     if bool(st.session_state.get("yt_bg_active")):
-        done = int(st.session_state.get("yt_bg_done", 0) or 0)
-        total = int(st.session_state.get("yt_bg_total", 0) or 0)
-        cur = int(st.session_state.get("yt_bg_current_idx", -1) or -1)
-        cur_url = ""
-        if 0 <= cur < len(rows):
-            cur_url = str(rows[cur].get("youtube_link") or "")
-        state_slot.caption(f"Hintergrund-Queue aktiv ({done}/{total}){': ' + cur_url[:95] if cur_url else ''}")
-        st.caption(
-            "Hinweis: Der Job-Prozess läuft im Hintergrund ohne Konsolenfenster. "
-            "Die Aufnahme selbst benötigt aber weiterhin ein sichtbares/fokussiertes Browser-Fenster "
-            "(bedingt durch `pyautogui` + Screen-Capture)."
-        )
-        if total > 0:
-            progress_slot.progress(min(1.0, done / total), text=f"Download-Fortschritt: {done}/{total}")
-        time.sleep(0.3)
-        st.rerun()
+        if not headless:
+            done = int(st.session_state.get("yt_bg_done", 0) or 0)
+            total = int(st.session_state.get("yt_bg_total", 0) or 0)
+            cur = int(st.session_state.get("yt_bg_current_idx", -1) or -1)
+            cur_url = ""
+            if 0 <= cur < len(rows):
+                cur_url = str(rows[cur].get("youtube_link") or "")
+            state_slot.caption(f"Hintergrund-Queue aktiv ({done}/{total}){': ' + cur_url[:95] if cur_url else ''}")
+            st.caption(
+                "Hinweis: Der Job-Prozess läuft im Hintergrund ohne Konsolenfenster. "
+                "Die Aufnahme selbst benötigt aber weiterhin ein sichtbares/fokussiertes Browser-Fenster "
+                "(bedingt durch `pyautogui` + Screen-Capture)."
+            )
+            if total > 0:
+                progress_slot.progress(min(1.0, done / total), text=f"Download-Fortschritt: {done}/{total}")
+            time.sleep(0.3)
+            st.rerun()
     else:
         state_slot.empty()
         progress_slot.empty()
