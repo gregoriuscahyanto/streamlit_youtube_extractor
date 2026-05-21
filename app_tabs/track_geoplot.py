@@ -155,8 +155,14 @@ def make_geoplot_tiled(
     cmax = max(all_cv) if all_cv else None
 
     if is_delta and all_cv:
-        # Symmetric range around zero; diverging colorscale
-        abs_max = max(abs(cmin), abs(cmax))
+        # Symmetric range around zero using 98th percentile to suppress outliers
+        import numpy as _np
+        _arr = _np.array(all_cv, dtype=float)
+        _arr = _arr[_np.isfinite(_arr)]
+        if len(_arr) >= 4:
+            abs_max = float(max(abs(_np.percentile(_arr, 2)), abs(_np.percentile(_arr, 98))))
+        else:
+            abs_max = max(abs(cmin), abs(cmax))
         cmin, cmax = -abs_max, abs_max
         _cs = colorscale or "RdYlGn"
     else:

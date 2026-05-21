@@ -136,6 +136,20 @@ def _load_file_data(json_path: str, offset_s: float, offset_m: float = 0.0) -> d
                     except Exception:
                         cols[k] = list(v)
 
+    # Interpolate track_xy_x / track_xy_y gaps so the track line is continuous
+    _ts = cols.get("time_s")
+    if _ts:
+        import numpy as _np
+        _t = _np.array(_ts, dtype=float)
+        for _xy_col in ("track_xy_x", "track_xy_y"):
+            if _xy_col not in cols:
+                continue
+            _v = _np.array(cols[_xy_col], dtype=float)
+            _ok = _np.isfinite(_v) & _np.isfinite(_t)
+            if _ok.sum() >= 2 and (~_ok).any():
+                _v[~_ok] = _np.interp(_t[~_ok], _t[_ok], _v[_ok])
+                cols[_xy_col] = _v.tolist()
+
     # Audio RPM processed
     arpm = rr.get("audio_rpm") or {}
     proc = arpm.get("processed") if isinstance(arpm.get("processed"), dict) else {}
@@ -528,6 +542,7 @@ def _render_geoplot_chart(chart: dict, files: list[dict], cmp_data: dict[str, di
             "ys": ys,
             "cs": list(d.get(color_col) or []) if color_col else None,
             "ts": list(d.get("time_s") or []),
+            "ps": list(d.get("s_m") or []),  # track position axis for delta
             "centerline": cl,
         })
 
@@ -557,20 +572,47 @@ def _render_geoplot_chart(chart: dict, files: list[dict], cmp_data: dict[str, di
             chart["ref_label"] = _ref_sel
             ref_i = _ref_labels.index(_ref_sel)
 
-            # Compute delta: interpolate reference values at each file's time points
+            # Compute delta aligned by s_m (track position) if available, else time_s
             import numpy as _np
-            ref_ts = _np.array(file_traces[ref_i].get("ts") or [], dtype=float)
-            ref_cs = _np.array(file_traces[ref_i].get("cs") or [], dtype=float)
-            if len(ref_ts) >= 2 and len(ref_cs) == len(ref_ts):
-                for j, tr in enumerate(file_traces):
-                    tr_ts = _np.array(tr.get("ts") or [], dtype=float)
-                    tr_cs = _np.array(tr.get("cs") or [], dtype=float)
-                    if len(tr_ts) > 0 and len(tr_cs) == len(tr_ts):
-                        interp_ref = _np.interp(tr_ts, ref_ts, ref_cs)
-                        tr["cs"] = (tr_cs - interp_ref).tolist()
-                    else:
-                        tr["cs"] = None
-                is_delta = True
+
+            def _axis(tr):
+                """Return (axis_array, label) — prefer s_m, fall back to time_s."""
+                ps = _np.array(tr.get("ps") or [], dtype=float)
+                ok = _np.isfinite(ps)
+                if ok.sum() >= 10:
+                    return ps, "s_m"
+                return _np.array(tr.get("ts") or [], dtype=float), "time_s"
+
+            ref_ax_raw, _ax_label = _axis(file_traces[ref_i])
+            ref_cs_raw = _np.array(file_traces[ref_i].get("cs") or [], dtype=float)
+            if len(ref_ax_raw) >= 2 and len(ref_cs_raw) == len(ref_ax_raw):
+                _ref_ok = _np.isfinite(ref_ax_raw) & _np.isfinite(ref_cs_raw)
+                ref_ax = ref_ax_raw[_ref_ok]
+                ref_cs = ref_cs_raw[_ref_ok]
+                if len(ref_ax) >= 2:
+                    for j, tr in enumerate(file_traces):
+                        tr_ax, _ = _axis(tr)
+                        tr_cs = _np.array([
+                            v if isinstance(v, (int, float)) and not (v != v) else float("nan")
+                            for v in (tr.get("cs") or [])
+                        ], dtype=float)
+                        tr_xs = tr.get("xs") or []
+                        tr_ys = tr.get("ys") or []
+                        if len(tr_ax) > 0 and len(tr_cs) == len(tr_ax):
+                            interp_ref = _np.interp(tr_ax, ref_ax, ref_cs,
+                                                    left=float("nan"), right=float("nan"))
+                            delta = tr_cs - interp_ref
+                            no_cs = ~_np.isfinite(tr_cs)
+                            no_xy = _np.array([
+                                not (isinstance(x, (int, float)) and _np.isfinite(float(x)))
+                                or not (isinstance(y, (int, float)) and _np.isfinite(float(y)))
+                                for x, y in zip(tr_xs, tr_ys)
+                            ] + [False] * max(0, len(delta) - len(tr_xs)), dtype=bool)
+                            delta[no_cs | no_xy[:len(delta)]] = float("nan")
+                            tr["cs"] = delta.tolist()
+                        else:
+                            tr["cs"] = None
+                    is_delta = True
 
     try:
         from app_tabs.track_geoplot import make_geoplot_tiled
