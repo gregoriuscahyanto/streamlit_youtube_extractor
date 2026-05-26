@@ -23,7 +23,12 @@ def transform_centerline(centerline_px, minimap_pts, ref_pts) -> list | None:
         return None
 
 
-def make_geoplot_figure(traces: list[dict], centerline_xy: list | None = None):
+def _tr(xs, ys):
+    """Coordinate transform: swap x/y so track displays correctly (Döttinger Höhe at bottom)."""
+    return list(ys), list(xs)
+
+
+def make_geoplot_figure(traces: list[dict], centerline_xy: list | None = None, template: str = "plotly_dark"):
     """
     Build a Plotly figure for track position.
 
@@ -35,8 +40,7 @@ def make_geoplot_figure(traces: list[dict], centerline_xy: list | None = None):
     fig = go.Figure()
 
     if centerline_xy and len(centerline_xy) >= 2:
-        cx = [p[0] for p in centerline_xy]
-        cy = [p[1] for p in centerline_xy]
+        cx, cy = _tr([p[0] for p in centerline_xy], [p[1] for p in centerline_xy])
         fig.add_trace(go.Scatter(
             x=cx, y=cy,
             mode="lines",
@@ -51,7 +55,6 @@ def make_geoplot_figure(traces: list[dict], centerline_xy: list | None = None):
         ts = tr.get("ts") or [None] * len(xs)
         if not xs or not ys or len(xs) != len(ys):
             continue
-        # drop NaN pairs
         vx, vy, vt = [], [], []
         for x, y, t in zip(xs, ys, ts):
             if isinstance(x, float) and math.isnan(x):
@@ -63,12 +66,13 @@ def make_geoplot_figure(traces: list[dict], centerline_xy: list | None = None):
             vt.append(t)
         if not vx:
             continue
+        vx_t, vy_t = _tr(vx, vy)
         hover = [
             f"t={t:.2f}s" if isinstance(t, (int, float)) and not math.isnan(float(t)) else ""
             for t in vt
         ]
         fig.add_trace(go.Scatter(
-            x=vx, y=vy,
+            x=vx_t, y=vy_t,
             mode="markers+lines",
             name=tr["name"],
             text=hover,
@@ -77,10 +81,14 @@ def make_geoplot_figure(traces: list[dict], centerline_xy: list | None = None):
             line=dict(width=1),
         ))
 
+    _light = "dark" not in template
     fig.update_layout(
         xaxis=dict(scaleanchor="y", scaleratio=1, title="X"),
         yaxis=dict(title="Y"),
-        template="plotly_dark",
+        template=template,
+        paper_bgcolor="white" if _light else "#0e1117",
+        plot_bgcolor="white" if _light else "#0e1117",
+        font_color="black" if _light else "white",
         height=420,
         margin=dict(l=40, r=20, t=10, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -112,22 +120,9 @@ def make_geoplot_tiled(
     color_col: str | None = None,
     colorscale: str | None = None,
     is_delta: bool = False,
+    template: str = "plotly_dark",
 ):
-    """Tiled geoplot: one subplot per file, all in a single row.
-
-    file_traces entries:
-        name       str
-        xs         list[float]        track_xy_x
-        ys         list[float]        track_xy_y
-        cs         list[float]|None   color variable (or delta values)
-        centerline [[x,y],...]|None   centerline_px in pixel coords
-
-    Features:
-        - Shared colorbar with global cmin/cmax across all subplots
-        - Y axis flipped (image pixel coords have Y=0 at top)
-        - Synchronized zoom: zooming one subplot mirrors all others
-        - Delta mode: diverging colorscale symmetric around zero
-    """
+    """Tiled geoplot: one subplot per file, all in a single row."""
     from plotly.subplots import make_subplots
     import plotly.graph_objects as go
 
@@ -155,7 +150,6 @@ def make_geoplot_tiled(
     cmax = max(all_cv) if all_cv else None
 
     if is_delta and all_cv:
-        # Symmetric range around zero using 98th percentile to suppress outliers
         import numpy as _np
         _arr = _np.array(all_cv, dtype=float)
         _arr = _arr[_np.isfinite(_arr)]
@@ -172,8 +166,9 @@ def make_geoplot_tiled(
     for col_i, tr in enumerate(file_traces, 1):
         cl = tr.get("centerline")
         if cl and len(cl) >= 2:
+            cx, cy = _tr([p[0] for p in cl], [p[1] for p in cl])
             fig.add_trace(go.Scattergl(
-                x=[p[0] for p in cl], y=[p[1] for p in cl],
+                x=cx, y=cy,
                 mode="lines",
                 line=dict(color="rgba(180,180,180,0.4)", dash="dot", width=1.5),
                 name="Centerline", showlegend=(col_i == 1),
@@ -198,10 +193,11 @@ def make_geoplot_tiled(
                 except (TypeError, ValueError):
                     vc.append(float("nan"))
 
+        vx_t, vy_t = _tr(vx, vy)
         show_colorbar = bool(color_col and vc and col_i == n)
         if color_col and vc:
             fig.add_trace(go.Scattergl(
-                x=vx, y=vy, mode="markers",
+                x=vx_t, y=vy_t, mode="markers",
                 name=tr["name"], showlegend=False,
                 marker=dict(
                     color=vc, colorscale=_cs, cmin=cmin, cmax=cmax, size=4,
@@ -215,25 +211,36 @@ def make_geoplot_tiled(
             ), row=1, col=col_i)
         else:
             fig.add_trace(go.Scattergl(
-                x=vx, y=vy, mode="lines+markers",
+                x=vx_t, y=vy_t, mode="lines+markers",
                 name=tr["name"], showlegend=False,
-                marker=dict(size=3), line=dict(width=1),
+                marker=dict(size=3, color="#555555"),
+                line=dict(width=1, color="#555555"),
             ), row=1, col=col_i)
 
-    # ── Axes: equal aspect + Y-flip + zoom sync ───────────────────────────────
-    # Y=0 is at the top in minimap pixel coords → reverse Y to match real-world maps
-    fig.update_yaxes(autorange="reversed")
-
-    # Equal aspect ratio for subplot 1; linked subplots inherit via matches
+    # ── Axes: equal aspect + no gridlines + zoom sync ────────────────────────
+    _ax_color = "black" if "dark" not in template else "white"
+    fig.update_xaxes(showgrid=False, zeroline=False,
+                     tickfont_color=_ax_color, title_font_color=_ax_color,
+                     linecolor=_ax_color, tickcolor=_ax_color)
+    fig.update_yaxes(showgrid=False, zeroline=False,
+                     tickfont_color=_ax_color, title_font_color=_ax_color,
+                     linecolor=_ax_color, tickcolor=_ax_color)
     fig.update_xaxes(scaleanchor="y", scaleratio=1, row=1, col=1)
-    # Sync zoom: all axes after col=1 match col=1
     for col_i in range(2, n + 1):
         fig.update_xaxes(matches="x", row=1, col=col_i)
         fig.update_yaxes(matches="y", row=1, col=col_i)
 
+    _light = "dark" not in template
+    _fc = "black" if _light else "white"
     fig.update_layout(
-        template="plotly_dark",
+        template=template,
+        paper_bgcolor="white" if _light else "#0e1117",
+        plot_bgcolor="white" if _light else "#0e1117",
+        font_color=_fc,
         height=500 + (max_lines - 1) * 18,
         margin=dict(l=40, r=90, t=top_margin, b=40),
     )
+    # Subplot titles use annotations
+    for ann in fig.layout.annotations:
+        ann.font.color = _fc
     return fig

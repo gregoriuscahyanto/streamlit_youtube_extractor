@@ -188,7 +188,8 @@ def _load_trkCalSlim(json_path: str) -> dict:
 # ── Config persistence ────────────────────────────────────────────────────────
 
 def _config_dir() -> Path:
-    d = _base() / "logs" / "compare_configs"
+    # Fixed path relative to this file — independent of local_base_path session state
+    d = Path(__file__).parent.parent / "logs" / "compare_configs"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -230,9 +231,20 @@ def render(ns: dict) -> None:
     # cmp_data: {path: {col: [values]}}  — cache, rebuilt when selection/offset changes
     st.session_state.setdefault("cmp_data", {})
 
-    # ── Reload config command ─────────────────────────────────────────────────
-    if st.session_state.pop("_cmp_apply_cfg", None):
-        pass  # already applied below
+    # ── Apply pending widget-key sync (must happen before widgets are instantiated) ──
+    _pending = st.session_state.pop("_cmp_pending_sync", None)
+    if _pending is not None:
+        for _ci, _ch in enumerate(_pending):
+            st.session_state[f"cmp_ctitle_{_ci}"] = _ch.get("title", f"Diagramm {_ci+1}")
+            st.session_state[f"cmp_ctype_{_ci}"] = _ch.get("plot_type", "line")
+            if _ch.get("plot_type") == "geoplot":
+                st.session_state[f"cmp_cgeo_{_ci}"] = _ch.get("color_col", "")
+                st.session_state[f"cmp_gdelta_{_ci}"] = bool(_ch.get("show_delta", False))
+                if _ch.get("ref_label"):
+                    st.session_state[f"cmp_gref_{_ci}"] = _ch["ref_label"]
+            else:
+                st.session_state[f"cmp_cx_{_ci}"] = _ch.get("x_col", "time_s")
+                st.session_state[f"cmp_cy_{_ci}"] = _ch.get("y_col", "")
 
     # ── 1. Datei-Auswahl ─────────────────────────────────────────────────────
     st.markdown("### Dateien")
@@ -246,16 +258,36 @@ def render(ns: dict) -> None:
         for a in available
     }
 
-    current_paths = [f["path"] for f in st.session_state.cmp_files]
-    valid_current = [p for p in current_paths if p in avail_paths and p not in busy_paths]
+    # Build label→path map (append short folder id if label is duplicate)
+    _label_counts: dict[str, int] = {}
+    for a in selectable:
+        lbl = label_map.get(a["path"], Path(a["path"]).stem)
+        _label_counts[lbl] = _label_counts.get(lbl, 0) + 1
+    _seen: dict[str, int] = {}
+    _opt_labels: list[str] = []
+    _label_to_path: dict[str, str] = {}
+    for a in selectable:
+        lbl = label_map.get(a["path"], Path(a["path"]).stem)
+        if _label_counts[lbl] > 1:
+            _seen[lbl] = _seen.get(lbl, 0) + 1
+            lbl = f"{lbl} [{Path(a['path']).stem[-8:]}]"
+        _opt_labels.append(lbl)
+        _label_to_path[lbl] = a["path"]
 
-    chosen = st.multiselect(
+    current_paths = [f["path"] for f in st.session_state.cmp_files]
+    _path_to_label = {v: k for k, v in _label_to_path.items()}
+    valid_current_labels = [
+        _path_to_label[p] for p in current_paths
+        if p in _path_to_label and p not in busy_paths
+    ]
+
+    chosen_labels = st.multiselect(
         "JSON-Dateien auswählen (mit OCR oder Audio-Auswertung)",
-        options=[a["path"] for a in selectable],
-        default=valid_current,
-        format_func=lambda p: label_map.get(p, Path(p).stem),
+        options=_opt_labels,
+        default=valid_current_labels,
         key="cmp_file_chooser",
     )
+    chosen = [_label_to_path[lbl] for lbl in chosen_labels if lbl in _label_to_path]
     if busy_paths:
         st.caption(f"⚠️ {len(busy_paths)} Datei(en) werden gerade vom Watchdog bearbeitet und sind nicht auswählbar.")
 
@@ -341,7 +373,13 @@ def render(ns: dict) -> None:
     st.divider()
 
     # ── 2. Diagramme ─────────────────────────────────────────────────────────
-    st.markdown("### Diagramme")
+    _dh1, _dh2 = st.columns([6, 1])
+    _dh1.markdown("### Diagramme")
+    st.session_state.setdefault("cmp_light_mode", False)
+    st.session_state["cmp_light_mode"] = _dh2.toggle(
+        "Hell", value=bool(st.session_state.get("cmp_light_mode", False)),
+        key="cmp_global_theme",
+    )
 
     charts = st.session_state.cmp_charts
     to_remove = None
@@ -477,14 +515,30 @@ def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], cha
             ))
             traces.append({"label": f["label"], "xs": list(xs), "ys": list(ys)})
 
+        _light = bool(st.session_state.get("cmp_light_mode"))
+        _chart_theme = "plotly_white" if _light else "plotly_dark"
+        _fc = "black" if _light else "white"
+        _gc = "rgba(0,0,0,0.15)" if _light else "rgba(255,255,255,0.1)"
         fig.update_layout(
-            title=chart.get("title", ""),
+            title=dict(text=chart.get("title", ""), font_color=_fc),
             margin=dict(l=40, r=20, t=40, b=40),
             height=340,
-            xaxis_title=x_col,
-            yaxis_title=y_col,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1, font_color=_fc),
+            template=_chart_theme,
+            paper_bgcolor="white" if _light else "#0e1117",
+            plot_bgcolor="white" if _light else "#0e1117",
+            font=dict(color=_fc),
+        )
+        fig.update_xaxes(
+            title=dict(text=x_col, font=dict(color=_fc)),
+            tickfont=dict(color=_fc),
+            gridcolor=_gc, linecolor=_fc, zerolinecolor=_gc,
+        )
+        fig.update_yaxes(
+            title=dict(text=y_col, font=dict(color=_fc)),
+            tickfont=dict(color=_fc),
+            gridcolor=_gc, linecolor=_fc, zerolinecolor=_gc,
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -612,11 +666,14 @@ def _render_geoplot_chart(chart: dict, files: list[dict], cmp_data: dict[str, di
                             tr["cs"] = delta.tolist()
                         else:
                             tr["cs"] = None
+                    # Reference shows as gray (cs=None) since delta with itself is always 0
+                    file_traces[ref_i]["cs"] = None
                     is_delta = True
 
+    _theme = "plotly_white" if st.session_state.get("cmp_light_mode") else "plotly_dark"
     try:
         from app_tabs.track_geoplot import make_geoplot_tiled
-        fig = make_geoplot_tiled(file_traces, color_col=color_col, is_delta=is_delta)
+        fig = make_geoplot_tiled(file_traces, color_col=color_col, is_delta=is_delta, template=_theme)
         st.plotly_chart(fig, use_container_width=True, key=f"cmp_geo_{chart_idx}")
     except Exception as e:
         st.caption(f"Geoplot-Fehler: {e}")
@@ -661,9 +718,10 @@ def _render_config_section() -> None:
                     st.session_state.cmp_files = loaded.get("files", [])
                     st.session_state.cmp_charts = loaded.get("charts", [])
                     st.session_state.cmp_data = {}
-                    st.success(f"Geladen: {sel}")
+                    st.session_state["_cmp_pending_sync"] = loaded.get("charts", [])
                     st.rerun()
                 else:
-                    st.error("Laden fehlgeschlagen.")
+                    _cfg_path = _config_dir() / f"{sel}.json"
+                    st.error(f"Laden fehlgeschlagen. Datei: {_cfg_path}")
         else:
             st.caption("Noch keine gespeicherten Konfigurationen.")
