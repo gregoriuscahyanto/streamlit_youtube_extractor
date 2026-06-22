@@ -6180,6 +6180,235 @@ def _audio_gear_center_line_from_spectrum(freqs_hz, score, t_audio, conv, gear_b
         return out[:n], meta
 
 
+def _audio_gear_ridge_line_from_spectrum(freqs_hz, score, t_audio, conv, gear_band_cfg):
+    """Pick a smooth gear path and the strongest audio ridge inside each gear band."""
+    import numpy as _np
+
+    f = _np.asarray(freqs_hz, dtype=float).ravel()
+    s = _np.asarray(score, dtype=_np.float32)
+    t = _np.asarray(t_audio, dtype=float).ravel()
+    out = _np.full(t.size, _np.nan, dtype=float)
+    meta = {"active": False, "valid_points": 0, "gear_count": 0}
+    if s.ndim != 2 or f.size < 2 or t.size < 2 or not isinstance(gear_band_cfg, dict):
+        return out, meta
+    n = min(t.size, s.shape[1])
+    if n < 2:
+        return out[:n], meta
+    ratios = [float(g) for g in (gear_band_cfg.get("gear_ratios") or []) if float(g) > 0]
+    if not ratios:
+        return out[:n], meta
+    try:
+        from app_tabs.audio_sweep import compute_gear_bands
+
+        bands = compute_gear_bands(
+            t[:n],
+            gear_band_cfg["t_ocr"],
+            gear_band_cfg["v_kmph_ocr"],
+            ratios,
+            float(gear_band_cfg.get("axle_ratio", 3.15)),
+            float(gear_band_cfg.get("r_dyn", 0.35)),
+            float(gear_band_cfg.get("rpm_min", 500.0)),
+            float(gear_band_cfg.get("rpm_max", 8000.0)),
+            float(gear_band_cfg.get("band_tol_pct", 5.0)),
+        )
+        g_n = int(bands.shape[1])
+        if g_n <= 0:
+            return out[:n], meta
+        conv = float(max(conv, 1e-9))
+        centers_hz = ((bands[:, :, 0] + bands[:, :, 1]) * 0.5) * conv / 60.0
+        valid = (bands[:, :, 1] > 0) & _np.isfinite(centers_hz)
+        if int(valid.any(axis=1).sum()) < 2:
+            return out[:n], meta
+
+        energy = _np.full((n, g_n), -1e6, dtype=float)
+        best_freq = _np.full((n, g_n), _np.nan, dtype=float)
+        center_weight = float(gear_band_cfg.get("band_center_weight", 0.65) or 0.65)
+        for i in range(n):
+            col = _np.asarray(s[:, i], dtype=float)
+            if not _np.isfinite(col).any():
+                continue
+            med = float(_np.nanmedian(col))
+            scale = float(_np.nanpercentile(col, 90) - _np.nanpercentile(col, 10))
+            scale = max(scale, 1e-3)
+            for gi in range(g_n):
+                if not valid[i, gi]:
+                    continue
+                lo_hz = float(bands[i, gi, 0] * conv / 60.0)
+                hi_hz = float(bands[i, gi, 1] * conv / 60.0)
+                fc = float(centers_hz[i, gi])
+                m = (f >= lo_hz) & (f <= hi_hz)
+                if not m.any():
+                    continue
+                half = max((hi_hz - lo_hz) * 0.5, 1e-3)
+                local_f = f[m]
+                local_s = col[m]
+                center_pref = _np.clip(1.0 - _np.abs(local_f - fc) / half, 0.0, 1.0)
+                pick_score = local_s + center_weight * scale * 0.35 * center_pref
+                if not _np.isfinite(pick_score).any():
+                    continue
+                k = int(_np.nanargmax(pick_score))
+                best_freq[i, gi] = float(local_f[k])
+                energy[i, gi] = (float(local_s[k]) - med) / scale + 0.25 * float(center_pref[k])
+
+        if not (energy > -1e5).any():
+            return out[:n], meta
+        shift_pen = float(gear_band_cfg.get("gear_shift_penalty", 0.35) or 0.35)
+        high_bias = float(gear_band_cfg.get("higher_gear_bias", 0.08) or 0.08)
+        rank = _np.linspace(0.0, 1.0, g_n) if g_n > 1 else _np.zeros(1)
+        local = _np.where(energy > -1e5, energy + high_bias * rank[None, :], -1e6)
+        dp = _np.full((n, g_n), -1e9, dtype=float)
+        prev = _np.full((n, g_n), -1, dtype=_np.int32)
+        dp[0] = local[0]
+        for i in range(1, n):
+            trans = dp[i - 1][:, None] - shift_pen * _np.abs(_np.arange(g_n)[:, None] - _np.arange(g_n)[None, :])
+            best_prev = _np.argmax(trans, axis=0)
+            dp[i] = local[i] + trans[best_prev, _np.arange(g_n)]
+            prev[i] = best_prev.astype(_np.int32)
+            if _np.nanmax(dp[i]) < -5e8:
+                dp[i] = dp[i - 1]
+        path = _np.full(n, -1, dtype=_np.int32)
+        path[-1] = int(_np.argmax(dp[-1]))
+        for i in range(n - 1, 0, -1):
+            path[i - 1] = int(prev[i, path[i]]) if path[i] >= 0 and prev[i, path[i]] >= 0 else path[i]
+        ok = (path >= 0) & _np.isfinite(best_freq[_np.arange(n), _np.maximum(path, 0)])
+        out = _np.full(n, _np.nan, dtype=float)
+        out[ok] = best_freq[_np.arange(n)[ok], path[ok]]
+        if int(ok.sum()) >= 3:
+            out[ok] = _audio_smooth(out[ok], int(gear_band_cfg.get("ridge_smooth_n", 7) or 7))
+        meta = {
+            "active": bool(ok.any()),
+            "valid_points": int(ok.sum()),
+            "gear_count": int(g_n),
+            "score": float(_np.nanmedian(energy[_np.arange(n)[ok], path[ok]])) if ok.any() else 0.0,
+        }
+        return out, meta
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return out[:n], meta
+
+
+def _audio_gear_ridge_viterbi_line_from_spectrum(freqs_hz, score, t_audio, conv, gear_band_cfg):
+    """Track one smooth spectral ridge inside the speed-derived gear bands."""
+    import numpy as _np
+
+    f = _np.asarray(freqs_hz, dtype=float).ravel()
+    s = _np.asarray(score, dtype=_np.float32)
+    t = _np.asarray(t_audio, dtype=float).ravel()
+    out = _np.full(t.size, _np.nan, dtype=float)
+    meta = {"active": False, "valid_points": 0, "gear_count": 0}
+    if s.ndim != 2 or f.size < 3 or t.size < 2 or not isinstance(gear_band_cfg, dict):
+        return out, meta
+    n = min(t.size, s.shape[1])
+    if n < 2:
+        return out[:n], meta
+    ratios = [float(g) for g in (gear_band_cfg.get("gear_ratios") or []) if float(g) > 0]
+    if not ratios:
+        return out[:n], meta
+    try:
+        from app_tabs.audio_sweep import compute_gear_bands
+
+        bands = compute_gear_bands(
+            t[:n],
+            gear_band_cfg["t_ocr"],
+            gear_band_cfg["v_kmph_ocr"],
+            ratios,
+            float(gear_band_cfg.get("axle_ratio", 3.15)),
+            float(gear_band_cfg.get("r_dyn", 0.35)),
+            float(gear_band_cfg.get("rpm_min", 500.0)),
+            float(gear_band_cfg.get("rpm_max", 8000.0)),
+            float(gear_band_cfg.get("band_tol_pct", 5.0)),
+        )
+        g_n = int(bands.shape[1])
+        if g_n <= 0:
+            return out[:n], meta
+        conv = float(max(conv, 1e-9))
+        centers_hz = ((bands[:, :, 0] + bands[:, :, 1]) * 0.5) * conv / 60.0
+        valid_gear = (bands[:, :, 1] > 0) & _np.isfinite(centers_hz)
+        if int(valid_gear.any(axis=1).sum()) < 2:
+            return out[:n], meta
+
+        allowed = _np.zeros((f.size, n), dtype=bool)
+        center_pref = _np.zeros((f.size, n), dtype=_np.float32)
+        for i in range(n):
+            for gi in range(g_n):
+                if not valid_gear[i, gi]:
+                    continue
+                lo_hz = float(bands[i, gi, 0] * conv / 60.0)
+                hi_hz = float(bands[i, gi, 1] * conv / 60.0)
+                if hi_hz < f[0] or lo_hz > f[-1]:
+                    continue
+                fc = float(centers_hz[i, gi])
+                m = (f >= lo_hz) & (f <= hi_hz)
+                if not m.any():
+                    continue
+                half = max((hi_hz - lo_hz) * 0.5, 1e-3)
+                pref = _np.clip(1.0 - _np.abs(f[m] - fc) / half, 0.0, 1.0)
+                allowed[m, i] = True
+                center_pref[m, i] = _np.maximum(center_pref[m, i], pref.astype(_np.float32, copy=False))
+        if int(allowed.any(axis=0).sum()) < 2:
+            return out[:n], meta
+
+        z = _np.asarray(s[:, :n], dtype=_np.float32).copy()
+        med = _np.nanmedian(z, axis=0, keepdims=True)
+        amp = _np.nanpercentile(z, 90, axis=0, keepdims=True) - _np.nanpercentile(z, 10, axis=0, keepdims=True)
+        amp = _np.where(_np.isfinite(amp), _np.maximum(amp, 1e-3), 1.0).astype(_np.float32, copy=False)
+        z = ((z - med) / amp).astype(_np.float32, copy=False)
+        center_weight = float(gear_band_cfg.get("band_center_weight", 0.65) or 0.65)
+        local = z + _np.float32(0.45 * center_weight) * center_pref
+        local = _np.where(allowed & _np.isfinite(local), local, _np.float32(-1e6))
+
+        df = float(_np.nanmedian(_np.diff(f))) if f.size > 1 else 1.0
+        width_hz = float(max(f[-1] - f[0], df))
+        jump_hz = float(gear_band_cfg.get("ridge_viterbi_jump_hz", max(8.0, min(24.0, 0.10 * width_hz))) or 16.0)
+        jump_hz = float(max(df, jump_hz))
+        w = int(max(1, min(f.size - 1, round(jump_hz / max(df, 1e-9)))))
+        penalty = float(gear_band_cfg.get("ridge_viterbi_penalty", 2.2) or 2.2)
+
+        dp = _np.full((f.size, n), -1e9, dtype=_np.float32)
+        prev = _np.full((f.size, n), -1, dtype=_np.int32)
+        dp[:, 0] = local[:, 0]
+        idx_all = _np.arange(f.size)
+        for ti in range(1, n):
+            old = dp[:, ti - 1]
+            if float(_np.nanmax(old)) < -5e8:
+                dp[:, ti] = local[:, ti]
+                continue
+            for fi in _np.where(local[:, ti] > -1e5)[0]:
+                lo = max(0, int(fi) - w)
+                hi = min(f.size, int(fi) + w + 1)
+                js = idx_all[lo:hi]
+                trans = old[lo:hi] - _np.float32(penalty) * (_np.abs(js - int(fi)) / max(1, w))
+                k = int(_np.argmax(trans))
+                dp[fi, ti] = local[fi, ti] + trans[k]
+                prev[fi, ti] = int(lo + k)
+            if float(_np.nanmax(dp[:, ti])) < -5e8:
+                dp[:, ti] = local[:, ti]
+
+        path = _np.full(n, -1, dtype=_np.int32)
+        path[-1] = int(_np.argmax(dp[:, -1]))
+        for ti in range(n - 1, 0, -1):
+            p = int(path[ti])
+            path[ti - 1] = int(prev[p, ti]) if p >= 0 and prev[p, ti] >= 0 else p
+        ok = (path >= 0) & (local[_np.maximum(path, 0), _np.arange(n)] > -1e5)
+        out = _np.full(n, _np.nan, dtype=float)
+        out[ok] = f[path[ok]]
+        if int(ok.sum()) >= 3:
+            win = int(gear_band_cfg.get("ridge_viterbi_smooth_n", gear_band_cfg.get("ridge_smooth_n", 5)) or 5)
+            out[ok] = _audio_smooth(out[ok], max(3, win))
+        meta = {
+            "active": bool(ok.any()),
+            "valid_points": int(ok.sum()),
+            "gear_count": int(g_n),
+            "jump_hz": float(jump_hz),
+            "penalty": float(penalty),
+            "score": float(_np.nanmedian(local[path[ok], _np.arange(n)[ok]])) if ok.any() else 0.0,
+        }
+        return out, meta
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return out[:n], meta
+
+
 def _audio_line_score(line, freqs, score, flo, fhi):
     line = np.asarray(line, dtype=float).copy()
     if line.size == 0:
@@ -6893,6 +7122,12 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                 method_lines["STFT Ridge"] = _audio_greedy_ridge_line(fb, _sb_eval, flo, fhi, smooth_win=int(mp.get("ridge_smooth", 7) or 7), max_jump_frac=float(mp.get("ridge_jump_frac", 0.08) or 0.08))
                 method_lines["STFT Viterbi"] = _audio_viterbi_line(fb, _sb_eval, flo, fhi, smooth_win=int(mp.get("viterbi_smooth", 5) or 5), jump_hz=viterbi_jump_hz, penalty=viterbi_penalty)
                 if gear_band_mode in ("hard", "guide", "guide_and_clamp", "clamp_and_guide"):
+                    _gb_vridge_line, _gb_vridge_meta = _audio_gear_ridge_viterbi_line_from_spectrum(fb, sb, t_video, conv, gear_band_cfg)
+                    if bool(_gb_vridge_meta.get("active")) and len(_gb_vridge_line) == sb.shape[1]:
+                        method_lines["Gear-Band Ridge Viterbi"] = np.asarray(_gb_vridge_line, dtype=float).copy()
+                    _gb_ridge_line, _gb_ridge_meta = _audio_gear_ridge_line_from_spectrum(fb, sb, t_video, conv, gear_band_cfg)
+                    if bool(_gb_ridge_meta.get("active")) and len(_gb_ridge_line) == sb.shape[1]:
+                        method_lines["Gear-Band Ridge"] = np.asarray(_gb_ridge_line, dtype=float).copy()
                     _gb_center_line, _gb_center_meta = _audio_gear_center_line_from_spectrum(fb, sb, t_video, conv, gear_band_cfg)
                     if bool(_gb_center_meta.get("active")) and len(_gb_center_line) == sb.shape[1]:
                         method_lines["Gear-Band Center"] = np.asarray(_gb_center_line, dtype=float).copy()
@@ -6917,6 +7152,10 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                     method_lines["Bandpass/Autokorr"] = _audio_bandpass_autocorr_line(seg, fs, nfft_eff, noverlap, sb.shape[1], flo, fhi)
 
                 scores = {name: _audio_line_score(line, fb, _sb_eval, flo, fhi) for name, line in method_lines.items()}
+                if "Gear-Band Ridge Viterbi" in scores:
+                    scores["Gear-Band Ridge Viterbi"] += float(mp.get("gear_ridge_viterbi_score_bonus", 1.45 if gear_band_mode == "hard" else 0.45) or 0.0)
+                if "Gear-Band Ridge" in scores:
+                    scores["Gear-Band Ridge"] += float(mp.get("gear_ridge_score_bonus", 1.2 if gear_band_mode == "hard" else 0.35) or 0.0)
                 if "Gear-Band Center" in scores:
                     scores["Gear-Band Center"] += float(mp.get("gear_center_score_bonus", 1.0 if gear_band_mode == "hard" else 0.25) or 0.0)
                 valid = [(name, line) for name, line in method_lines.items() if np.isfinite(scores.get(name, np.nan)) and scores.get(name, -1e12) > -1e11]
@@ -6969,16 +7208,19 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
     rpm = np.asarray(_audio_smooth(fsel * 60 / max(best['conv'], 1e-9), 9), dtype=float).copy()
     rpm[np.asarray((rpm < rpm_min * .5) | (rpm > rpm_max * 1.5), dtype=bool).copy()] = np.nan
     gear_limit_meta = {"gear_band_constraint": False, "limited_points": 0, "valid_band_points": 0}
+    gear_limit_cfg = gear_band_cfg
     if isinstance(gear_band_cfg, dict) and gear_band_cfg.get("gear_ratios"):
         try:
-            from app_tabs.audio_sweep import constrain_rpm_to_gear_bands
-            rpm, gear_limit_meta = constrain_rpm_to_gear_bands(t_video, rpm, gear_band_cfg)
+            from app_tabs.audio_sweep import _gear_band_cfg_for_candidate, constrain_rpm_to_gear_bands
+            gear_limit_cfg = _gear_band_cfg_for_candidate(gear_band_cfg, str(best.get("method", "")))
+            rpm, gear_limit_meta = constrain_rpm_to_gear_bands(t_video, rpm, gear_limit_cfg)
             valid_band_points = int(gear_limit_meta.get("valid_band_points", 0) or 0)
             coverage_pct = 100.0 * valid_band_points / max(1, int(len(t_video)))
             dbg(
                 "Gear-Band Constraint: "
                 f"active={bool(gear_limit_meta.get('gear_band_constraint'))}, "
-                f"mode={gear_band_cfg.get('mode', '')}, "
+                f"mode={gear_limit_cfg.get('mode', '')}, "
+                f"policy={gear_limit_cfg.get('candidate_band_policy', 'default')}, "
                 f"coverage={coverage_pct:.1f}%, "
                 f"limited={int(gear_limit_meta.get('limited_points', 0) or 0)}"
             )
@@ -6996,7 +7238,8 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
     prog(total_jobs, total_jobs, "Audioanalyse abgeschlossen")
     gear_band_active = bool(gear_limit_meta.get("gear_band_constraint"))
     gear_valid_points = int(gear_limit_meta.get("valid_band_points", 0) or 0)
-    return dict(fs=int(fs), t=t_video, freqs=freqs, db=db, audio_t=np.arange(a0, a1) / float(fs) - float(offset_s), audio_y=seg, freq_lines=lines, rpm_lines=rpm_lines, selected_method=selected_method, selected_freq=fsel, rpm=rpm, candidate_table=table, debug_lines=[], params=dict(start_s=start_s, end_s=end_s, audio_offset_s=offset_s, nfft=best['nfft'], nfft_requested=nfft, overlap_pct=best['overlap_pct'], overlap_requested=overlap_pct, stft_mode=stft_mode, fmax=fmax, cyl=best['cyl'], takt=takt, order=order_base, harmonic=best['harmonic'], drive_type=drive_type, f_search_lo=best['f_lo'], f_search_hi=best['f_hi'], conversion_factor=best['conv'], method_params=mp, gear_band_cfg=gear_band_cfg if isinstance(gear_band_cfg, dict) else {}, gear_band_active=gear_band_active, gear_band_mode=str((gear_band_cfg or {}).get("mode", "")), gear_band_coverage_pct=float(100.0 * gear_valid_points / max(1, int(len(t_video)))), gear_band_limited_points=int(gear_limit_meta.get("limited_points", 0) or 0), gear_band_valid_points=gear_valid_points, gear_band_error=str(gear_limit_meta.get("gear_band_constraint_error", ""))))
+    gear_band_policy = str((gear_limit_cfg or {}).get("candidate_band_policy", ""))
+    return dict(fs=int(fs), t=t_video, freqs=freqs, db=db, audio_t=np.arange(a0, a1) / float(fs) - float(offset_s), audio_y=seg, freq_lines=lines, rpm_lines=rpm_lines, selected_method=selected_method, selected_freq=fsel, rpm=rpm, candidate_table=table, debug_lines=[], params=dict(start_s=start_s, end_s=end_s, audio_offset_s=offset_s, nfft=best['nfft'], nfft_requested=nfft, overlap_pct=best['overlap_pct'], overlap_requested=overlap_pct, stft_mode=stft_mode, fmax=fmax, cyl=best['cyl'], takt=takt, order=order_base, harmonic=best['harmonic'], drive_type=drive_type, f_search_lo=best['f_lo'], f_search_hi=best['f_hi'], conversion_factor=best['conv'], method_params=mp, gear_band_cfg=gear_band_cfg if isinstance(gear_band_cfg, dict) else {}, gear_band_active=gear_band_active, gear_band_mode=str((gear_band_cfg or {}).get("mode", "")), gear_band_policy=gear_band_policy, gear_band_coverage_pct=float(100.0 * gear_valid_points / max(1, int(len(t_video)))), gear_band_limited_points=int(gear_limit_meta.get("limited_points", 0) or 0), gear_band_valid_points=gear_valid_points, gear_band_error=str(gear_limit_meta.get("gear_band_constraint_error", ""))))
 
 
 def _matlab_field_name(name: str, fallback: str = "field") -> str:

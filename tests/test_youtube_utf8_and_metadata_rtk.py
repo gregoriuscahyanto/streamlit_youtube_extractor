@@ -40,5 +40,5 @@ def test_tab_parses_result_meta_json_and_continuations():
 def test_no_mojibake_label_remains_for_delete_button():
     txt = _read("app_tabs/youtube_tab.py")
     assert "Ausgewählte löschen" in txt
-    assert "AusgewÃ¤hlte lÃ¶schen" not in txt
-
+    bad_label = "Ausgew" + chr(0x00C3) + chr(0x00A4) + "hlte l" + chr(0x00C3) + chr(0x00B6) + "schen"
+    assert bad_label not in txt

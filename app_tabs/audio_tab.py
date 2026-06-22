@@ -1233,7 +1233,7 @@ def render(ns):
                 with _gb_c2_f:
                     _btol_v = st.number_input(
                         "Bandbreite ± [%]", min_value=1.0, max_value=30.0,
-                        value=float(st.session_state.get("sw_band_tol_pct", 5.0)),
+                        value=float(st.session_state.get("sw_band_tol_pct", 25.0)),
                         step=0.5, format="%.1f", key="sw_band_tol_pct",
                         help="Toleranzband um die berechnete Solldrehzahl je Gang. "
                              "RPM-Werte außerhalb aller Bänder werden hart auf die nächste Bandgrenze geklemmt.",

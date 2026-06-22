@@ -105,7 +105,7 @@ class TestBuildMergedMatJson(unittest.TestCase):
         self.assertIsInstance(json_bytes, bytes)
 
     def test_json_is_valid_utf8(self):
-        raw = _simple_mat_bytes({"metadata": {"title": "NÃ¼rburgring Runde"}})
+        raw = _simple_mat_bytes({"metadata": {"title": "N\u00fcrburgring Runde"}})
         _, json_bytes = build_merged_mat_json(raw, "audio_config", {"src": "test"})
         decoded = json_bytes.decode("utf-8")
         self.assertIn("recordResult", decoded)

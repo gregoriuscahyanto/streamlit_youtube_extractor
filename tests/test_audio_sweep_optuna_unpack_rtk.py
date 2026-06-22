@@ -109,10 +109,7 @@ def test_audio_tab_top1_rpm_over_time_plot_exists():
 def test_no_mojibake_sequences_in_audio_tabs():
     t1 = _read("app_tabs/audio_tab.py")
     t2 = _read("app_tabs/audio_sweep.py")
-    bad_tokens = [
-        "VerknÃ", "Ã¤", "Ã¶", "Ã¼", "Ã„", "Ã–", "Ãœ", "ÃŸ",
-        "Â±", "Î”", "â€”", "â†’", "â€“", "Ã—",
-    ]
+    bad_tokens = [chr(0x00C3), chr(0x00C2), chr(0xFFFD)]
     for tok in bad_tokens:
         assert tok not in t1
         assert tok not in t2

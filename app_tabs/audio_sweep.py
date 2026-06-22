@@ -296,7 +296,7 @@ def cross_corr_offset(t_audio, rpm_audio, t_ref, rpm_ref,
         t_hi = min(t_a[-1], t_r_shifted[-1])
         if t_hi - t_lo < 0.5:
             continue
-        t_common = np.linspace(t_lo, t_hi, min(500, int((t_hi - t_lo) * 4)))
+        t_common = np.linspace(t_lo, t_hi, min(2000, int((t_hi - t_lo) * 10)))
         try:
             r_a_interp = np.interp(t_common, t_a, r_a)
             r_r_interp = np.interp(t_common, t_r_shifted, r_r)
@@ -346,7 +346,7 @@ def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
     if t_hi - t_lo < 0.1:
         return {"ok": False, "error": "keine Überlappung"}
 
-    n_pts = min(2000, max(50, int((t_hi - t_lo) * 4)))
+    n_pts = min(4000, max(100, int((t_hi - t_lo) * 10)))
     t_common = np.linspace(t_lo, t_hi, n_pts)
     r_a_i = np.interp(t_common, t_a, r_a)
     r_r_i = np.interp(t_common, t_r, r_r)
@@ -697,11 +697,11 @@ def build_param_grid(cfg: dict) -> list[dict]:
                 for cyl in cyls:
                     for takt in takts:
                         for order in orders:
-                            # fmax derived from physics: fundamental at rpm_max + headroom
+                            # fmax: max of (headroom × fundamental) and (3 harmonics), min 30 Hz
                             f_fund_max = _fundamental_hz(rpm_max, cyl, order, takt)
                             if f_fund_max < 10.0:
                                 continue  # below audio range
-                            fmax = max(200.0, min(f_fund_max * fmax_headroom, 5000.0))
+                            fmax = min(max(f_fund_max * fmax_headroom, f_fund_max * 3.0, 30.0), 5000.0)
                             # round to nearest 10 Hz for cleaner STFT bins
                             fmax = round(fmax / 10) * 10
 
@@ -862,18 +862,21 @@ def _score_one_rpm_candidate(
     """Score one candidate RPM line against the reference and return its best offset."""
     import numpy as np
 
-    rpm_eval, gear_meta = constrain_rpm_to_gear_bands(t_audio, rpm_candidate, gear_band_cfg)
+    score_gear_band_cfg = _gear_band_cfg_for_candidate(gear_band_cfg, candidate_name)
+    rpm_eval, gear_meta = constrain_rpm_to_gear_bands(t_audio, rpm_candidate, score_gear_band_cfg)
     if offset_range > 0:
+        _coarse_step = max(offset_step, 0.5)
         best_off = cross_corr_offset(
             t_audio, rpm_eval, t_ref, rpm_ref,
             search_lo=offset_base - offset_range,
             search_hi=offset_base + offset_range,
-            step=max(offset_step, 0.1),
+            step=_coarse_step,
         )
+        _fine_step = min(0.1, offset_step)
         fine_offsets = np.arange(
-            best_off - offset_step * 2,
-            best_off + offset_step * 2 + offset_step * 0.5,
-            offset_step,
+            best_off - _coarse_step,
+            best_off + _coarse_step + _fine_step * 0.5,
+            _fine_step,
         ).tolist()
     else:
         fine_offsets = [offset_base]
@@ -886,7 +889,7 @@ def _score_one_rpm_candidate(
             tol_abs_rpm=tol_abs_rpm,
             tol_pct=tol_pct,
             tol_logic=tol_logic,
-            gear_band_cfg=gear_band_cfg,
+            gear_band_cfg=score_gear_band_cfg,
         )
         if not sd.get("ok"):
             continue
@@ -901,6 +904,20 @@ def _score_one_rpm_candidate(
         if best is None or sd["combined_score"] > best["combined_score"]:
             best = sd
     return best or {"ok": False, "error": "candidate scoring failed"}
+
+
+def _gear_band_cfg_for_candidate(gear_band_cfg: dict | None, candidate_name: str) -> dict | None:
+    """Keep ridge candidates inside gear bands without destroying their spectral line."""
+    if not isinstance(gear_band_cfg, dict):
+        return gear_band_cfg
+    name = str(candidate_name)
+    if "Gear-Band Ridge" not in name:
+        return gear_band_cfg
+    cfg = dict(gear_band_cfg)
+    cfg["snap_to_band_center"] = False
+    cfg["center_blend"] = 0.0
+    cfg["candidate_band_policy"] = "ridge_no_center_snap"
+    return cfg
 
 
 def _compact_plot_preview(t_audio, rpm_audio, max_points: int = 2500) -> dict:
@@ -1110,7 +1127,7 @@ def run_sweep_optuna(
         f_fund_max = _fundamental_hz(rpm_max, cyl, order, takt)
         if f_fund_max < 10.0:
             raise optuna.exceptions.TrialPruned()
-        fmax = round(max(200.0, min(f_fund_max * fmax_headroom, 5000.0)) / 10) * 10
+        fmax = round(min(max(f_fund_max * fmax_headroom, f_fund_max * 3.0, 30.0), 5000.0) / 10) * 10
 
         params = {
             "method": method, "nfft": int(nfft), "overlap_pct": float(overlap),

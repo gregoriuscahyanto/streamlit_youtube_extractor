@@ -40,6 +40,8 @@ def test_audio_tab_exposes_reference_free_band_guidance_controls():
     assert '"snap_to_band_center": str(_band_mode) == "hard"' in txt
     assert '"center_blend": 1.0 if str(_band_mode) == "hard" else 0.0' in txt
     assert '"band_smooth_n": max(int(_band_smooth_n), 21) if str(_band_mode) == "hard" else int(_band_smooth_n)' in txt
+    assert "_gear_band_cfg_snap = _sw_gear_band_cfg" in txt
+    assert '"center_blend": 0.0, "snap_to_band_center": False' not in txt
 
 
 def test_hard_mode_blends_rpm_toward_band_center_without_reference():

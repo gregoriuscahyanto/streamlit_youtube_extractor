@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from app_tabs.audio_sweep import constrain_rpm_to_gear_bands
+from app_tabs.audio_sweep import _score_one_rpm_candidate, constrain_rpm_to_gear_bands
 
 
 def test_constrain_rpm_to_gear_bands_clamps_per_timepoint():
@@ -57,3 +57,44 @@ def test_audio_sweep_source_uses_constraint_before_scoring():
     assert "rpm_audio, _gear_limit_meta = constrain_rpm_to_gear_bands(" in txt
     assert '"gear_band_constraint"' in txt
     assert "band_compliance_pct * (band_weight / 100.0)" not in txt
+
+
+def test_gear_band_ridge_scoring_keeps_spectral_line_without_center_snap():
+    t = np.linspace(0.0, 2.0, 5)
+    cfg = {
+        "t_ocr": [0.0, 2.0],
+        "v_kmph_ocr": [100.0, 100.0],
+        "gear_ratios": [1.0],
+        "axle_ratio": 3.0,
+        "r_dyn": 0.35,
+        "rpm_min": 500.0,
+        "rpm_max": 8000.0,
+        "band_tol_pct": 20.0,
+        "mode": "hard",
+        "snap_to_band_center": True,
+        "center_blend": 1.0,
+    }
+    center, _ = constrain_rpm_to_gear_bands(t, np.full_like(t, 2300.0), cfg)
+    ridge = center * 1.08
+
+    for name in ("Gear-Band Ridge", "Gear-Band Ridge Viterbi"):
+        sd = _score_one_rpm_candidate(
+            t,
+            ridge,
+            t,
+            ridge,
+            offset_base=0.0,
+            offset_range=0.0,
+            offset_step=0.5,
+            tol_abs_rpm=300.0,
+            tol_pct=5.0,
+            tol_logic="ODER",
+            gear_band_cfg=cfg,
+            candidate_name=name,
+        )
+
+        assert sd["ok"] is True
+        assert sd["center_blend"] == 0.0
+        assert sd["snap_to_band_center"] is False
+        assert sd["candidate_source_method"] == name
+        assert np.allclose(np.asarray(sd["plot_rpm"], dtype=float), ridge, atol=0.01)
