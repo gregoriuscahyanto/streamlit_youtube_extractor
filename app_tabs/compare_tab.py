@@ -171,6 +171,56 @@ def _load_file_data(json_path: str, offset_s: float, offset_m: float = 0.0) -> d
     return cols
 
 
+def _read_external_table(uploaded_file, sheet_name=0):
+    """Read an uploaded Excel/CSV table into a DataFrame."""
+    import io
+    import pandas as pd
+
+    name = str(getattr(uploaded_file, "name", "") or "").lower()
+    data = uploaded_file.getvalue()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(io.BytesIO(data), sheet_name=sheet_name)
+    if name.endswith(".csv"):
+        try:
+            return pd.read_csv(io.BytesIO(data))
+        except Exception:
+            return pd.read_csv(io.BytesIO(data), sep=";")
+    raise ValueError(f"Nicht unterstuetztes Format: {name}")
+
+
+def _external_table_to_cols(df, mapping: dict, offset_s: float = 0.0, offset_m: float = 0.0) -> dict[str, list]:
+    """Convert an external table to comparison columns using canonical names."""
+    import pandas as pd
+
+    cols: dict[str, list] = {}
+    if df is None or getattr(df, "empty", True):
+        return cols
+    used: set[str] = set()
+    for target, source in (mapping or {}).items():
+        if not source or source not in df.columns:
+            continue
+        vals = pd.to_numeric(df[source], errors="coerce")
+        out_name = str(target)
+        if out_name == "time_s":
+            vals = vals + float(offset_s)
+        elif out_name == "s_m":
+            vals = vals + float(offset_m)
+        cols[out_name] = vals.astype(float).tolist()
+        used.add(str(source))
+
+    # Keep extra numeric columns available without forcing a mapping.
+    for c in df.columns:
+        if str(c) in used:
+            continue
+        vals = pd.to_numeric(df[c], errors="coerce")
+        if vals.notna().any():
+            out_name = str(c)
+            if out_name in cols:
+                out_name = f"ext_{out_name}"
+            cols[out_name] = vals.astype(float).tolist()
+    return cols
+
+
 # ── Track calibration helper ──────────────────────────────────────────────────
 
 def _load_trkCalSlim(json_path: str) -> dict:
@@ -224,6 +274,7 @@ def render(ns: dict) -> None:
 
     # ── Session state defaults ────────────────────────────────────────────────
     st.session_state.setdefault("cmp_files", [])
+    st.session_state.setdefault("cmp_external_sources", {})
     # cmp_files: list of {"path": str, "label": str, "offset_s": float}
     st.session_state.setdefault("cmp_charts", [
         {"title": "Diagramm 1", "x_col": "time_s", "y_col": "", "plot_type": "line"}
@@ -304,7 +355,77 @@ def render(ns: dict) -> None:
             new_files.append({"path": p, "label": _lbl, "offset_s": 0.0, "offset_m": 0.0})
     st.session_state.cmp_files = new_files
 
-    if not st.session_state.cmp_files:
+    st.markdown("### Externe Excel/CSV-Tabelle")
+    ext_uploads = st.file_uploader(
+        "Externe Tabelle laden",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+        key="cmp_external_uploads",
+        help="Spalten koennen auf interne Namen wie time_s, rpm oder v_Fzg_kmph gemappt werden.",
+    )
+    external_files: list[dict] = []
+    external_data: dict[str, dict] = {}
+    for ei, uf in enumerate(ext_uploads or []):
+        ext_id = f"external::{ei}::{getattr(uf, 'name', 'table')}"
+        try:
+            df_ext = _read_external_table(uf)
+        except Exception as exc:
+            st.warning(f"Externe Tabelle '{getattr(uf, 'name', '')}' konnte nicht gelesen werden: {exc}")
+            continue
+        if df_ext is None or df_ext.empty:
+            st.warning(f"Externe Tabelle '{getattr(uf, 'name', '')}' ist leer.")
+            continue
+        with st.container(border=True):
+            st.caption(f"Extern: {getattr(uf, 'name', '')} ({len(df_ext)} Zeilen)")
+            numeric_ext_cols = list(df_ext.columns)
+            map_targets = ["time_s", "rpm", "v_Fzg_kmph", "s_m", "track_xy_x", "track_xy_y"]
+            aliases = {
+                "time_s": ["time_s", "t_s", "time", "t"],
+                "rpm": ["rpm", "n_VKM_anzeige_Upm1n", "n", "engine_rpm"],
+                "v_Fzg_kmph": ["v_Fzg_kmph", "v_kmph", "speed", "kmph"],
+                "s_m": ["s_m", "distance", "dist_m"],
+                "track_xy_x": ["track_xy_x", "x"],
+                "track_xy_y": ["track_xy_y", "y"],
+            }
+            mapping: dict[str, str] = {}
+            mcols = st.columns(3)
+            for mi, target in enumerate(map_targets):
+                opts = [""] + [str(c) for c in numeric_ext_cols]
+                default = ""
+                for a in aliases.get(target, []):
+                    hit = next((str(c) for c in numeric_ext_cols if str(c).lower() == a.lower()), "")
+                    if hit:
+                        default = hit
+                        break
+                val = mcols[mi % 3].selectbox(
+                    target,
+                    options=opts,
+                    index=opts.index(default) if default in opts else 0,
+                    key=f"cmp_ext_map_{ei}_{target}",
+                    format_func=lambda v: "(nicht zuordnen)" if v == "" else v,
+                )
+                if val:
+                    mapping[target] = val
+            ecol1, ecol2, ecol3 = st.columns([3, 2, 2])
+            label = ecol1.text_input(
+                "Label extern",
+                value=Path(str(getattr(uf, "name", f"extern_{ei}"))).stem,
+                key=f"cmp_ext_label_{ei}",
+            )
+            off_s = ecol2.number_input(
+                "Zeitversatz extern [s]",
+                value=0.0, step=0.001, format="%.3f", key=f"cmp_ext_offs_{ei}",
+            )
+            off_m = ecol3.number_input(
+                "Streckenversatz extern [m]",
+                value=0.0, step=1.0, format="%.1f", key=f"cmp_ext_offm_{ei}",
+            )
+        ext_cols = _external_table_to_cols(df_ext, mapping, off_s, off_m)
+        st.session_state.cmp_external_sources[ext_id] = {"label": label, "columns": list(ext_cols.keys())}
+        external_files.append({"path": ext_id, "label": label, "offset_s": off_s, "offset_m": off_m})
+        external_data[ext_id] = ext_cols
+
+    if not st.session_state.cmp_files and not external_files:
         st.info("Mindestens eine JSON-Datei auswählen.")
         _render_config_section()
         return
@@ -361,6 +482,8 @@ def render(ns: dict) -> None:
                     pass
             st.session_state.cmp_data[key] = cached
         cmp_data[f["path"]] = cached
+    cmp_data.update(external_data)
+    display_files = list(st.session_state.cmp_files) + list(external_files)
 
     # Collect all column names across all loaded files
     all_cols: list[str] = []
@@ -437,9 +560,9 @@ def render(ns: dict) -> None:
 
             # Render this chart
             if chart["plot_type"] == "geoplot":
-                _render_geoplot_chart(chart, st.session_state.cmp_files, cmp_data, ci)
+                _render_geoplot_chart(chart, display_files, cmp_data, ci)
             elif chart["y_col"] and all_cols:
-                _render_chart(chart, st.session_state.cmp_files, cmp_data, ci)
+                _render_chart(chart, display_files, cmp_data, ci)
             else:
                 st.caption("Y-Achse auswählen um das Diagramm anzuzeigen.")
 
@@ -461,7 +584,7 @@ def render(ns: dict) -> None:
 
 
 def _safe_sheet_name(label: str) -> str:
-    """Sanitize a string for use as an Excel sheet name (max 31 chars, no /\?*:[]')."""
+    """Sanitize a string for use as an Excel sheet name."""
     import re
     name = re.sub(r'[/\\?*:\[\]\']', "_", str(label or "Kurve"))
     return name[:31] or "Kurve"

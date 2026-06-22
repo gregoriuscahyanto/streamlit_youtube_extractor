@@ -14,6 +14,8 @@ def test_media_tab_parses_string_roi_from_json_columnar_table():
     txt = _read("app_tabs/media_tab.py")
     assert "def _parse_roi_table(roi_table) -> list[dict]:" in txt
     assert "def _coords_from_any(v) -> list[float]:" in txt
+    assert "def _flat_roi_row_from_list(v) -> dict | None:" in txt
+    assert "flat_row = _flat_roi_row_from_list(roi_table)" in txt
     assert 'txt.replace(",", " ").replace(";", " ").split()' in txt
     assert 'coords = coords_list[i] if i < len(coords_list) else []' in txt
     assert "x, y, w, h = _coords_from_any(coords)" in txt

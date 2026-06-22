@@ -4,7 +4,11 @@ The renderer receives app.py globals so existing helper functions and
 session-state conventions remain shared during the incremental split.
 """
 
+from pathlib import Path
+
 import streamlit as st
+
+from gopro_correction import apply_gopro_corrections_to_frame, run_gopro_correction_2fps
 
 @st.fragment
 def _roi_columns_fragment():
@@ -402,7 +406,7 @@ def _roi_columns_fragment():
             columns=_roi_cols,
         )
 
-        if has_pyarrow:
+        if bool(globals().get("HAS_PYARROW", False)):
             edited_df = st.data_editor(
                 df_edit,
                 column_config={
@@ -709,6 +713,185 @@ def _roi_columns_fragment():
             _dl_json_col = st.columns(1)[0]
             _dl_json_col.download_button("JSON herunterladen", _last_save.get("json_bytes", b""), _last_save.get("json_name", "results.json"), "application/json", width="stretch", key="json_download")
 
+def _render_gopro_correction_panel():
+    video_raw = str(st.session_state.get("video_path") or "").strip()
+    video_path = Path(video_raw) if video_raw else None
+    has_video = video_path is not None and video_path.exists()
+    with st.expander("GoPro-Korrektur", expanded=False):
+        st.caption("Korrektur wird als neues 2 fps Video neben dem geladenen Video gespeichert.")
+        c1, c2, c3 = st.columns(3)
+        apply_wide = c1.checkbox("Weitwinkelkorrektur", value=True, key="roi_gopro_wide")
+        apply_shift = c2.checkbox("Bildlagewanderung kompensieren", value=True, key="roi_gopro_shift")
+        apply_warp = c3.checkbox("Kamera hoeher simulieren", value=True, key="roi_gopro_warp")
+        s1, s2 = st.columns(2)
+        wide_k1 = s1.slider(
+            "Weitwinkel-Staerke",
+            -0.80,
+            0.0,
+            float(st.session_state.get("roi_gopro_wide_k1", -0.48)),
+            step=0.02,
+            key="roi_gopro_wide_k1",
+        )
+        perspective_strength = s2.slider(
+            "Warp / Kamerahoehe",
+            0.0,
+            1.50,
+            float(st.session_state.get("roi_gopro_perspective", 0.35)),
+            step=0.01,
+            key="roi_gopro_perspective",
+        )
+        s3, s4 = st.columns(2)
+        shift_gain = s3.slider(
+            "Auto-Bildlage-Staerke",
+            0.0,
+            10.0,
+            float(st.session_state.get("roi_gopro_shift_gain", 2.2)),
+            step=0.1,
+            key="roi_gopro_shift_gain",
+            help="Verstärkungsfaktor für die automatische Bildlagestabilisierung (optischer Fluss gegen Startframe). "
+                 "Höherer Wert = stärkere Gegenkorrektur. 0 = deaktiviert.",
+        )
+        max_shift_px = s4.slider(
+            "Max. Bildlage px",
+            0.0,
+            1500.0,
+            float(st.session_state.get("roi_gopro_max_shift", 360.0)),
+            step=10.0,
+            key="roi_gopro_max_shift",
+            help="Maximale Verschiebung in Pixel, die die Auto-Stabilisierung anwenden darf. "
+                 "Verhindert, dass ein einzelner Ausreißer das Bild stark verschiebt.",
+        )
+        b1, b2 = st.columns(2)
+        manual_shift_x_px = b1.slider(
+            "Bildlage X (manuell)",
+            -1500.0,
+            1500.0,
+            float(st.session_state.get("roi_gopro_manual_shift_x", 0.0)),
+            step=5.0,
+            key="roi_gopro_manual_shift_x",
+            help="Feste horizontale Verschiebung in Pixel — überlagert sich additiv mit der Auto-Stabilisierung.",
+        )
+        manual_shift_y_px = b2.slider(
+            "Bildlage Y (manuell)",
+            -1500.0,
+            1500.0,
+            float(st.session_state.get("roi_gopro_manual_shift_y", 0.0)),
+            step=5.0,
+            key="roi_gopro_manual_shift_y",
+            help="Feste vertikale Verschiebung in Pixel — überlagert sich additiv mit der Auto-Stabilisierung.",
+        )
+        rotation_deg = st.slider(
+            "Drehung (immer um Bildmitte)",
+            -20.0,
+            20.0,
+            float(st.session_state.get("roi_gopro_rotation", 0.0)),
+            step=0.1,
+            key="roi_gopro_rotation",
+        )
+        rotation_center_x = 0.5
+        rotation_center_y = 0.5
+        st.caption(
+            "**Auto-Bildlage**: stabilisiert gegen den Startframe per optischem Fluss — "
+            "Stärke steuert wie stark korrigiert wird, Max. px begrenzt den Ausschlag. "
+            "**Bildlage X/Y**: feste manuelle Verschiebung, additiv zur Auto-Stabilisierung. "
+            "**Drehung**: dreht immer um die Bildmitte."
+        )
+        st.caption(f"Quelle: {video_path if has_video else 'kein Video geladen'}")
+        if has_video:
+            preview_t = float(st.session_state.get("t_current", st.session_state.get("t_start", 0.0)) or 0.0)
+            frame = _get_media_frame(preview_t)
+            ref = _get_media_frame(float(st.session_state.get("t_start", 0.0) or 0.0))
+            st.markdown("**Live-Vorschau**")
+            p1, p2 = st.columns(2)
+            if frame is not None:
+                p1.image(frame, width="stretch", caption="Vorher")
+                corrected, _preview_meta = apply_gopro_corrections_to_frame(
+                    frame,
+                    ref,
+                    apply_wide=bool(apply_wide),
+                    apply_shift=bool(apply_shift),
+                    apply_warp=bool(apply_warp),
+                    wide_k1=float(wide_k1),
+                    shift_gain=float(shift_gain),
+                    max_shift_px=float(max_shift_px),
+                    perspective_strength=float(perspective_strength),
+                    rotation_deg=float(rotation_deg),
+                    rotation_center_x=float(rotation_center_x),
+                    rotation_center_y=float(rotation_center_y),
+                    manual_shift_x_px=float(manual_shift_x_px),
+                    manual_shift_y_px=float(manual_shift_y_px),
+                )
+                p2.image(corrected, width="stretch", caption="Nachher")
+            else:
+                st.caption("Live-Vorschau ist verfuegbar, sobald der aktuelle Frame gelesen werden kann.")
+        disabled = (not has_video) or bool(st.session_state.get("roi_gopro_running", False))
+        if st.button("Korrekturvideo erzeugen", key="roi_gopro_make_video", type="primary", disabled=disabled):
+            assert video_path is not None
+            st.session_state.roi_gopro_running = True
+            out_path = video_path.with_name(f"{video_path.stem}_gopro_corrected_2fps.avi")
+            logs: list[str] = []
+
+            def _fmt_eta(eta_s: float | None) -> str:
+                if eta_s is None:
+                    return "Restzeit: unbekannt"
+                eta = max(0.0, float(eta_s))
+                if eta >= 60.0:
+                    return f"Restzeit ca. {eta / 60.0:.1f} min"
+                return f"Restzeit ca. {eta:.0f} s"
+
+            def _progress(msg: str, pct: float = 0.0, eta_s: float | None = None) -> None:
+                logs.append(str(msg))
+                progress_box.progress(max(0.0, min(1.0, float(pct or 0.0))), text=f"{float(pct or 0.0) * 100.0:.1f}% | {_fmt_eta(eta_s)}")
+                log_box.code("\n".join(logs[-12:]), language="text")
+
+            try:
+                with st.status("GoPro-Korrektur laeuft", expanded=True) as status:
+                    progress_box = st.progress(0.0, text="0.0% | Restzeit: unbekannt")
+                    log_box = st.empty()
+                    ok, msg, meta = run_gopro_correction_2fps(
+                        video_path,
+                        out_path,
+                        float(st.session_state.get("t_start", 0.0) or 0.0),
+                        float(st.session_state.get("t_end", 0.0) or 0.0),
+                        apply_wide=bool(apply_wide),
+                        apply_shift=bool(apply_shift),
+                        apply_warp=bool(apply_warp),
+                        wide_k1=float(wide_k1),
+                        shift_gain=float(shift_gain),
+                        max_shift_px=float(max_shift_px),
+                        perspective_strength=float(perspective_strength),
+                        rotation_deg=float(rotation_deg),
+                        rotation_center_x=float(rotation_center_x),
+                        rotation_center_y=float(rotation_center_y),
+                        manual_shift_x_px=float(manual_shift_x_px),
+                        manual_shift_y_px=float(manual_shift_y_px),
+                        target_fps=2.0,
+                        progress_cb=_progress,
+                    )
+                    if ok:
+                        status.update(label="GoPro-Korrektur abgeschlossen", state="complete")
+                        st.session_state.roi_gopro_last_meta = dict(meta or {})
+                        applier = globals().get("_apply_video")
+                        if callable(applier):
+                            applier(str(out_path), out_path.name)
+                        else:
+                            st.session_state.video_path = str(out_path)
+                        st.session_state.tab_default = "ROI Setup"
+                        st.success(f"Korrekturvideo geladen: {out_path.name}")
+                        st.rerun()
+                    else:
+                        status.update(label="GoPro-Korrektur fehlgeschlagen", state="error")
+                        st.error(msg or "GoPro-Korrektur fehlgeschlagen.")
+            finally:
+                st.session_state.roi_gopro_running = False
+        meta = st.session_state.get("roi_gopro_last_meta") or {}
+        if isinstance(meta, dict) and meta:
+            st.caption(
+                "Letzte Korrektur: "
+                f"{int(meta.get('frames_written', 0))} Frames, "
+                f"Warp {int(meta.get('warp_used_frames', 0))}x, "
+                f"Lage {int(meta.get('translation_used_frames', 0))}x."
+            )
 
 
 def render(ns):
@@ -787,6 +970,7 @@ def render(ns):
         st.markdown('<div class="roi-compact">', unsafe_allow_html=True)
         st.subheader("1 · ROI Setup")
 
+        _render_gopro_correction_panel()
         _roi_columns_fragment()
 
 

@@ -7,17 +7,30 @@ No R2, no framepack, no audio proxy.
 from __future__ import annotations
 
 import json
+import tempfile
+import time
 import threading
 from datetime import datetime
 from pathlib import Path
 
 from core.watchdog_state import _JSON_ROW_CACHE, get_path_lock
+from local_media_ingest import import_local_media
 
 # ── Background conversion state (module-level, survives render calls) ─────────
 _CONV_LOCK = threading.Lock()
 _CONV: dict = {
     "running": False, "kind": "", "done": 0, "total": 0,
     "current": "", "log": [], "stop_requested": False,
+}
+
+_LOCAL_IMPORT_LOCK = threading.Lock()
+_LOCAL_IMPORT: dict = {
+    "running": False,
+    "step": "",
+    "log": [],
+    "ok": None,
+    "msg": "",
+    "info": {},
 }
 
 # Per-JSON detail cache: str(path) -> (mtime, detail_dict)
@@ -33,10 +46,243 @@ def _conv_log(msg: str) -> None:
         _CONV["log"] = _CONV["log"][-100:]
 
 
+def _local_import_log(msg: str) -> None:
+    with _LOCAL_IMPORT_LOCK:
+        _LOCAL_IMPORT["step"] = str(msg or "")
+        _LOCAL_IMPORT["log"].append(f"{datetime.now().strftime('%H:%M:%S')} | {msg}")
+        _LOCAL_IMPORT["log"] = _LOCAL_IMPORT["log"][-100:]
+
+
+def _run_local_import_job(
+    base: Path,
+    folder: str,
+    video_source_path: Path,
+    audio_source_path: Path | None,
+    title: str,
+    trim_start_s: float,
+    trim_end_s: float | None,
+    target_fps: float | None,
+) -> None:
+    with _LOCAL_IMPORT_LOCK:
+        _LOCAL_IMPORT["running"] = True
+        _LOCAL_IMPORT["step"] = "Lokaler Import startet"
+        _LOCAL_IMPORT["log"] = [f"{datetime.now().strftime('%H:%M:%S')} | Lokaler Import startet"]
+        _LOCAL_IMPORT["ok"] = None
+        _LOCAL_IMPORT["msg"] = ""
+        _LOCAL_IMPORT["info"] = {}
+    ok_import, msg_import, info_import = import_local_media(
+        base,
+        folder,
+        video_source_path,
+        audio_source_path,
+        title=title,
+        trim_start_s=trim_start_s,
+        trim_end_s=trim_end_s,
+        target_fps=target_fps,
+        progress_cb=_local_import_log,
+    )
+    with _LOCAL_IMPORT_LOCK:
+        _LOCAL_IMPORT["running"] = False
+        _LOCAL_IMPORT["ok"] = bool(ok_import)
+        _LOCAL_IMPORT["msg"] = str(msg_import or "")
+        _LOCAL_IMPORT["info"] = dict(info_import or {})
+        if ok_import:
+            _LOCAL_IMPORT["step"] = "Import abgeschlossen"
+            _LOCAL_IMPORT["log"].append(f"{datetime.now().strftime('%H:%M:%S')} | Import abgeschlossen")
+        else:
+            _LOCAL_IMPORT["step"] = "Import fehlgeschlagen"
+            _LOCAL_IMPORT["log"].append(f"{datetime.now().strftime('%H:%M:%S')} | Import fehlgeschlagen: {msg_import}")
+
+
 def _base() -> Path:
     import streamlit as _st
     lp = str(_st.session_state.get("local_base_path") or "").strip()
     return Path(lp).expanduser().resolve() if lp else Path.cwd()
+
+
+def _pick_local_file(title: str, filetypes: list[tuple[str, str]]) -> tuple[str, str]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        picked = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        root.destroy()
+        return str(picked or "").strip(), ""
+    except Exception as exc:
+        return "", f"Dateiauswahl fehlgeschlagen: {exc}"
+
+
+def _probe_video_duration(path: Path) -> tuple[float, str]:
+    duration_v = 0.0
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(path))
+        if cap.isOpened():
+            fps_v = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frames_v = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            if fps_v > 0 and frames_v > 0:
+                duration_v = frames_v / fps_v
+        cap.release()
+        return float(duration_v), ""
+    except Exception as exc:
+        return 0.0, f"Vorschau konnte nicht analysiert werden: {exc}"
+
+
+def _prepare_video_preview_path(src_path: Path, sig: str) -> tuple[Path | None, float, str]:
+    if src_path is None or not src_path.exists():
+        return None, 0.0, ""
+    info = st.session_state.get("lib_local_video_preview") or {}
+    if info.get("sig") == sig:
+        path_txt = str(info.get("path") or "").strip()
+        path = Path(path_txt) if path_txt else None
+        if path is not None and path.exists():
+            return path, float(info.get("duration") or 0.0), ""
+    duration_v, err = _probe_video_duration(src_path)
+    st.session_state["lib_local_video_preview"] = {
+        "sig": sig,
+        "path": str(src_path),
+        "duration": float(duration_v),
+    }
+    return src_path, float(duration_v), err
+
+
+def _resolve_local_path_input(raw_path: str) -> tuple[Path | None, str]:
+    txt = str(raw_path or "").strip().strip('"')
+    if not txt:
+        return None, ""
+    try:
+        path = Path(txt).expanduser().resolve()
+    except Exception as exc:
+        return None, f"Pfad ungueltig: {exc}"
+    if not path.exists() or not path.is_file():
+        return None, f"Datei nicht gefunden: {path}"
+    return path, ""
+
+
+def _read_video_frame(src_path: Path, time_s: float):
+    if src_path is None or not src_path.exists():
+        return None, "Videodatei fehlt."
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(src_path))
+        if not cap.isOpened():
+            return None, f"Video konnte nicht geoeffnet werden: {src_path.name}"
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(time_s or 0.0)) * 1000.0)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            return None, f"Frame konnte nicht gelesen werden: {src_path.name}"
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return frame, ""
+    except Exception as exc:
+        return None, f"Frame-Vorschau fehlgeschlagen: {exc}"
+
+
+def _build_frame_preview(
+    src_path: Path,
+    trim_start_s: float = 0.0,
+    trim_end_s: float | None = None,
+) -> tuple[list, list[str], str]:
+    if src_path is None or not src_path.exists():
+        return [], [], "Videovorschau-Datei fehlt."
+    start_v = max(0.0, float(trim_start_s or 0.0))
+    end_v = None if trim_end_s is None else float(trim_end_s)
+    info = st.session_state.get("lib_local_video_preview") or {}
+    trim_sig = f"{start_v:.3f}|{'' if end_v is None else f'{end_v:.3f}'}"
+    cached_frames = info.get("preview_frames")
+    cached_captions = info.get("preview_captions")
+    if info.get("preview_trim_sig") == trim_sig and isinstance(cached_frames, list) and isinstance(cached_captions, list):
+        return cached_frames, cached_captions, ""
+    seg_end = end_v if end_v is not None and end_v > start_v else max(start_v, float(info.get("duration") or start_v))
+    frame_times: list[tuple[str, float]] = [("Start", start_v)]
+    if seg_end > start_v:
+        if seg_end - start_v > 1.0:
+            mid_count = 4
+            step = (seg_end - start_v) / (mid_count + 1)
+            for idx in range(mid_count):
+                t = start_v + (idx + 1) * step
+                frame_times.append((f"{t:.1f}s", t))
+        frame_times.append(("Ende", max(start_v, seg_end - 0.05)))
+    seen: list[float] = []
+    uniq_times: list[tuple[str, float]] = []
+    for label, t in frame_times:
+        key = round(float(t), 2)
+        if key in seen:
+            continue
+        seen.append(key)
+        uniq_times.append((label, float(t)))
+    frames = []
+    captions: list[str] = []
+    err_last = ""
+    for label, t in uniq_times[:6]:
+        frame, err = _read_video_frame(src_path, t)
+        if frame is None:
+            err_last = err
+            continue
+        frames.append(frame)
+        captions.append(label)
+    if not frames:
+        return [], [], err_last or "Keine Bildvorschau verfuegbar."
+    info["preview_trim_sig"] = trim_sig
+    info["preview_frames"] = frames
+    info["preview_captions"] = captions
+    st.session_state["lib_local_video_preview"] = info
+    return frames, captions, ""
+
+
+def _render_preview_fragment(preview_path: Path | None, preview_duration: float) -> tuple[float, float | None]:
+    import streamlit as _st
+
+    _trim_start_s = 0.0
+    _trim_end_s = None
+    _preview_video_err = ""
+    _preview_frames = []
+    _preview_captions: list[str] = []
+    _preview_max = max(0.0, float(preview_duration or 0.0))
+    if _preview_max > 0:
+        _trim_default = (0.0, float(_preview_max))
+        _trim_range = _st.slider(
+            "Start / Ende (s)",
+            min_value=0.0,
+            max_value=float(_preview_max),
+            value=_trim_default,
+            step=0.5,
+            key="lib_local_trim_range_s",
+        )
+        _trim_start_s = float(_trim_range[0])
+        _trim_end_s = float(_trim_range[1])
+        _st.caption(f"Importiert wird nur der Bereich {_trim_start_s:.1f}s bis {_trim_end_s:.1f}s.")
+    else:
+        _st.info("Start-/Ende-Slider wird nach der Dateiauswahl aktiviert.")
+
+    if preview_path is not None:
+        _preview_frames, _preview_captions, _preview_video_err = _build_frame_preview(
+            preview_path,
+            trim_start_s=_trim_start_s,
+            trim_end_s=_trim_end_s,
+        )
+    if _preview_frames:
+        _img_c1, _img_c2 = _st.columns(2)
+        _img_c1.image(_preview_frames[0], caption="Start", use_container_width=True)
+        _img_c2.image(_preview_frames[-1], caption="Ende", use_container_width=True)
+        if len(_preview_frames) > 2:
+            _st.caption("Filmstreifen")
+            _mid_cols = _st.columns(4)
+            _mid_frames = _preview_frames[1:-1]
+            _mid_caps = _preview_captions[1:-1]
+            for _idx, _col in enumerate(_mid_cols):
+                if _idx < len(_mid_frames):
+                    _col.image(_mid_frames[_idx], caption=_mid_caps[_idx], use_container_width=True)
+    else:
+        _st.info("Videovorschau erscheint nach der Dateiauswahl.")
+        if _preview_video_err:
+            _st.warning(_preview_video_err)
+    return _trim_start_s, _trim_end_s
 
 
 def _lamp(ok: bool) -> str:
@@ -822,6 +1068,152 @@ def render(ns: dict) -> None:
         except Exception as _rfall:
             st.error(f"Nachkorrektur fehlgeschlagen: {_rfall}")
 
+    st.divider()
+
+    with st.expander("Lokaler Import", expanded=False):
+        with _LOCAL_IMPORT_LOCK:
+            _li_running = bool(_LOCAL_IMPORT.get("running"))
+            _li_step = str(_LOCAL_IMPORT.get("step") or "")
+            _li_log = list(_LOCAL_IMPORT.get("log") or [])
+            _li_ok = _LOCAL_IMPORT.get("ok")
+            _li_msg = str(_LOCAL_IMPORT.get("msg") or "")
+            _li_info = dict(_LOCAL_IMPORT.get("info") or {})
+        _video_path_pending = str(st.session_state.pop("lib_local_video_path_pending", "") or "").strip()
+        if _video_path_pending:
+            st.session_state["lib_local_video_path"] = _video_path_pending
+        _audio_path_pending = str(st.session_state.pop("lib_local_audio_path_pending", "") or "").strip()
+        if _audio_path_pending:
+            st.session_state["lib_local_audio_path"] = _audio_path_pending
+        _up_c1, _up_c2 = st.columns([2, 2])
+        _folder_display = _up_c1.text_input(
+            "Capture-Ordner",
+            value="",
+            key="lib_local_capture_folder_display",
+            placeholder="Wird beim Import automatisch aus Datum/Uhrzeit erzeugt",
+            disabled=True,
+        )
+        _title_input = _up_c2.text_input("Titel", value="", key="lib_local_upload_title")
+        _title_required = bool(str(_title_input or "").strip())
+        if not _title_required:
+            st.warning("Titel ist Pflicht.")
+        _fps_choice = st.selectbox(
+            "Import-FPS",
+            ["10 fps", "2 fps", "Original"],
+            index=0,
+            key="lib_local_import_fps",
+            help="Reduziert die Frames beim Import. 10 fps ist meist deutlich schneller; 2 fps ist fuer reine Einzelbild/ROI-Arbeit am schnellsten.",
+        )
+        _local_import_target_fps = 10.0 if _fps_choice.startswith("10") else (2.0 if _fps_choice.startswith("2") else None)
+        _path_c1, _path_c2 = st.columns([8, 2], vertical_alignment="bottom")
+        _video_path_raw = _path_c1.text_input(
+            "Lokales Video aus Pfad",
+            value=str(st.session_state.get("lib_local_video_path") or ""),
+            key="lib_local_video_path",
+            disabled=True,
+        )
+        if _path_c2.button("Datei waehlen", key="lib_local_video_pick_btn", use_container_width=True):
+            _picked, _pick_err = _pick_local_file(
+                "Video auswaehlen",
+                [("Video", "*.mp4 *.avi *.mov *.mkv"), ("Alle Dateien", "*.*")],
+            )
+            if _picked:
+                st.session_state["lib_local_video_path_pending"] = _picked
+                st.rerun()
+            if _pick_err:
+                st.warning(_pick_err)
+        _path_c3, _path_c4 = st.columns([8, 2], vertical_alignment="bottom")
+        _audio_path_raw = _path_c3.text_input(
+            "Separate Audio aus Pfad (optional)",
+            value=str(st.session_state.get("lib_local_audio_path") or ""),
+            key="lib_local_audio_path",
+            disabled=True,
+        )
+        if _path_c4.button("Audio waehlen", key="lib_local_audio_pick_btn", use_container_width=True):
+            _picked, _pick_err = _pick_local_file(
+                "Audio auswaehlen",
+                [("Audio", "*.wav *.mp3 *.m4a *.aac *.flac"), ("Alle Dateien", "*.*")],
+            )
+            if _picked:
+                st.session_state["lib_local_audio_path_pending"] = _picked
+                st.rerun()
+            if _pick_err:
+                st.warning(_pick_err)
+        _video_source_path, _video_path_err = _resolve_local_path_input(_video_path_raw)
+        _audio_source_path, _audio_path_err = _resolve_local_path_input(_audio_path_raw)
+        _preview_path, _preview_duration, _preview_err = _prepare_video_preview_path(
+            _video_source_path,
+            f"path:{_video_source_path}",
+        ) if _video_source_path is not None else (None, 0.0, "")
+        _trim_start_s = 0.0
+        _trim_end_s = None
+        if _video_path_err:
+            st.warning(_video_path_err)
+        if _audio_path_err:
+            st.warning(_audio_path_err)
+        if _preview_err:
+            st.warning(_preview_err)
+        if _li_running:
+            _progress_placeholder = st.empty()
+            _progress_placeholder.info(f"Lokaler Import läuft: {_li_step or 'bitte warten'}")
+            with st.expander("Import-Log", expanded=True):
+                _log_placeholder = st.empty()
+                _log_placeholder.code("\n".join(_li_log[-20:]), language="text")
+                while True:
+                    time.sleep(0.5)
+                    with _LOCAL_IMPORT_LOCK:
+                        _still_running = bool(_LOCAL_IMPORT.get("running"))
+                        _cur_step = str(_LOCAL_IMPORT.get("step") or "")
+                        _cur_log = list(_LOCAL_IMPORT.get("log") or [])
+                    _progress_placeholder.info(f"Lokaler Import läuft: {_cur_step or 'bitte warten'}")
+                    _log_placeholder.code("\n".join(_cur_log[-20:]), language="text")
+                    if not _still_running:
+                        break
+            st.rerun()
+        elif _li_ok is True:
+            st.success(f"Lokal importiert: {_li_info.get('folder', '')}")
+            with st.expander("Import-Log", expanded=False):
+                st.code("\n".join(_li_log[-20:]), language="text")
+        elif _li_ok is False:
+            st.error(_li_msg or "Lokaler Import fehlgeschlagen.")
+            with st.expander("Import-Log", expanded=True):
+                st.code("\n".join(_li_log[-20:]), language="text")
+        _fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+        if callable(_fragment):
+            @_fragment
+            def _preview_fragment_runner():
+                return _render_preview_fragment(_preview_path, _preview_duration)
+
+            _trim_vals = _preview_fragment_runner()
+            if isinstance(_trim_vals, tuple) and len(_trim_vals) == 2:
+                _trim_start_s, _trim_end_s = _trim_vals
+        else:
+            _trim_start_s, _trim_end_s = _render_preview_fragment(_preview_path, _preview_duration)
+
+        st.caption(f"Zielpfad: {base / 'captures' / '<capture_folder>'}")
+        if st.button(
+            "Lokal importieren",
+            key="lib_local_import_btn",
+            type="primary",
+            disabled=_video_source_path is None or _li_running or not _title_required,
+        ):
+            _folder_effective = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _t = threading.Thread(
+                target=_run_local_import_job,
+                args=(
+                    base,
+                    _folder_effective,
+                    _video_source_path,
+                    _audio_source_path,
+                    _title_input,
+                    _trim_start_s,
+                    _trim_end_s,
+                    _local_import_target_fps,
+                ),
+                daemon=True,
+            )
+            _t.start()
+            st.rerun()
+
     # ── YouTube-Link hinzufügen (Enter zum Bestätigen) ─────────────────────────
     with st.form("lib_link_form", clear_on_submit=True, border=False):
         _lc1, _lc2 = st.columns([5, 1])
@@ -968,8 +1360,27 @@ def render(ns: dict) -> None:
                 pass
             return [0.0, 0.0, 0.0, 0.0]
 
+        def _flat_roi_row_from_list(v) -> dict | None:
+            if not isinstance(v, list) or len(v) < 2 or isinstance(v[0], dict):
+                return None
+            x, y, w, h = _coords_from_any(v[1])
+            if w <= 0.0 or h <= 0.0:
+                return None
+            return {
+                "name": str(v[0] or "roi"),
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "fmt": str(v[2] if len(v) > 2 and v[2] is not None else "any"),
+                "max_scale": _scalar(v[3], 1.2) if len(v) > 3 else 1.2,
+            }
+
         out: list[dict] = []
         if isinstance(roi_table, list):
+            flat_row = _flat_roi_row_from_list(roi_table)
+            if flat_row is not None:
+                return [flat_row]
             for r in roi_table:
                 if not isinstance(r, dict):
                     continue
@@ -1324,5 +1735,3 @@ def render(ns: dict) -> None:
                     st.error(f"Track-Fehler: {_tr_msg}")
             else:
                 st.error("Track-Rerun-Funktion nicht verfügbar (youtube_tab.render noch nicht aufgerufen?).")
-
-

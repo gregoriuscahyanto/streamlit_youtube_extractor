@@ -1,4 +1,4 @@
-﻿"""RTK checks for Video OCR Full FPS mode selector (native/2fps/1fps)."""
+"""RTK checks for Video OCR Full FPS mode selector."""
 
 from pathlib import Path
 
@@ -13,8 +13,12 @@ def _read(rel: str) -> str:
 def test_video_ocr_full_tab_has_fps_selector_default_2():
     txt = _read("app_tabs/video_ocr_tab.py")
     assert 'st.session_state.setdefault("video_ocr_full_target_fps", "2")' in txt
-    assert '_fps_options = ["2", "1", "max"]' in txt
-    assert '_fps_labels = {"2": "2 fps (Standard)", "1": "1 fps", "max": "max (native fps)"}' in txt
+    assert '_fps_options = ["10", "5", "2", "1", "max"]' in txt
+    assert '"10": "10 fps"' in txt
+    assert '"5": "5 fps"' in txt
+    assert '"2": "2 fps (Standard)"' in txt
+    assert '"1": "1 fps"' in txt
+    assert '"max": "max (native fps)"' in txt
     assert 'fps_mode = st.selectbox(' in txt
     assert 'key="video_ocr_full_target_fps"' in txt
 

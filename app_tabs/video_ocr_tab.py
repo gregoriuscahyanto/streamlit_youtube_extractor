@@ -12,6 +12,7 @@ def render(ns):
     st.session_state.setdefault("video_ocr_full_progress", {})
     st.session_state.setdefault("video_ocr_full_live_rows", [])
     st.session_state.setdefault("video_ocr_full_target_fps", "2")
+    st.session_state.setdefault("video_ocr_full_resume_enabled", True)
     st.session_state.setdefault("ocr_scope_charts", [
         {"title": "Diagramm 1", "x_col": "time_s", "y_cols": [], "plot_type": "line"},
     ])
@@ -183,8 +184,14 @@ def render(ns):
 
     running = _is_running()
 
-    _fps_options = ["2", "1", "max"]
-    _fps_labels = {"2": "2 fps (Standard)", "1": "1 fps", "max": "max (native fps)"}
+    _fps_options = ["10", "5", "2", "1", "max"]
+    _fps_labels = {
+        "10": "10 fps",
+        "5": "5 fps",
+        "2": "2 fps (Standard)",
+        "1": "1 fps",
+        "max": "max (native fps)",
+    }
     _fps_cur = str(st.session_state.get("video_ocr_full_target_fps", "2") or "2")
     if _fps_cur not in _fps_options:
         _fps_cur = "2"
@@ -195,6 +202,12 @@ def render(ns):
         format_func=lambda v: _fps_labels.get(v, v),
         disabled=running or wd_ocr_active,
         key="video_ocr_full_target_fps",
+    )
+    resume_enabled = st.checkbox(
+        "Resume vorhandenen Zwischenstand fortsetzen",
+        key="video_ocr_full_resume_enabled",
+        disabled=running or wd_ocr_active,
+        help="Wenn ein partieller OCR-Lauf in der Ergebnis-JSON vorhanden ist, wird ab dem letzten gespeicherten Frame weitergemacht.",
     )
 
     can_run = bool(ocr_rois) and bool(capture_folder) and (full_video is not None) and not wd_ocr_active
@@ -220,6 +233,7 @@ def render(ns):
         capture_folder_snapshot = str(capture_folder or "").strip()
         full_video_snapshot = str(full_video) if full_video is not None else ""
         target_fps_snapshot = str(fps_mode or "2").strip() or "2"
+        resume_enabled_snapshot = bool(resume_enabled)
         # Snapshot all session state needed by the background thread — session state
         # is not accessible from non-Streamlit threads, so capture here in the main thread.
         track_params_snapshot = {
@@ -272,6 +286,7 @@ def render(ns):
                 capture_folder_override=capture_folder_snapshot,
                 video_path_override=full_video_snapshot,
                 target_fps_str=target_fps_snapshot,
+                resume_enabled=resume_enabled_snapshot,
                 track_params_override=track_params_snapshot,
             )
             return {"ok": bool(ok), "msg": str(msg or ""), "res": res}

@@ -14,9 +14,9 @@ def test_video_ocr_tab_shows_watchdog_live_progress_and_values():
     txt = _read("app_tabs/video_ocr_tab.py")
     assert "def _watchdog_live_ocr_for_folder(folder: str, wd_cur: str)" in txt
     assert 'st.info(' in txt and 'Watchdog läuft automatisiert' in txt
-    assert 'Watchdog OCR-Live:' in txt
-    assert 'if wd_ocr_active and capture_folder:' in txt
-    assert 'wd_prog, wd_rows, wd_json = _watchdog_live_ocr_for_folder(capture_folder, wd_current)' in txt
-    assert 'live_rows = wd_rows if wd_rows else live_rows' in txt
-    assert 'if running or _is_running() or wd_ocr_active:' in txt
-    assert 'st.dataframe(pd.DataFrame(live_rows)' in txt
+    assert 'elif wd_ocr_running:' in txt
+    assert '_wd_live_folder_hint = str((wd_snap.get("ocr_live") or {}).get("folder") or "")' in txt
+    assert 'if _wd_ocr:' in txt
+    assert '_live = dict(_snap.get("ocr_live") or {})' in txt
+    assert '_wd_rows = list(_live.get("rows") or [])' in txt
+    assert '_df = pd.DataFrame(_rows)' in txt

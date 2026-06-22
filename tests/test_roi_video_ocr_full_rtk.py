@@ -25,8 +25,9 @@ def test_app_has_full_video_ocr_runner():
     assert "cap.read()" in txt
     assert '"table"' in txt and '"cleaned"' in txt
     assert 'def _save_ocr_progress(partial: bool) -> tuple[bool, str]:' in txt
-    assert '_save_fields_to_local_json({"ocr": ocr_doc_local}, cf_local, base_rr=rr_doc_local)' in txt
-    assert 'progress_cb(done_native, frame_count, t_s, dict(live_snapshot))' in txt
+    assert '_save_fields_to_local_json(' in txt
+    assert '{"ocr": ocr_doc_local}, cf_local, base_rr=None, json_path_override=_jp_str' in txt
+    assert 'progress_cb(done_native, total_native, t_s, dict(live_snapshot))' in txt
     assert 'frame_step = max(1, int(round(fps / target_fps)))' in txt
     assert 'for _ in range(max(0, frame_step - 1)):' in txt
     assert '"track_minimap_x"' in txt
@@ -45,10 +46,10 @@ def test_video_ocr_full_tab_has_run_button_and_roi_guard():
     assert "if capture_folder and full_video is None:" in txt
     assert "video_ocr_full_running" in txt
     assert "Live-Progress (OCR-Werte je Update" in txt
-    assert "pd.DataFrame(live_rows)" in txt
+    assert "pd.DataFrame(_rows)" in txt
     assert "video_ocr_full_stop_event" in txt
     assert "video_ocr_full_stop_requested" in txt
-    assert "disabled=(not can_run) or running or stop_requested" in txt
+    assert "disabled=(not can_run) or running or stop_requested or wd_ocr_active" in txt
     assert "OCR-Stop angefordert" in txt
     assert "rois_snapshot = [dict(r) for r in list(st.session_state.get(\"rois\") or []) if isinstance(r, dict)]" in txt
     assert "capture_folder_override=capture_folder_snapshot" in txt

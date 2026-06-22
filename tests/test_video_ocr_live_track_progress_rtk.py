@@ -13,7 +13,7 @@ def _read(rel: str) -> str:
 def test_full_video_ocr_progress_updates_are_dense():
     txt = _read("app.py")
     assert 'video_ocr_live_progress_step_frames' in txt
-    assert 'processed <= 3 or processed % progress_step == 0 or done_native >= frame_count' in txt
+    assert 'processed <= 3 or processed % progress_step == 0 or done_native >= total_native' in txt
 
 
 def test_full_video_ocr_track_columns_are_always_present_in_live_snapshot():

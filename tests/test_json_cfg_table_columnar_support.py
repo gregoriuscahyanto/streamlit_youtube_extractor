@@ -92,3 +92,22 @@ def test_recordresult_json_to_cfg_accepts_string_roi_and_audio_params_fallback()
     assert ac.get("gear_ratios") == [3.56, 2.53, 1.68]
     assert ac.get("use_ocr_v") is True
     assert ac.get("audio_offset_s") == 0.4
+
+
+def test_recordresult_json_to_cfg_accepts_flat_single_roi_table():
+    fn = _load_fn("_recordresult_json_to_cfg")
+    doc = {
+        "recordResult": {
+            "ocr": {
+                "params": {"start_s": 0.0, "end_s": 105.0},
+                "roi_table": ["v_Fzg_kmph", [1323.0, 794.0, 855.0, 388.0], "integer", 1.2],
+            }
+        }
+    }
+    cfg = fn(doc, vid_duration=105.0)
+    assert len(cfg["rois"]) == 1
+    roi = cfg["rois"][0]
+    assert roi["name"] == "v_Fzg_kmph"
+    assert roi["x"] == 1323.0
+    assert roi["h"] == 388.0
+    assert roi["fmt"] == "integer"

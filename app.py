@@ -1,4 +1,4 @@
-﻿"""
+"""
 OCR Extractor - Streamlit App v4
 Tab 1: Cloudflare R2-Verbindung, Prefix waehlen, Datei-Browser
 Tab 2: Video laden, Start/Ende, ROI-Auswahl
@@ -877,6 +877,13 @@ def _find_local_fullfps_video(folder: str) -> Path | None:
         if "_1fps" in p.name.lower():
             continue
         candidates_by_ext[p.suffix.lower()].append(p)
+    corrected_cands = [
+        p for cands in candidates_by_ext.values()
+        for p in cands
+        if "_gopro_corrected_2fps" in p.name.lower()
+    ]
+    if corrected_cands:
+        return max(corrected_cands, key=lambda x: x.stat().st_mtime)
     for ext in [".avi", ".mp4", ".mov", ".mkv"]:
         cands = candidates_by_ext.get(ext) or []
         if cands:
@@ -1527,8 +1534,6 @@ def _run_video_ocr_full_now() -> tuple[bool, str, dict]:
         return False, f"OCR-Zeitfenster zu gross ({n} Frames). Bitte Zeitfenster verkuerzen.", {}
     times: list[float] = [float(start_s + i * step) for i in range(max(1, n))]
 
-    raw_rows: list[dict] = []
-    clean_rows: list[dict] = []
     roi_stats: dict[str, dict] = {}
     for _idx in indices:
         nm = str(st.session_state.rois[_idx].get("name", f"roi_{_idx}") or f"roi_{_idx}")
@@ -1608,6 +1613,7 @@ def _run_video_ocr_fullvideo_framewise_now(
     capture_folder_override: str = "",
     video_path_override: str = "",
     target_fps_str: str = "2",
+    resume_enabled: bool = True,
     track_params_override: dict | None = None,
 ) -> tuple[bool, str, dict]:
     """Run OCR frame-by-frame on the full local video (not framepack/lite)."""
@@ -1696,7 +1702,6 @@ def _run_video_ocr_fullvideo_framewise_now(
     frames_in_range = max(1, _end_frame - _start_frame)
 
     processed_target = max(1, int(math.ceil(frames_in_range / max(1, frame_step))))
-    checkpoint_every = max(1, processed_target // 10)
 
     raw_rows: list[dict] = []
     clean_rows: list[dict] = []
@@ -1770,26 +1775,104 @@ def _run_video_ocr_fullvideo_framewise_now(
 
     progress_step = int(_tpo.get("progress_step_frames") or st.session_state.get("video_ocr_live_progress_step_frames") or 2)
     progress_step = max(1, progress_step)
+    checkpoint_interval_s = float(_tpo.get("checkpoint_interval_s") or st.session_state.get("video_ocr_full_checkpoint_interval_s") or 30.0)
+    if (not np.isfinite(checkpoint_interval_s)) or checkpoint_interval_s <= 0:
+        checkpoint_interval_s = 30.0
 
-    # Seek to start_s boundary
-    if _start_frame > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, _start_frame)
+    track_cols = []
+    if track_roi is not None:
+        track_cols = ["track_minimap_x", "track_minimap_y", "track_xy_x", "track_xy_y", "track_pct", "track_minimap_found"]
+
+    def _json_path_for_capture() -> Path | None:
+        cf_local = str(capture_folder or "").strip()
+        safe_cf_local = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in cf_local).strip("._") or "output"
+        json_name_local = f"results_{safe_cf_local}.json"
+        _rd = str(_tpo.get("results_dir") or "").strip()
+        return (Path(_rd) / json_name_local) if _rd else None
+
+    def _columnar_to_rows(tbl) -> list[dict]:
+        if not isinstance(tbl, dict) or not tbl:
+            return []
+        keys = [k for k, v in tbl.items() if isinstance(v, list)]
+        if not keys:
+            return []
+        n_rows = max((len(tbl.get(k) or []) for k in keys), default=0)
+        rows_local: list[dict] = []
+        for i in range(n_rows):
+            row = {}
+            for k in keys:
+                vals = tbl.get(k)
+                if isinstance(vals, list) and i < len(vals):
+                    row[k] = vals[i]
+            if row:
+                rows_local.append(row)
+        return rows_local
+
+    def _load_resume_rows() -> tuple[list[dict], list[dict], bool]:
+        if not bool(resume_enabled):
+            return [], [], False
+        json_path_local = _json_path_for_capture()
+        if json_path_local is None or (not json_path_local.exists()):
+            return [], [], False
+        try:
+            _edoc = json.loads(json_path_local.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return [], [], False
+        _err = _edoc.get("recordResult", {}) if isinstance(_edoc, dict) else {}
+        existing_ocr = _err.get("ocr", {}) if isinstance(_err, dict) and isinstance(_err.get("ocr"), dict) else {}
+        _params = existing_ocr.get("params") if isinstance(existing_ocr.get("params"), dict) else {}
+        if not bool(_params.get("partial")):
+            return [], [], False
+        existing_mode = str(existing_ocr.get("fps_mode") or "").strip().lower()
+        if existing_mode and existing_mode != fps_mode:
+            return [], [], False
+        existing_step = int(existing_ocr.get("frame_step") or 0)
+        if existing_step > 0 and existing_step != int(max(1, frame_step)):
+            return [], [], False
+        raw_existing = existing_ocr.get("table")
+        clean_existing = existing_ocr.get("cleaned")
+        if isinstance(raw_existing, dict):
+            raw_existing = _columnar_to_rows(raw_existing)
+        if isinstance(clean_existing, dict):
+            clean_existing = _columnar_to_rows(clean_existing)
+        if not isinstance(raw_existing, list) or not isinstance(clean_existing, list):
+            return [], [], False
+        if len(raw_existing) != len(clean_existing) or not raw_existing:
+            return [], [], False
+        expected_cols = {"time_s", "frame_idx"}
+        expected_cols.update(str((rois_active[_idx] or {}).get("name", f"roi_{_idx}") or f"roi_{_idx}") for _idx in indices)
+        expected_cols.update(track_cols)
+        for row in raw_existing:
+            if not isinstance(row, dict) or any(col not in row for col in expected_cols):
+                return [], [], False
+        for row in clean_existing:
+            if not isinstance(row, dict) or any(col not in row for col in expected_cols):
+                return [], [], False
+        return list(raw_existing), list(clean_existing), True
+
+    raw_rows, clean_rows, resumed = _load_resume_rows()
+    resume_frame_idx = _start_frame
+    if resumed:
+        try:
+            last_frame_idx = int(float((raw_rows[-1] or {}).get("frame_idx", _start_frame)))
+            resume_frame_idx = max(_start_frame, last_frame_idx + max(1, frame_step))
+        except Exception:
+            raw_rows, clean_rows, resumed = [], [], False
+            resume_frame_idx = _start_frame
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, resume_frame_idx)
 
     processed = 0
-    frame_idx_native = _start_frame
+    frame_idx_native = resume_frame_idx
     cancelled = False
     save_error = ""
+    next_checkpoint_at = time.perf_counter() + checkpoint_interval_s
 
     def _save_ocr_progress(partial: bool) -> tuple[bool, str]:
         # Do NOT call build_result_json() here — st.session_state is inaccessible from
         # background threads. Read the existing JSON file directly for the ocr baseline.
         cf_local = str(capture_folder or "").strip()
-        safe_cf_local = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in cf_local).strip("._") or "output"
-        json_name_local = f"results_{safe_cf_local}.json"
-        # Use results_dir snapshotted in the main thread before this background thread
-        # was launched (via track_params_override["results_dir"]).
-        _rd = str(_tpo.get("results_dir") or "").strip()
-        json_path_local = (Path(_rd) / json_name_local) if _rd else None
+        json_path_local = _json_path_for_capture()
 
         existing_ocr: dict = {}
         if json_path_local and json_path_local.exists():
@@ -1810,7 +1893,7 @@ def _run_video_ocr_fullvideo_framewise_now(
         ocr_doc_local["fps_mode"] = str(fps_mode)
         _params = ocr_doc_local.get("params") if isinstance(ocr_doc_local.get("params"), dict) else {}
         _params["start_s"] = float(_start_s)
-        _params["end_s"] = float(raw_rows[-1]["time_s"]) if raw_rows else float(_start_s)
+        _params["end_s"] = float(_end_s)
         if partial:
             _params["partial"] = True
         else:
@@ -1830,6 +1913,9 @@ def _run_video_ocr_fullvideo_framewise_now(
             if callable(stop_cb):
                 try:
                     if bool(stop_cb()):
+                        _ok_stop, _msg_stop = _save_ocr_progress(partial=True)
+                        if not _ok_stop:
+                            save_error = str(_msg_stop)
                         cancelled = True
                         break
                 except Exception:
@@ -1929,12 +2015,13 @@ def _run_video_ocr_fullvideo_framewise_now(
                 else:
                     break
             frame_idx_native += 1 + skipped
-            if processed % checkpoint_every == 0:
+            if time.perf_counter() >= next_checkpoint_at:
                 _ok_ckpt, _msg_ckpt = _save_ocr_progress(partial=True)
                 if not _ok_ckpt:
                     save_error = str(_msg_ckpt)
                     cancelled = True
                     break
+                next_checkpoint_at = time.perf_counter() + checkpoint_interval_s
     finally:
         cap.release()
 
@@ -1980,6 +2067,7 @@ def _run_video_ocr_fullvideo_framewise_now(
         "capture_folder": str(capture_folder),
         "cancelled": bool(cancelled),
         "partial": bool(cancelled),
+        "resumed": bool(resumed),
         "json_key": _r2_json_sidecar_key(mat_key),
         "roi_stats": roi_stats,
     }
@@ -1990,9 +2078,11 @@ def _run_video_ocr_fullvideo_framewise_now(
     except Exception:
         pass
     msg = (
-        f"OCR vollstaendig ausgewertet (Full Video): {len(clean_rows)} Zeilen gespeichert."
+        (f"OCR fortgesetzt und vollstaendig ausgewertet (Full Video): {len(clean_rows)} Zeilen gespeichert."
+         if resumed else f"OCR vollstaendig ausgewertet (Full Video): {len(clean_rows)} Zeilen gespeichert.")
         if not cancelled
-        else f"OCR abgebrochen: {len(clean_rows)} Zeilen bis Abbruch gespeichert."
+        else (f"OCR fortgesetzt und abgebrochen: {len(clean_rows)} Zeilen bis Abbruch gespeichert."
+              if resumed else f"OCR abgebrochen: {len(clean_rows)} Zeilen bis Abbruch gespeichert.")
     )
     return True, msg, out
 
@@ -5485,6 +5575,9 @@ def _recordresult_json_to_cfg(doc: dict, vid_duration: float = 0.0) -> dict:
     )
     def _table_rows(tbl) -> list[dict]:
         if isinstance(tbl, list):
+            flat_row = _flat_roi_row_from_list(tbl)
+            if flat_row is not None:
+                return [flat_row]
             return [r for r in tbl if isinstance(r, dict)]
         if isinstance(tbl, dict):
             cols = {str(k): v for k, v in tbl.items() if isinstance(v, list)}
@@ -5499,6 +5592,22 @@ def _recordresult_json_to_cfg(doc: dict, vid_duration: float = 0.0) -> dict:
                 rows.append(row)
             return rows
         return []
+
+    def _flat_roi_row_from_list(v) -> dict | None:
+        if not isinstance(v, list) or len(v) < 2:
+            return None
+        if isinstance(v[0], dict):
+            return None
+        rv = _parse_roi_value(v[1])
+        rv = list(rv or [])
+        if len(rv) < 4:
+            return None
+        return {
+            "name_roi": str(v[0] or "_"),
+            "roi": rv[:4],
+            "fmt": str(v[2] if len(v) > 2 and v[2] is not None else "any"),
+            "max_scale": float(v[3] if len(v) > 3 and v[3] is not None else 1.2),
+        }
 
     roi_table = ocr.get("roi_table")
     for row in _table_rows(roi_table):
@@ -5758,9 +5867,10 @@ def _audio_load_current_capture() -> tuple[bool, str, int, np.ndarray, str]:
     # 2. Local full-fps video (extract audio track via ffmpeg)
     fp_video = _find_local_fullfps_video(folder)
     if fp_video is not None:
+        source_kind = "video"
         result = _read_via_ffmpeg(fp_video, "Lokales Vollvideo")
         if result[0]:
-            return result[0], result[1], result[2], result[3], f"local-video:{fp_video.name}"
+            return result[0], result[1], result[2], result[3], f"local-{source_kind}:{fp_video.name}"
 
     # 3. Cloud proxy as last resort
     if st.session_state.get("r2_connected") and st.session_state.get("r2_client") is not None:
@@ -5834,6 +5944,240 @@ def _audio_candidate_nfft_overlap(nfft: int, overlap_pct: float, mode: str, fs: 
                     keep.append((nf, ov))
         combos = keep[:40] or combos[:40]
     return combos or [(min(nfft, seg_len), overlap_pct)]
+
+
+def _audio_gear_band_freq_bonus(t_audio, freqs_hz, conv, gear_band_cfg):
+    t = np.asarray(t_audio, dtype=float).ravel()
+    f = np.asarray(freqs_hz, dtype=float).ravel()
+    bonus = np.zeros((f.size, t.size), dtype=np.float32)
+    meta = {"active": False, "valid_points": 0, "coverage_pct": 0.0}
+    if t.size == 0 or f.size == 0 or not isinstance(gear_band_cfg, dict):
+        return bonus, meta
+    gear_ratios = list(gear_band_cfg.get("gear_ratios") or [])
+    if not gear_ratios:
+        return bonus, meta
+    try:
+        t_ocr = np.asarray(gear_band_cfg.get("t_ocr") or [], dtype=float).ravel()
+        v_ocr = np.asarray(gear_band_cfg.get("v_kmph_ocr") or [], dtype=float).ravel()
+        if t_ocr.size < 2 or v_ocr.size < 2:
+            return bonus, meta
+        valid_pairs = np.isfinite(t_ocr) & np.isfinite(v_ocr)
+        if int(valid_pairs.sum()) < 2:
+            return bonus, meta
+        t_ocr = t_ocr[valid_pairs]
+        v_ocr = v_ocr[valid_pairs]
+        order = np.argsort(t_ocr)
+        t_ocr = t_ocr[order]
+        v_ocr = v_ocr[order]
+        axle_ratio = float(gear_band_cfg.get("axle_ratio", 3.15) or 3.15)
+        r_dyn = float(gear_band_cfg.get("r_dyn", 0.35) or 0.35)
+        rpm_min = float(gear_band_cfg.get("rpm_min", 500.0) or 500.0)
+        rpm_max = float(gear_band_cfg.get("rpm_max", 8000.0) or 8000.0)
+        band_tol_pct = float(gear_band_cfg.get("band_tol_pct", 5.0) or 5.0)
+        center_weight = float(gear_band_cfg.get("band_center_weight", 0.65) or 0.65)
+        higher_gear_bias = float(gear_band_cfg.get("higher_gear_bias", 0.08) or 0.08)
+        conv = float(max(conv, 1e-9))
+        v_interp = np.interp(t, t_ocr, v_ocr)
+        in_range = (t >= t_ocr[0]) & (t <= t_ocr[-1]) & np.isfinite(v_interp)
+        valid = in_range & (v_interp > 0.5)
+        if not valid.any():
+            return bonus, meta
+        tol_frac = band_tol_pct / 100.0
+        denom = 2.0 * math.pi * max(r_dyn, 0.001)
+        rpm_grid = (f[:, None] * 60.0 / conv).astype(np.float32, copy=False)
+        n_gears = max(1, len(gear_ratios))
+        for gi, g_ratio in enumerate(gear_ratios):
+            rpm_c = (v_interp / 3.6) / denom * axle_ratio * float(g_ratio) * 60.0
+            rpm_lo = np.clip(rpm_c * (1.0 - tol_frac), rpm_min, rpm_max)
+            rpm_hi = np.clip(rpm_c * (1.0 + tol_frac), rpm_min, rpm_max)
+            f_lo = (rpm_lo / 60.0) * conv
+            f_hi = (rpm_hi / 60.0) * conv
+            inside = (f[:, None] >= f_lo[None, :]) & (f[:, None] <= f_hi[None, :]) & valid[None, :]
+            half_width = np.maximum((rpm_hi - rpm_lo) * 0.5, 1.0)
+            center_score = np.clip(1.0 - np.abs(rpm_grid - rpm_c[None, :]) / half_width[None, :], 0.0, 1.0)
+            gear_bias = higher_gear_bias * (float(gi) / max(1.0, float(n_gears - 1)))
+            weighted = inside.astype(np.float32) * (
+                (1.0 - center_weight) + center_weight * center_score.astype(np.float32) + gear_bias
+            )
+            bonus = np.maximum(bonus, weighted.astype(np.float32, copy=False))
+        coverage = bonus[:, valid].max(axis=0) if valid.any() else np.asarray([], dtype=np.float32)
+        meta = {
+            "active": bool(valid.any()),
+            "valid_points": int(valid.sum()),
+            "coverage_pct": float(100.0 * np.mean(coverage > 0.0)) if coverage.size else 0.0,
+        }
+        return bonus, meta
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return bonus, meta
+
+
+def _audio_motor_spectrum_contrast(score, kernel_bins: int = 9):
+    """Cheap local frequency whitening for motor-line extraction."""
+    arr = np.asarray(score, dtype=np.float32)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr
+    k = int(max(3, kernel_bins))
+    if k % 2 == 0:
+        k += 1
+    try:
+        from scipy import ndimage as _ndi
+        local = _ndi.median_filter(arr, size=(k, 1), mode="nearest")
+        return (arr - local).astype(np.float32, copy=False)
+    except Exception:
+        return arr
+
+
+def _audio_apply_gear_band_guidance(sb, fb, t_video, conv, gear_band_cfg):
+    sb_arr = np.asarray(sb, dtype=np.float32).copy()
+    meta = {"active": False, "strength": 0.0}
+    if sb_arr.size == 0 or not isinstance(gear_band_cfg, dict):
+        return sb_arr, meta
+    mode = str(gear_band_cfg.get("mode", "hard") or "hard").strip().lower()
+    try:
+        strength = float(gear_band_cfg.get("guide_strength", 0.35) or 0.35)
+    except Exception:
+        strength = 0.35
+    if (not np.isfinite(strength)) or strength <= 0:
+        return sb_arr, meta
+    bonus, bonus_meta = _audio_gear_band_freq_bonus(t_video, fb, conv, gear_band_cfg)
+    if bonus.shape != sb_arr.shape or not bool(bonus_meta.get("active")):
+        return sb_arr, meta
+    if mode == "hard":
+        floor = np.nanmedian(sb_arr, axis=0, keepdims=True).astype(np.float32, copy=False)
+        penalty = np.float32(np.nanmax(sb_arr) - np.nanmin(sb_arr) + 20.0)
+        masked = np.where(bonus > 0.0, sb_arr, floor - penalty)
+        meta = {
+            "active": True,
+            "strength": 1.0,
+            "mode": "hard",
+            "valid_points": int(bonus_meta.get("valid_points", 0) or 0),
+            "coverage_pct": float(bonus_meta.get("coverage_pct", 0.0) or 0.0),
+        }
+        return masked.astype(np.float32, copy=False), meta
+    col_floor = np.nanmedian(sb_arr, axis=0, keepdims=True)
+    col_amp = np.nanmax(sb_arr, axis=0, keepdims=True) - col_floor
+    col_amp = np.where(np.isfinite(col_amp), np.maximum(col_amp, 0.0), 0.0).astype(np.float32, copy=False)
+    guided = sb_arr + np.float32(strength) * col_amp * bonus
+    meta = {
+        "active": True,
+        "strength": float(strength),
+        "mode": "guide",
+        "valid_points": int(bonus_meta.get("valid_points", 0) or 0),
+        "coverage_pct": float(bonus_meta.get("coverage_pct", 0.0) or 0.0),
+    }
+    return guided, meta
+
+
+def _audio_gear_center_line_from_spectrum(freqs_hz, score, t_audio, conv, gear_band_cfg):
+    """Pick a smooth gear path from audio energy, then return the gear-center frequency."""
+    import numpy as _np
+
+    f = _np.asarray(freqs_hz, dtype=float).ravel()
+    s = _np.asarray(score, dtype=_np.float32)
+    t = _np.asarray(t_audio, dtype=float).ravel()
+    out = _np.full(t.size, _np.nan, dtype=float)
+    meta = {"active": False, "valid_points": 0, "gear_count": 0}
+    if s.ndim != 2 or f.size < 2 or t.size < 2 or not isinstance(gear_band_cfg, dict):
+        return out, meta
+    n = min(t.size, s.shape[1])
+    if n < 2:
+        return out[:n], meta
+    ratios = [float(g) for g in (gear_band_cfg.get("gear_ratios") or []) if float(g) > 0]
+    if not ratios:
+        return out[:n], meta
+    try:
+        from app_tabs.audio_sweep import compute_gear_bands
+
+        bands = compute_gear_bands(
+            t[:n],
+            gear_band_cfg["t_ocr"],
+            gear_band_cfg["v_kmph_ocr"],
+            ratios,
+            float(gear_band_cfg.get("axle_ratio", 3.15)),
+            float(gear_band_cfg.get("r_dyn", 0.35)),
+            float(gear_band_cfg.get("rpm_min", 500.0)),
+            float(gear_band_cfg.get("rpm_max", 8000.0)),
+            float(gear_band_cfg.get("band_tol_pct", 5.0)),
+        )
+        g_n = int(bands.shape[1])
+        if g_n <= 0:
+            return out[:n], meta
+        conv = float(max(conv, 1e-9))
+        centers_rpm = (bands[:, :, 0] + bands[:, :, 1]) * 0.5
+        centers_hz = centers_rpm * conv / 60.0
+        valid = (bands[:, :, 1] > 0) & _np.isfinite(centers_hz)
+        if int(valid.any(axis=1).sum()) < 2:
+            return out[:n], meta
+
+        energy = _np.full((n, g_n), -1e6, dtype=float)
+        df_hz = float(_np.nanmedian(_np.diff(f))) if f.size > 1 else 1.0
+        for i in range(n):
+            col = _np.asarray(s[:, i], dtype=float)
+            if not _np.isfinite(col).any():
+                continue
+            med = float(_np.nanmedian(col))
+            scale = float(_np.nanpercentile(col, 90) - _np.nanpercentile(col, 10))
+            scale = max(scale, 1e-3)
+            for gi in range(g_n):
+                if not valid[i, gi]:
+                    continue
+                lo_hz = float(bands[i, gi, 0] * conv / 60.0)
+                hi_hz = float(bands[i, gi, 1] * conv / 60.0)
+                fc = float(centers_hz[i, gi])
+                if hi_hz < f[0] or lo_hz > f[-1]:
+                    continue
+                half_hz = max(2.0 * df_hz, 0.25 * max(hi_hz - lo_hz, df_hz))
+                near_center = (f >= fc - half_hz) & (f <= fc + half_hz)
+                in_band = (f >= lo_hz) & (f <= hi_hz)
+                peak_center = float(_np.nanmax(col[near_center])) if near_center.any() else float("-inf")
+                peak_wide = float(_np.nanmax(col[in_band])) if in_band.any() else float("-inf")
+                center = float(_np.interp(fc, f, col, left=_np.nan, right=_np.nan))
+                vals = [
+                    v for v in (
+                        center,
+                        peak_center,
+                        0.85 * peak_center + 0.15 * peak_wide,
+                    )
+                    if _np.isfinite(v)
+                ]
+                val = max(vals) if vals else float("nan")
+                if _np.isfinite(val):
+                    energy[i, gi] = (float(val) - med) / scale
+
+        if not (energy > -1e5).any():
+            return out[:n], meta
+        shift_pen = float(gear_band_cfg.get("gear_shift_penalty", 0.35) or 0.35)
+        high_bias = float(gear_band_cfg.get("higher_gear_bias", 0.08) or 0.08)
+        rank = _np.linspace(0.0, 1.0, g_n) if g_n > 1 else _np.zeros(1)
+        local = _np.where(energy > -1e5, energy + high_bias * rank[None, :], -1e6)
+        dp = _np.full((n, g_n), -1e9, dtype=float)
+        prev = _np.full((n, g_n), -1, dtype=_np.int32)
+        dp[0] = local[0]
+        for i in range(1, n):
+            trans = dp[i - 1][:, None] - shift_pen * _np.abs(_np.arange(g_n)[:, None] - _np.arange(g_n)[None, :])
+            best_prev = _np.argmax(trans, axis=0)
+            dp[i] = local[i] + trans[best_prev, _np.arange(g_n)]
+            prev[i] = best_prev.astype(_np.int32)
+            if _np.nanmax(dp[i]) < -5e8:
+                dp[i] = dp[i - 1]
+        path = _np.full(n, -1, dtype=_np.int32)
+        path[-1] = int(_np.argmax(dp[-1]))
+        for i in range(n - 1, 0, -1):
+            path[i - 1] = int(prev[i, path[i]]) if path[i] >= 0 and prev[i, path[i]] >= 0 else path[i]
+        ok = (path >= 0) & valid[_np.arange(n), _np.maximum(path, 0)]
+        out = _np.full(n, _np.nan, dtype=float)
+        out[ok] = centers_hz[_np.arange(n)[ok], path[ok]]
+        meta = {
+            "active": bool(ok.any()),
+            "valid_points": int(ok.sum()),
+            "gear_count": int(g_n),
+            "score": float(_np.nanmedian(energy[_np.arange(n)[ok], path[ok]])) if ok.any() else 0.0,
+        }
+        return out, meta
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return out[:n], meta
 
 
 def _audio_line_score(line, freqs, score, flo, fhi):
@@ -6434,6 +6778,7 @@ def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_
         debug_cb=dbg,
         method_params=params.get("method_params", {}),
         progress_cb=progress_cb,
+        gear_band_cfg=params.get("gear_band_cfg"),
     )
     _set_progress(1, 1, "Audioanalyse fertig. Ergebnis wird uebernommen.")
     _audio_live_update(live_job_id, status="done")
@@ -6444,7 +6789,7 @@ def _audio_background_worker(y, fs, source, params, ui, shared_log=None, shared_
     return res
 
 
-def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode="Fest auswählen", debug_cb=None, method_params=None, progress_cb=None):
+def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct, fmax, cyl, takt, order, rpm_min, rpm_max, method, cyl_mode, harmonic_mode, drive_type, stft_mode="Fest auswählen", debug_cb=None, method_params=None, progress_cb=None, gear_band_cfg=None):
     def dbg(msg):
         if callable(debug_cb):
             debug_cb(msg)
@@ -6488,6 +6833,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
     comb_harmonics = int(mp.get("comb_harmonics", 4) or 4)
     viterbi_jump_hz = float(mp.get("viterbi_jump_hz", 25.0) or 25.0)
     viterbi_penalty = float(mp.get("viterbi_penalty", 1.2) or 1.2)
+    gear_band_mode = str((gear_band_cfg or {}).get("mode", "hard") or "hard").strip().lower()
 
     for combo_idx, (nfft_req, ov_req) in enumerate(stft_candidates, 1):
         nfft_eff = int(max(64, min(int(nfft_req), len(seg))))
@@ -6510,6 +6856,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
         row = np.nanmedian(db, axis=1, keepdims=True).astype(np.float32, copy=False)
         col = np.nanmedian(db - row, axis=0, keepdims=True).astype(np.float32, copy=False)
         score = (db - row - col).astype(np.float32, copy=True)
+        score = _audio_motor_spectrum_contrast(score, int(mp.get("spectrum_contrast_bins", 9) or 9))
         t_video = tt.astype(np.float32) + np.float32(a0 / fs - float(offset_s))
 
         for ci in cyls:
@@ -6526,10 +6873,15 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                     continue
                 fb = np.asarray(freqs2[bm], dtype=np.float32).copy()
                 sb = np.asarray(score[bm, :], dtype=np.float32).copy()
+                _sb_eval, _gear_guidance_meta = _audio_apply_gear_band_guidance(sb, fb, t_video, conv, gear_band_cfg)
+                if gear_band_mode not in ("hard", "guide", "guide_and_clamp", "clamp_and_guide"):
+                    _sb_eval = sb
 
                 done_jobs += 1
                 job_txt = f"Job {done_jobs}/{total_jobs}: NFFT {nfft_eff}, OV {ov_eff:g}%, {'EV' if ci == 0 else 'C'+str(ci)}, H{h}, Band {flo:.1f}-{fhi:.1f} Hz"
                 dbg(job_txt)
+                if bool(_gear_guidance_meta.get("active")) and done_jobs <= 3:
+                    dbg(f"  Bandfuehrung aktiv: Strength {_gear_guidance_meta.get('strength', 0.0):.2f}, Abdeckung {_gear_guidance_meta.get('coverage_pct', 0.0):.1f}%")
                 prog(done_jobs - 1, total_jobs, job_txt)
                 _job_t0 = time.perf_counter()
 
@@ -6537,9 +6889,13 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                 fast_mode = bool(mp.get("fast_mode", True))
                 method_s = str(method)
                 # Schnelle Basismethoden: diese sind vektorisiert und reichen fuer die Vorauswahl meist aus.
-                method_lines["Original Peak"] = np.asarray(_audio_smooth(_audio_peak_line(fb, sb), 5), dtype=float).copy()
-                method_lines["STFT Ridge"] = _audio_greedy_ridge_line(fb, sb, flo, fhi, smooth_win=int(mp.get("ridge_smooth", 7) or 7), max_jump_frac=float(mp.get("ridge_jump_frac", 0.08) or 0.08))
-                method_lines["STFT Viterbi"] = _audio_viterbi_line(fb, sb, flo, fhi, smooth_win=int(mp.get("viterbi_smooth", 5) or 5), jump_hz=viterbi_jump_hz, penalty=viterbi_penalty)
+                method_lines["Original Peak"] = np.asarray(_audio_smooth(_audio_peak_line(fb, _sb_eval), 5), dtype=float).copy()
+                method_lines["STFT Ridge"] = _audio_greedy_ridge_line(fb, _sb_eval, flo, fhi, smooth_win=int(mp.get("ridge_smooth", 7) or 7), max_jump_frac=float(mp.get("ridge_jump_frac", 0.08) or 0.08))
+                method_lines["STFT Viterbi"] = _audio_viterbi_line(fb, _sb_eval, flo, fhi, smooth_win=int(mp.get("viterbi_smooth", 5) or 5), jump_hz=viterbi_jump_hz, penalty=viterbi_penalty)
+                if gear_band_mode in ("hard", "guide", "guide_and_clamp", "clamp_and_guide"):
+                    _gb_center_line, _gb_center_meta = _audio_gear_center_line_from_spectrum(fb, sb, t_video, conv, gear_band_cfg)
+                    if bool(_gb_center_meta.get("active")) and len(_gb_center_line) == sb.shape[1]:
+                        method_lines["Gear-Band Center"] = np.asarray(_gb_center_line, dtype=float).copy()
                 # Teure Methoden nur berechnen, wenn sie explizit gewaehlt sind oder Genau-Modus aktiv ist.
                 if (not fast_mode) or method_s == "Autokorrelation/YIN":
                     method_lines["Autokorrelation/YIN"] = _audio_autocorr_line(seg, fs, nfft_eff, noverlap, sb.shape[1], flo, fhi)
@@ -6560,7 +6916,9 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                 if (not fast_mode) or method_s == "Bandpass/Autokorr":
                     method_lines["Bandpass/Autokorr"] = _audio_bandpass_autocorr_line(seg, fs, nfft_eff, noverlap, sb.shape[1], flo, fhi)
 
-                scores = {name: _audio_line_score(line, freqs2, score, flo, fhi) for name, line in method_lines.items()}
+                scores = {name: _audio_line_score(line, fb, _sb_eval, flo, fhi) for name, line in method_lines.items()}
+                if "Gear-Band Center" in scores:
+                    scores["Gear-Band Center"] += float(mp.get("gear_center_score_bonus", 1.0 if gear_band_mode == "hard" else 0.25) or 0.0)
                 valid = [(name, line) for name, line in method_lines.items() if np.isfinite(scores.get(name, np.nan)) and scores.get(name, -1e12) > -1e11]
                 if valid:
                     # Hybrid = median of the best agreeing tracks, not just a renamed ridge.
@@ -6568,7 +6926,7 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
                     stack = np.vstack([np.asarray(v, dtype=float) for _, v in ranked])
                     hybrid = np.nanmedian(stack, axis=0)
                     method_lines["Hybrid"] = np.asarray(_audio_smooth(hybrid, int(mp.get("hybrid_smooth", 9) or 9)), dtype=float).copy()
-                    scores["Hybrid"] = _audio_line_score(method_lines["Hybrid"], freqs2, score, flo, fhi) + 0.4
+                    scores["Hybrid"] = _audio_line_score(method_lines["Hybrid"], fb, _sb_eval, flo, fhi) + 0.4
                 else:
                     method_lines["Hybrid"] = method_lines.get("STFT Ridge", np.full(sb.shape[1], np.nan))
                     scores["Hybrid"] = scores.get("STFT Ridge", -1e12)
@@ -6595,19 +6953,50 @@ def _audio_extract_rpm_robust(y, fs, start_s, end_s, offset_s, nfft, overlap_pct
 
     freqs = best['freqs']; db = best['db']; t_video = best['t']
     lines = {}
+    rpm_lines = {}
     for name, line in (best.get('all_lines') or {}).items():
-        lines[name] = np.asarray(line, dtype=float).copy()
-    for i, c in enumerate(sorted(all_candidates, key=lambda x: x.get('score', -1e12), reverse=True)[:10], 1):
-        lines[f"Kandidat {i}: {c['method']} {'EV' if c['cyl']==0 else 'C'+str(c['cyl'])} H{c['harmonic']} N{c['nfft']} O{c['overlap_pct']:g}"] = c['line']
+        _line_arr = np.asarray(line, dtype=float).copy()
+        lines[name] = _line_arr
+        rpm_lines[name] = np.asarray(_audio_smooth(_line_arr * 60 / max(best['conv'], 1e-9), 9), dtype=float).copy()
+    _max_ref_candidates = int(mp.get("max_reference_candidates", 120) or 120)
+    for i, c in enumerate(sorted(all_candidates, key=lambda x: x.get('score', -1e12), reverse=True)[:_max_ref_candidates], 1):
+        _cand_label = f"Kandidat {i}: {c['method']} {'EV' if c['cyl']==0 else 'C'+str(c['cyl'])} H{c['harmonic']} N{c['nfft']} O{c['overlap_pct']:g}"
+        _cand_line = np.asarray(c['line'], dtype=float).copy()
+        lines[_cand_label] = _cand_line
+        rpm_lines[_cand_label] = np.asarray(_audio_smooth(_cand_line * 60 / max(c['conv'], 1e-9), 9), dtype=float).copy()
 
     fsel = np.asarray(best['line'], dtype=float).copy()
     rpm = np.asarray(_audio_smooth(fsel * 60 / max(best['conv'], 1e-9), 9), dtype=float).copy()
     rpm[np.asarray((rpm < rpm_min * .5) | (rpm > rpm_max * 1.5), dtype=bool).copy()] = np.nan
+    gear_limit_meta = {"gear_band_constraint": False, "limited_points": 0, "valid_band_points": 0}
+    if isinstance(gear_band_cfg, dict) and gear_band_cfg.get("gear_ratios"):
+        try:
+            from app_tabs.audio_sweep import constrain_rpm_to_gear_bands
+            rpm, gear_limit_meta = constrain_rpm_to_gear_bands(t_video, rpm, gear_band_cfg)
+            valid_band_points = int(gear_limit_meta.get("valid_band_points", 0) or 0)
+            coverage_pct = 100.0 * valid_band_points / max(1, int(len(t_video)))
+            dbg(
+                "Gear-Band Constraint: "
+                f"active={bool(gear_limit_meta.get('gear_band_constraint'))}, "
+                f"mode={gear_band_cfg.get('mode', '')}, "
+                f"coverage={coverage_pct:.1f}%, "
+                f"limited={int(gear_limit_meta.get('limited_points', 0) or 0)}"
+            )
+        except Exception as exc:
+            gear_limit_meta = {
+                "gear_band_constraint": False,
+                "limited_points": 0,
+                "valid_band_points": 0,
+                "gear_band_constraint_error": str(exc),
+            }
+            dbg(f"Gear-Band Constraint inaktiv: {exc}")
 
     table = [{"Rang": i + 1, "Methode": c['method'], "Zyl": "EV" if c['cyl'] == 0 else c['cyl'], "Harmonik": c['harmonic'], "NFFT": c['nfft'], "Overlap_%": c['overlap_pct'], "Score": round(c['score'], 3), "Band_Hz": f"{c['f_lo']:.1f}-{c['f_hi']:.1f}"} for i, c in enumerate(sorted(all_candidates, key=lambda x: x.get('score', -1e12), reverse=True)[:50])]
     dbg(f"Auswahl: {best['method']} · {'EV' if best['cyl']==0 else 'C'+str(best['cyl'])} · H{best['harmonic']} · NFFT {best['nfft']} · OV {best['overlap_pct']:g}% · Score {best['score']:.3f}")
     prog(total_jobs, total_jobs, "Audioanalyse abgeschlossen")
-    return dict(fs=int(fs), t=t_video, freqs=freqs, db=db, audio_t=np.arange(a0, a1) / float(fs) - float(offset_s), audio_y=seg, freq_lines=lines, selected_method=selected_method, selected_freq=fsel, rpm=rpm, candidate_table=table, debug_lines=[], params=dict(start_s=start_s, end_s=end_s, audio_offset_s=offset_s, nfft=best['nfft'], nfft_requested=nfft, overlap_pct=best['overlap_pct'], overlap_requested=overlap_pct, stft_mode=stft_mode, fmax=fmax, cyl=best['cyl'], takt=takt, order=order_base, harmonic=best['harmonic'], drive_type=drive_type, f_search_lo=best['f_lo'], f_search_hi=best['f_hi'], conversion_factor=best['conv'], method_params=mp))
+    gear_band_active = bool(gear_limit_meta.get("gear_band_constraint"))
+    gear_valid_points = int(gear_limit_meta.get("valid_band_points", 0) or 0)
+    return dict(fs=int(fs), t=t_video, freqs=freqs, db=db, audio_t=np.arange(a0, a1) / float(fs) - float(offset_s), audio_y=seg, freq_lines=lines, rpm_lines=rpm_lines, selected_method=selected_method, selected_freq=fsel, rpm=rpm, candidate_table=table, debug_lines=[], params=dict(start_s=start_s, end_s=end_s, audio_offset_s=offset_s, nfft=best['nfft'], nfft_requested=nfft, overlap_pct=best['overlap_pct'], overlap_requested=overlap_pct, stft_mode=stft_mode, fmax=fmax, cyl=best['cyl'], takt=takt, order=order_base, harmonic=best['harmonic'], drive_type=drive_type, f_search_lo=best['f_lo'], f_search_hi=best['f_hi'], conversion_factor=best['conv'], method_params=mp, gear_band_cfg=gear_band_cfg if isinstance(gear_band_cfg, dict) else {}, gear_band_active=gear_band_active, gear_band_mode=str((gear_band_cfg or {}).get("mode", "")), gear_band_coverage_pct=float(100.0 * gear_valid_points / max(1, int(len(t_video)))), gear_band_limited_points=int(gear_limit_meta.get("limited_points", 0) or 0), gear_band_valid_points=gear_valid_points, gear_band_error=str(gear_limit_meta.get("gear_band_constraint_error", ""))))
 
 
 def _matlab_field_name(name: str, fallback: str = "field") -> str:

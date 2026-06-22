@@ -1,0 +1,1 @@
+streamlit run app.py --logger.level debug *> logs\run.log                   
