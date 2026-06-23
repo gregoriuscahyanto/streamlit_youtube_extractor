@@ -53,6 +53,7 @@ def _load_audio_helpers():
         "_audio_gear_center_line_from_spectrum",
         "_audio_gear_ridge_line_from_spectrum",
         "_audio_gear_ridge_viterbi_line_from_spectrum",
+        "_audio_gear_harmonic_center_line_from_spectrum",
     }
     nodes = [
         node
@@ -74,9 +75,12 @@ def test_audio_extractor_registers_gear_center_candidate():
     assert 'method_lines["Gear-Band Ridge"]' in txt
     assert "_audio_gear_ridge_viterbi_line_from_spectrum(fb, sb, t_video, conv, gear_band_cfg)" in txt
     assert 'method_lines["Gear-Band Ridge Viterbi"]' in txt
+    assert "_audio_gear_harmonic_center_line_from_spectrum(freqs2, score, t_video, conv, gear_band_cfg)" in txt
+    assert 'method_lines["Gear-Band Harmonic Center"]' in txt
     assert "gear_center_score_bonus" in txt
     assert "gear_ridge_score_bonus" in txt
     assert "gear_ridge_viterbi_score_bonus" in txt
+    assert "gear_harmonic_center_score_bonus" in txt
 
 
 def test_gear_center_candidate_follows_audio_energy_without_reference():
@@ -188,3 +192,41 @@ def test_gear_ridge_viterbi_rejects_alternating_spikes_without_reference():
     assert meta["active"] is True
     assert meta["valid_points"] == len(t)
     assert np.nanmedian(np.abs(line - target)) < 0.8
+
+
+def test_gear_harmonic_center_uses_harmonic_energy_for_gear_path_without_reference():
+    ns = _load_audio_helpers()
+    from app_tabs.audio_sweep import compute_gear_bands
+
+    t = np.linspace(0.0, 5.0, 6)
+    freqs = np.linspace(10.0, 260.0, 501)
+    cfg = {
+        "t_ocr": t.tolist(),
+        "v_kmph_ocr": [100.0] * len(t),
+        "gear_ratios": [2.0, 1.0],
+        "axle_ratio": 3.0,
+        "r_dyn": 0.35,
+        "rpm_min": 500.0,
+        "rpm_max": 8000.0,
+        "band_tol_pct": 20.0,
+        "gear_shift_penalty": 1.2,
+        "higher_gear_bias": 0.0,
+        "gear_harmonic_count": 3,
+    }
+    conv = 1.0
+    bands = compute_gear_bands(t, cfg["t_ocr"], cfg["v_kmph_ocr"], cfg["gear_ratios"], cfg["axle_ratio"], cfg["r_dyn"], cfg["rpm_min"], cfg["rpm_max"], cfg["band_tol_pct"])
+    centers_hz = ((bands[:, :, 0] + bands[:, :, 1]) * 0.5) * conv / 60.0
+    target = centers_hz[:, 1]
+
+    score = np.zeros((len(freqs), len(t)), dtype=np.float32)
+    for i, fc in enumerate(target):
+        for h, amp in ((1, 4.0), (2, 8.0), (3, 6.0)):
+            score[int(np.argmin(np.abs(freqs - fc * h))), i] = amp
+    for i, fc in enumerate(centers_hz[:, 0]):
+        score[int(np.argmin(np.abs(freqs - fc))), i] = 6.0
+
+    line, meta = ns["_audio_gear_harmonic_center_line_from_spectrum"](freqs, score, t, conv, cfg)
+
+    assert meta["active"] is True
+    assert meta["valid_points"] == len(t)
+    assert np.allclose(line, target)

@@ -25,7 +25,7 @@ def test_audio_sweep_has_band_precheck_and_auto_scale_helpers():
 
 def test_audio_score_is_within_dominant():
     txt = _read("app_tabs/audio_sweep.py")
-    assert "within_pct * 1.25" in txt
+    assert "within_pct * 1.55" in txt
     assert "smooth_penalty = 0.018 * excess_roughness_rpm + 0.08 * jump_rate_per_min" in txt
     assert "band_bonus = band_compliance_pct * max(0.0, float(band_weight)) / 100.0" in txt
 

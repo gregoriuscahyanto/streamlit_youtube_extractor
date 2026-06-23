@@ -49,3 +49,19 @@ def test_reference_validation_does_not_modify_candidate_preview():
     assert res["selected_candidate_line"] == "spiky"
     assert res["reference_guided_candidate"] is False
     assert res["plot_rpm"] == [float(v) for v in spiky]
+
+
+def test_reference_free_antispike_candidate_reduces_single_frame_spikes():
+    from app_tabs.audio_sweep import _reference_aware_candidate_pool, _reference_free_antispike_rpm
+
+    t = np.arange(11, dtype=float)
+    rpm = np.array([5200, 5250, 5300, 2500, 5350, 5400, 5450, 7800, 5500, 5550, 5600], dtype=float)
+
+    clean = _reference_free_antispike_rpm(t, rpm, window=5)
+    pool = _reference_aware_candidate_pool(t, rpm, {"rpm_lines": {"raw": rpm}})
+    names = [name for name, _line in pool]
+
+    assert "Anti-Spike: Extractor-Auswahl" in names
+    assert "Anti-Spike: raw" in names
+    assert abs(clean[3] - 5325.0) < abs(rpm[3] - 5325.0)
+    assert abs(clean[7] - 5475.0) < abs(rpm[7] - 5475.0)

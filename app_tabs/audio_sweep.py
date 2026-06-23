@@ -445,12 +445,12 @@ def score_agreement(t_audio, rpm_audio, t_ref, rpm_ref,
     band_bonus = band_compliance_pct * max(0.0, float(band_weight)) / 100.0
     smooth_penalty = 0.018 * excess_roughness_rpm + 0.08 * jump_rate_per_min
     combined = (
-        within_pct * 1.25
+        within_pct * 1.55
         + max(0.0, pearson_r) * 15.0
         + band_bonus
         + jump_in_band_pct * 0.03
         - 0.006 * mae
-        - 0.004 * rmse
+        - 0.0045 * rmse
         - smooth_penalty
     )
 
@@ -641,6 +641,120 @@ METHOD_OPTIONS = [
     "Cepstrum", "Harmonic Comb/HPS", "CWT/Wavelet", "Hybrid",
     "pYIN", "CQT/Constant-Q", "Harmonische Summe", "Bandpass/Autokorr",
 ]
+FMAX_VARIANTS = ["harmonic_3x"]
+
+
+def _fmax_candidates_for_combo(rpm_max: float, cyl: int, order: float, takt: int, fmax_headroom: float) -> list[tuple[str, float]]:
+    """Return physically motivated fmax variants for this engine/order combination."""
+    f_fund_max = _fundamental_hz(float(rpm_max), int(cyl), float(order), int(takt))
+    if f_fund_max < 10.0:
+        return []
+    raw = [
+        ("harmonic_3x", min(max(f_fund_max * float(fmax_headroom), f_fund_max * 3.0, 30.0), 5000.0)),
+    ]
+    out: list[tuple[str, float]] = []
+    seen: set[float] = set()
+    for name, val in raw:
+        fmax = float(round(float(val) / 10.0) * 10.0)
+        if fmax in seen:
+            continue
+        seen.add(fmax)
+        out.append((name, fmax))
+    return out
+
+
+def _fmax_for_variant(rpm_max: float, cyl: int, order: float, takt: int, fmax_headroom: float, variant: str) -> float:
+    candidates = _fmax_candidates_for_combo(rpm_max, cyl, order, takt, fmax_headroom)
+    if not candidates:
+        return float("nan")
+    by_name = {name: fmax for name, fmax in candidates}
+    return float(by_name.get(str(variant), candidates[-1][1]))
+
+
+def _balanced_optuna_startup_grid(
+    methods,
+    nffts,
+    overlaps,
+    orders,
+    cyls,
+    takts,
+    max_trials: int,
+) -> list[dict]:
+    """Create generic, deterministic startup trials without dataset-specific favorites."""
+    max_trials = int(max(0, max_trials))
+    if max_trials <= 0:
+        return []
+    dims = [
+        [str(v) for v in (methods or [])],
+        [int(v) for v in (nffts or [])],
+        [float(v) for v in (overlaps or [])],
+        [str(v) for v in (orders or [])],
+        [str(v) for v in (cyls or [])],
+        [str(v) for v in (takts or [])],
+        [str(v) for v in FMAX_VARIANTS],
+    ]
+    if any(len(d) == 0 for d in dims):
+        return []
+    full: list[dict] = []
+    for method in dims[0]:
+        for nfft in dims[1]:
+            for overlap in dims[2]:
+                for order in dims[3]:
+                    for cyl in dims[4]:
+                        for takt in dims[5]:
+                            for fmax_variant in dims[6]:
+                                full.append({
+                                    "method": method,
+                                    "nfft": nfft,
+                                    "overlap": overlap,
+                                    "order": order,
+                                    "cyl": cyl,
+                                    "takt": takt,
+                                    "fmax_variant": fmax_variant,
+                                })
+    if len(full) <= max_trials:
+        return full
+    out: list[dict] = []
+    used: set[tuple] = set()
+
+    def _key(row: dict) -> tuple:
+        return (
+            row["method"],
+            row["nfft"],
+            row["overlap"],
+            row["order"],
+            row["cyl"],
+            row["takt"],
+            row["fmax_variant"],
+        )
+
+    def _add(row: dict) -> bool:
+        if len(out) >= max_trials:
+            return False
+        key = _key(row)
+        if key in used:
+            return False
+        used.add(key)
+        out.append(row)
+        return True
+
+    fields = ["method", "nfft", "overlap", "order", "cyl", "takt", "fmax_variant"]
+    for field, values in zip(fields, dims):
+        for val in values:
+            for row in full:
+                if row[field] == val and _add(row):
+                    break
+            if len(out) >= max_trials:
+                return out
+
+    import random as _rnd
+    shuffled = full[:]
+    _rnd.Random(1729).shuffle(shuffled)
+    for row in shuffled:
+        _add(row)
+        if len(out) >= max_trials:
+            break
+    return out
 
 
 def build_param_grid(cfg: dict) -> list[dict]:
@@ -726,6 +840,7 @@ def build_param_grid(cfg: dict) -> list[dict]:
                                                             "nfft":             int(nfft),
                                                             "overlap_pct":      float(overlap),
                                                             "fmax":             float(fmax),
+                                                            "fmax_variant":     "harmonic_3x",
                                                             "cyl":              int(cyl),
                                                             "takt":             int(takt),
                                                             "order":            float(order),
@@ -941,6 +1056,75 @@ def _compact_plot_preview(t_audio, rpm_audio, max_points: int = 2500) -> dict:
     }
 
 
+def _rolling_nanmedian(values, window: int = 7):
+    """Small dependency-free rolling median for candidate cleanup."""
+    import numpy as np
+
+    x = np.asarray(values, dtype=float).ravel()
+    n = x.size
+    if n == 0:
+        return x.copy()
+    w = int(max(1, window))
+    if w <= 1:
+        return x.copy()
+    hw = w // 2
+    out = np.empty(n, dtype=float)
+    for i in range(n):
+        lo = max(0, i - hw)
+        hi = min(n, i + hw + 1)
+        vals = x[lo:hi]
+        vals = vals[np.isfinite(vals)]
+        out[i] = float(np.median(vals)) if vals.size else np.nan
+    return out
+
+
+def _reference_free_antispike_rpm(t_audio, rpm_line, window: int = 7):
+    """Create a reference-free anti-spike RPM candidate from one extracted trace."""
+    import numpy as np
+
+    t = np.asarray(t_audio, dtype=float).ravel()
+    r = np.asarray(rpm_line, dtype=float).ravel()
+    n = min(t.size, r.size)
+    if n < 5:
+        return r[:n].copy()
+    t = t[:n]
+    out = r[:n].copy()
+    finite = np.isfinite(out)
+    if int(finite.sum()) < 5:
+        return out
+    if not finite.all():
+        idx = np.where(finite)[0]
+        out[~finite] = np.interp(np.where(~finite)[0], idx, out[idx])
+
+    med = _rolling_nanmedian(out, window)
+    thresh = np.maximum(350.0, 0.11 * np.maximum(np.abs(med), 1000.0))
+    spike = np.isfinite(med) & (np.abs(out - med) > thresh)
+    out[spike] = med[spike]
+
+    dt = np.diff(t)
+    pos_dt = dt[np.isfinite(dt) & (dt > 1e-6)]
+    if pos_dt.size:
+        med_dt = float(np.median(pos_dt))
+    else:
+        med_dt = 0.25
+    # Allows real shifts, but rejects single-frame teleports.
+    max_slew = 5200.0
+    min_step = 450.0
+    for i in range(1, n):
+        dti = float(t[i] - t[i - 1]) if np.isfinite(t[i] - t[i - 1]) and t[i] > t[i - 1] else med_dt
+        step = max(min_step, max_slew * dti)
+        delta = out[i] - out[i - 1]
+        if np.isfinite(delta) and abs(delta) > step:
+            out[i] = out[i - 1] + np.sign(delta) * step
+    for i in range(n - 2, -1, -1):
+        dti = float(t[i + 1] - t[i]) if np.isfinite(t[i + 1] - t[i]) and t[i + 1] > t[i] else med_dt
+        step = max(min_step, max_slew * dti)
+        delta = out[i] - out[i + 1]
+        if np.isfinite(delta) and abs(delta) > step:
+            out[i] = out[i + 1] + np.sign(delta) * step
+    return _rolling_nanmedian(out, 3)
+
+
 def _reference_aware_candidate_pool(t_audio, rpm_audio, extra: dict | None) -> list[tuple[str, object]]:
     """Return baseline plus extractor-provided RPM candidate lines."""
     pool: list[tuple[str, object]] = [("Extractor-Auswahl", rpm_audio)]
@@ -948,6 +1132,14 @@ def _reference_aware_candidate_pool(t_audio, rpm_audio, extra: dict | None) -> l
     if isinstance(rpm_lines, dict):
         for name, rpm_line in rpm_lines.items():
             pool.append((str(name), rpm_line))
+    variants: list[tuple[str, object]] = []
+    for name, rpm_line in pool[:40]:
+        try:
+            clean = _reference_free_antispike_rpm(t_audio, rpm_line, window=7)
+            variants.append((f"Anti-Spike: {name}", clean))
+        except Exception:
+            continue
+    pool.extend(variants)
     return pool
 
 
@@ -1123,15 +1315,15 @@ def run_sweep_optuna(
         order   = float(trial.suggest_categorical("order", [str(o) for o in orders]))
         cyl     = int(trial.suggest_categorical("cyl",  cyls))
         takt    = int(trial.suggest_categorical("takt", takts))
+        fmax_variant = trial.suggest_categorical("fmax_variant", FMAX_VARIANTS)
 
-        f_fund_max = _fundamental_hz(rpm_max, cyl, order, takt)
-        if f_fund_max < 10.0:
+        fmax = _fmax_for_variant(rpm_max, cyl, order, takt, fmax_headroom, str(fmax_variant))
+        if not math.isfinite(fmax):
             raise optuna.exceptions.TrialPruned()
-        fmax = round(min(max(f_fund_max * fmax_headroom, f_fund_max * 3.0, 30.0), 5000.0) / 10) * 10
 
         params = {
             "method": method, "nfft": int(nfft), "overlap_pct": float(overlap),
-            "fmax": float(fmax), "cyl": cyl, "takt": takt, "order": order,
+            "fmax": float(fmax), "fmax_variant": str(fmax_variant), "cyl": cyl, "takt": takt, "order": order,
             "rpm_min": rpm_min, "rpm_max": rpm_max,
             "ridge_smooth": 7, "ridge_jump_frac": 0.08,
             "viterbi_jump_hz": 25.0, "viterbi_penalty": 1.2, "viterbi_smooth": 5,
@@ -1161,18 +1353,16 @@ def run_sweep_optuna(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42),
     )
-    startup_grid = []
-    for _m in methods:
-        for _ord in orders:
-            startup_grid.append({
-                "method": _m,
-                "nfft": int(nffts[min(len(nffts) // 2, len(nffts) - 1)]),
-                "overlap": float(overlaps[min(len(overlaps) // 2, len(overlaps) - 1)]),
-                "order": str(_ord),
-                "cyl": str(cyls[0]),
-                "takt": str(takts[0]),
-            })
-    for _params in startup_grid[:max(0, min(len(startup_grid), n_trials // 2))]:
+    startup_grid = _balanced_optuna_startup_grid(
+        methods,
+        nffts,
+        overlaps,
+        orders,
+        cyls,
+        takts,
+        max_trials=max(0, min(n_trials // 2, 64)),
+    )
+    for _params in startup_grid:
         study.enqueue_trial(_params)
     study.optimize(
         objective, n_trials=n_trials,
