@@ -329,9 +329,9 @@ def _add_wheel_dynamics(data: dict[str, list], cfg: dict) -> tuple[bool, list[st
     f_total = f_aero + f_roll + f_inertia + f_grade
     p_w = f_total * v_mps
 
-    data["s_m_from_v"] = _compute_s_m_from_speed(data) or []
-    if "s_m" not in data and data["s_m_from_v"]:
-        data["s_m"] = list(data["s_m_from_v"])
+    s_from_v = _compute_s_m_from_speed(data) or []
+    if s_from_v:
+        data["s_m"] = list(s_from_v)
     data["a_mps2"] = a_mps2.astype(float).tolist()
     data["wheel_force_n"] = f_total.astype(float).tolist()
     data["wheel_force_aero_n"] = f_aero.astype(float).tolist()
@@ -352,9 +352,7 @@ def _add_compare_derivatives(data: dict[str, list], cfg: dict) -> tuple[bool, li
     """Add distance and optional wheel-power derived columns to one loaded dataset."""
     s = _compute_s_m_from_speed(data)
     if s:
-        data["s_m_from_v"] = s
-        if "s_m" not in data:
-            data["s_m"] = list(s)
+        data["s_m"] = list(s)
     if not cfg.get("enable_wheel_dynamics"):
         return True, []
     return _add_wheel_dynamics(data, cfg)
@@ -587,16 +585,10 @@ def render(ns: dict) -> None:
         c4.caption(f"{f['offset_s']:+.3f}s / {f['offset_m']:+.0f}m")
 
     st.markdown("### Abgeleitete Verlaeufe")
-    with st.expander("Strecke, Radleistung und Raddrehmoment berechnen", expanded=False):
+    st.caption("s_m wird immer aus v_Fzg_kmph und time_s berechnet.")
+    with st.expander("Radleistung und Raddrehmoment", expanded=False):
         st.caption(
-            "s_m_from_v wird immer aus v_Fzg_kmph und time_s berechnet. "
-            "Radleistung/Raddrehmoment werden nur berechnet, wenn die Pflichtwerte vorhanden sind. "
             "Steigung wird aktuell mit 0 % angesetzt; spaeter kann sie ueber Strecke/GPS per Lookup ergaenzt werden."
-        )
-        _cmp_enable_wheel = st.checkbox(
-            "Radleistung und Raddrehmoment aus Fahrwiderstaenden berechnen",
-            value=bool(st.session_state.get("cmp_enable_wheel_dynamics", False)),
-            key="cmp_enable_wheel_dynamics",
         )
         _d1, _d2, _d3, _d4 = st.columns(4)
         _rho = _d1.text_input("Luftdichte rho [kg/m^3]", value=st.session_state.get("cmp_rho_txt", "1,225"), key="cmp_rho_txt")
@@ -608,9 +600,32 @@ def render(ns: dict) -> None:
         _cw = _r2.text_input("Luftwiderstandsbeiwert Cw (Pflicht)", value=st.session_state.get("cmp_cw_txt", ""), key="cmp_cw_txt")
         _area = _r3.text_input("Stirnflaeche A [m^2] (Pflicht)", value=st.session_state.get("cmp_area_txt", ""), key="cmp_area_txt")
         _rdyn = _r4.text_input("r dyn [m] fuer Drehmoment", value=st.session_state.get("cmp_rdyn_txt", ""), key="cmp_rdyn_txt")
-        st.caption("Hinweis: Fuer Raddrehmoment in Nm ist r dyn erforderlich. Ohne r dyn wird nur Radleistung berechnet.")
+        st.caption("Fuer Raddrehmoment in Nm ist r dyn erforderlich. Ohne r dyn wird nur Radleistung berechnet.")
+        _wheel_active = bool(st.session_state.get("cmp_enable_wheel_dynamics", False))
+        _wb1, _wb2 = st.columns([2, 1])
+        if _wb1.button(
+            "Berechnen" if not _wheel_active else "Aktiv — Parameter aendern und neu berechnen",
+            type="primary",
+            key="cmp_wheel_calc_btn",
+            width="stretch",
+        ):
+            st.session_state["cmp_enable_wheel_dynamics"] = True
+            st.rerun()
+        if _wheel_active and _wb2.button("Deaktivieren", key="cmp_wheel_reset_btn", width="stretch"):
+            st.session_state["cmp_enable_wheel_dynamics"] = False
+            st.rerun()
+
+    _cmp_enable_wheel = bool(st.session_state.get("cmp_enable_wheel_dynamics", False))
+    _rho  = st.session_state.get("cmp_rho_txt",    "1,225")
+    _g    = st.session_state.get("cmp_g_txt",      "9,81")
+    _crr  = st.session_state.get("cmp_crr_txt",    "0,01")
+    _lam  = st.session_state.get("cmp_lambda_txt", "1,00")
+    _mass = st.session_state.get("cmp_mass_txt",   "")
+    _cw   = st.session_state.get("cmp_cw_txt",     "")
+    _area = st.session_state.get("cmp_area_txt",   "")
+    _rdyn = st.session_state.get("cmp_rdyn_txt",   "")
     _cmp_deriv_cfg = {
-        "enable_wheel_dynamics": bool(_cmp_enable_wheel),
+        "enable_wheel_dynamics": _cmp_enable_wheel,
         "rho": _to_float_or_none(_rho),
         "g": _to_float_or_none(_g),
         "crr": _to_float_or_none(_crr),
@@ -719,8 +734,8 @@ def render(ns: dict) -> None:
 
             col_a, col_b, col_c = st.columns([2, 2, 2])
 
-            _type_opts = ["line", "scatter", "geoplot"]
-            _type_labels = {"line": "Linie", "scatter": "Punkte", "geoplot": "Geoplot"}
+            _type_opts = ["line", "scatter", "geoplot", "heatmap"]
+            _type_labels = {"line": "Linie", "scatter": "Punkte", "geoplot": "Geoplot", "heatmap": "Heatmap"}
             _cur_type = chart.get("plot_type", "line")
             if _cur_type not in _type_opts:
                 _cur_type = "line"
@@ -743,6 +758,45 @@ def render(ns: dict) -> None:
                 col_b.caption("X: `track_xy_x`  ·  Y: `track_xy_y`")
                 chart["x_col"] = "track_xy_x"
                 chart["y_col"] = "track_xy_y"
+            elif chart["plot_type"] == "heatmap":
+                x_opts = ["time_s"] + [c for c in all_cols if c != "time_s"]
+                x_def = chart.get("x_col", "time_s")
+                x_idx = x_opts.index(x_def) if x_def in x_opts else 0
+                chart["x_col"] = col_a.selectbox("X-Achse", options=x_opts, index=x_idx, key=f"cmp_cx_{ci}")
+                y_opts = [c for c in all_cols if c != chart["x_col"]]
+                y_def = chart.get("y_col", "")
+                y_idx = y_opts.index(y_def) if y_def in y_opts else 0
+                chart["y_col"] = (
+                    col_b.selectbox("Y-Achse", options=y_opts, index=y_idx if y_opts else 0, key=f"cmp_cy_{ci}")
+                    if y_opts else ""
+                )
+                # Heatmap-specific controls: bin sizes, Y limits
+                _hm1, _hm2, _hm3, _hm4 = st.columns([2, 2, 2, 1])
+                chart["x_step"] = float(_hm1.number_input(
+                    "Schrittweite X", min_value=0.01,
+                    value=float(chart.get("x_step") or 100.0),
+                    step=10.0, key=f"cmp_hm_xstep_{ci}",
+                ))
+                chart["y_step"] = float(_hm2.number_input(
+                    "Schrittweite Y", min_value=0.01,
+                    value=float(chart.get("y_step") or 50.0),
+                    step=5.0, key=f"cmp_hm_ystep_{ci}",
+                ))
+                _ymax_raw = float(chart.get("y_max") or 0.0)
+                _ymax_new = float(_hm3.number_input(
+                    "Y max (0 = auto)", min_value=0.0,
+                    value=_ymax_raw, step=100.0, key=f"cmp_hm_ymax_{ci}",
+                ))
+                chart["y_max"] = _ymax_new if _ymax_new > 0.0 else None
+                _ymin_zero = chart.get("y_min") == 0.0
+                if _hm4.button(
+                    "Y ≥ 0" if not _ymin_zero else "Y auto",
+                    key=f"cmp_hm_ymin_{ci}",
+                    help="Y-Achse unten auf 0 setzen / Begrenzung aufheben",
+                    width="stretch",
+                ):
+                    chart["y_min"] = 0.0 if not _ymin_zero else None
+                    st.rerun()
             else:
                 x_opts = ["time_s"] + [c for c in all_cols if c != "time_s"]
                 x_def = chart.get("x_col", "time_s")
@@ -761,6 +815,11 @@ def render(ns: dict) -> None:
             # Render this chart
             if chart["plot_type"] == "geoplot":
                 _render_geoplot_chart(chart, display_files, cmp_data, ci)
+            elif chart["plot_type"] == "heatmap":
+                if chart.get("y_col") and all_cols:
+                    _render_heatmap_chart(chart, display_files, cmp_data, ci)
+                else:
+                    st.caption("Y-Achse auswählen um die Heatmap anzuzeigen.")
             elif chart["y_col"] and all_cols:
                 _render_chart(chart, display_files, cmp_data, ci)
             else:
@@ -815,6 +874,55 @@ def _build_excel_bytes(traces: list[dict], x_col: str, y_col: str) -> bytes:
     return buf.getvalue()
 
 
+def _natural_t_col(col: str) -> str:
+    """Return the natural time-axis column for a given data column."""
+    return "audio_time_s" if str(col).startswith("audio_") else "time_s"
+
+
+def _align_xy(xs, ys, data: dict, x_col: str, y_col: str):
+    """Align xs and ys when they live on different time grids.
+
+    Returns (xs_out, ys_out) after interpolating y onto x's time axis,
+    or (None, None) when alignment is not possible.
+    """
+    import numpy as _np
+
+    if len(xs) == len(ys):
+        return xs, ys
+
+    x_t_col = _natural_t_col(x_col)
+    y_t_col = _natural_t_col(y_col)
+
+    # When x_col IS the time axis (e.g. "time_s"), x already equals x_t.
+    x_t = data.get(x_t_col) if x_t_col != x_col else xs
+    y_t = data.get(y_t_col) if y_t_col != y_col else ys
+
+    if not x_t or not y_t or len(x_t) != len(xs) or len(y_t) != len(ys):
+        return None, None
+
+    x_t_arr = _np.asarray(x_t, dtype=float)
+    y_t_arr = _np.asarray(y_t, dtype=float)
+    xs_arr  = _np.asarray(xs, dtype=float)
+    ys_arr  = _np.asarray(ys, dtype=float)
+
+    valid_y = _np.isfinite(y_t_arr) & _np.isfinite(ys_arr)
+    if valid_y.sum() < 2:
+        return None, None
+
+    # Use x's time range clipped to y's coverage
+    t_min = max(float(y_t_arr[valid_y].min()), float(x_t_arr[_np.isfinite(x_t_arr)].min()))
+    t_max = min(float(y_t_arr[valid_y].max()), float(x_t_arr[_np.isfinite(x_t_arr)].max()))
+    if t_min >= t_max:
+        return None, None
+
+    mask = (x_t_arr >= t_min) & (x_t_arr <= t_max) & _np.isfinite(x_t_arr)
+    xs_out = xs_arr[mask]
+    ys_out = _np.interp(x_t_arr[mask], y_t_arr[valid_y], ys_arr[valid_y])
+    if xs_out.size < 2:
+        return None, None
+    return xs_out.tolist(), ys_out.tolist()
+
+
 def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], chart_idx: int = 0) -> None:
     try:
         import plotly.graph_objects as go
@@ -828,6 +936,10 @@ def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], cha
             data = cmp_data.get(f["path"], {})
             xs = data.get(x_col)
             ys = data.get(y_col)
+            if not xs or not ys:
+                continue
+            if len(xs) != len(ys):
+                xs, ys = _align_xy(xs, ys, data, x_col, y_col)
             if not xs or not ys or len(xs) != len(ys):
                 continue
             fig.add_trace(go.Scatter(
@@ -1000,6 +1112,114 @@ def _render_geoplot_chart(chart: dict, files: list[dict], cmp_data: dict[str, di
         st.plotly_chart(fig, use_container_width=True, key=f"cmp_geo_{chart_idx}")
     except Exception as e:
         st.caption(f"Geoplot-Fehler: {e}")
+
+
+def _render_heatmap_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], chart_idx: int) -> None:
+    """Render a 2D density heatmap (Histogram2d) — one subplot per file."""
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        import numpy as np
+
+        x_col  = chart["x_col"]
+        y_col  = chart["y_col"]
+        x_step = max(1e-6, float(chart.get("x_step") or 100.0))
+        y_step = max(1e-6, float(chart.get("y_step") or 50.0))
+        y_min  = chart.get("y_min")
+        y_max  = chart.get("y_max")
+
+        file_data: list[dict] = []
+        for f in files:
+            data = cmp_data.get(f["path"], {})
+            xs = data.get(x_col)
+            ys = data.get(y_col)
+            if not xs or not ys:
+                continue
+            if len(xs) != len(ys):
+                xs, ys = _align_xy(xs, ys, data, x_col, y_col)
+            if not xs or not ys:
+                continue
+            xs_arr = np.asarray(xs, dtype=float)
+            ys_arr = np.asarray(ys, dtype=float)
+            mask = np.isfinite(xs_arr) & np.isfinite(ys_arr)
+            if y_min is not None:
+                mask &= ys_arr >= float(y_min)
+            if y_max is not None:
+                mask &= ys_arr <= float(y_max)
+            if mask.sum() < 2:
+                continue
+            file_data.append({"label": f["label"], "xs": xs_arr[mask], "ys": ys_arr[mask]})
+
+        if not file_data:
+            st.caption("Keine Daten fuer Heatmap in den ausgewaehlten Dateien vorhanden.")
+            return
+
+        n     = len(file_data)
+        ncols = min(n, 2)
+        nrows = (n + ncols - 1) // ncols
+
+        _light = bool(st.session_state.get("cmp_light_mode"))
+        _theme = "plotly_white" if _light else "plotly_dark"
+        _fc    = "black" if _light else "white"
+        _bg    = "white" if _light else "#0e1117"
+        _gc    = "rgba(0,0,0,0.12)" if _light else "rgba(255,255,255,0.08)"
+
+        fig = make_subplots(
+            rows=nrows, cols=ncols,
+            subplot_titles=[d["label"] for d in file_data],
+            horizontal_spacing=0.14,
+        )
+
+        _yrange = [
+            float(y_min) if y_min is not None else None,
+            float(y_max) if y_max is not None else None,
+        ]
+        _apply_yrange = any(v is not None for v in _yrange)
+
+        for i, d in enumerate(file_data):
+            row = i // ncols + 1
+            col = i % ncols + 1
+            fig.add_trace(
+                go.Histogram2d(
+                    x=d["xs"], y=d["ys"],
+                    xbins=dict(size=x_step),
+                    ybins=dict(size=y_step),
+                    colorscale="Viridis",
+                    showscale=(i == 0),
+                    colorbar=dict(
+                        title="Anzahl", thickness=14, x=1.02,
+                        tickfont=dict(color=_fc), title_font=dict(color=_fc),
+                    ),
+                    hovertemplate=(
+                        f"{x_col}: %{{x}}<br>{y_col}: %{{y}}<br>Anzahl: %{{z}}<extra></extra>"
+                    ),
+                ),
+                row=row, col=col,
+            )
+            _ax_kw = dict(
+                title_font=dict(color=_fc), tickfont=dict(color=_fc),
+                gridcolor=_gc, linecolor=_fc, zerolinecolor=_gc,
+            )
+            fig.update_xaxes(title_text=x_col, **_ax_kw, row=row, col=col)
+            fig.update_yaxes(title_text=y_col, **_ax_kw, row=row, col=col)
+            if _apply_yrange:
+                fig.update_yaxes(range=_yrange, row=row, col=col)
+
+        for ann in fig.layout.annotations:
+            ann.font.color = _fc
+
+        fig.update_layout(
+            title=dict(text=chart.get("title", ""), font_color=_fc),
+            height=370 * nrows,
+            template=_theme,
+            paper_bgcolor=_bg,
+            plot_bgcolor=_bg,
+            font=dict(color=_fc),
+            margin=dict(l=50, r=70, t=50, b=40),
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"cmp_heatmap_{chart_idx}")
+    except Exception as e:
+        st.caption(f"Heatmap-Fehler: {e}")
 
 
 def _render_config_section() -> None:
