@@ -41,6 +41,35 @@ def _result_json_path():
         return None
 
 
+def _write_audio_rpm_json_only(res: dict) -> tuple[bool, str]:
+    """Update recordResult.audio_rpm in the sidecar JSON without touching MAT."""
+    try:
+        jp = _result_json_path()
+        build_fn = globals().get("_build_audio_rpm_struct_from_result")
+        if jp is None or not callable(build_fn):
+            return False, ""
+        import json as _json
+        from app_tabs.plausibility_filter import _atomic_write
+
+        doc = _json.loads(jp.read_text(encoding="utf-8", errors="ignore"))
+        rr = doc.get("recordResult")
+        if not isinstance(rr, dict):
+            return False, ""
+        audio_rpm = build_fn(res)
+        norm_fn = globals().get("_normalize_sidecar_json_payload")
+        if callable(norm_fn):
+            audio_rpm = norm_fn(audio_rpm)
+        else:
+            from app_tabs.audio_sweep import _json_safe
+            audio_rpm = _json_safe(audio_rpm)
+        rr["audio_rpm"] = audio_rpm
+        doc["recordResult"] = rr
+        _atomic_write(jp, doc)
+        return True, str(jp)
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _apply_audio_config_to_state(cfg: dict) -> None:
     """Write saved audio config fields into session state so widgets pick them up."""
     _ss = {
@@ -656,6 +685,14 @@ def render(ns):
                     if isinstance(live_prog_done, dict) and live_prog_done:
                         st.session_state.audio_bg_progress = dict(live_prog_done)
                     st.session_state.audio_bg_progress_ref = None
+                    _json_ok, _json_msg = _write_audio_rpm_json_only(res_bg)
+                    if _json_ok:
+                        st.session_state.audio_rpm_json_autosaved = _json_msg
+                    elif _json_msg:
+                        st.session_state.audio_debug_lines = [
+                            *list(st.session_state.get("audio_debug_lines", []) or [])[-199:],
+                            f"Audio-RPM JSON Auto-Save fehlgeschlagen: {_json_msg}",
+                        ]
                     _audio_live_update(str(st.session_state.get("audio_bg_live_id", "")), progress=st.session_state.get("audio_bg_progress") or {}, status="done")
                     set_status("Audioanalyse abgeschlossen.", "ok")
                 except Exception as e:
@@ -780,12 +817,32 @@ def render(ns):
             st.caption("Noch kein Ergebnis vorhanden. Nach 'Audioanalyse starten' werden Spektrogramm, RPM-Plot und Exportoptionen hier befuellt.")
             st.dataframe(pd.DataFrame(columns=["Methode", "Score", "Hinweis"]), width="stretch", hide_index=True, height=120)
             st.button("Debug ZIP herunterladen", width="stretch", key="aud_debug_zip_ph", disabled=True)
-            st.button("Audioanalyse in MAT + JSON speichern", type="primary", width="stretch", key="aud_save_to_mat_ph", disabled=True)
+            st.button("Audioanalyse in JSON speichern", type="primary", width="stretch", key="aud_save_to_json_ph", disabled=True)
 
         if isinstance(res, dict) and res.get("t") is not None:
             p = res.get('params', {})
             zyl_txt = "EV" if p.get('cyl') == 0 else p.get('cyl')
             st.caption(f"Quelle: {res.get('source','')} · Methode: {res.get('selected_method','')} · Kandidat: {zyl_txt} Zyl / H{p.get('harmonic')} · Suchband: {p.get('f_search_lo',0):.1f}-{p.get('f_search_hi',0):.1f} Hz · NFFT: {p.get('nfft')} · Overlap: {p.get('overlap_pct')}%")
+            try:
+                from app_tabs.audio_sweep import audio_candidate_options_from_result, apply_audio_candidate_selection
+                _cand_opts = audio_candidate_options_from_result(res)
+                _cand_default = str(res.get("selected_candidate_line") or p.get("selected_candidate_line") or "Extractor-Auswahl")
+                if _cand_default not in _cand_opts:
+                    _cand_default = "Extractor-Auswahl"
+                if st.session_state.get("aud_standard_candidate_choice") not in _cand_opts:
+                    st.session_state["aud_standard_candidate_choice"] = _cand_default
+                _cand_choice = st.selectbox(
+                    "RPM-Kandidat auswaehlen",
+                    options=_cand_opts,
+                    key="aud_standard_candidate_choice",
+                    help="Referenzfreie Auswahl aus Extractor-Linien und Anti-Spike-Varianten; Referenz-RPM wird hier nicht verwendet.",
+                )
+                res = apply_audio_candidate_selection(res, _cand_choice)
+                st.session_state.audio_analysis_result_selected = res
+                if res.get("selected_candidate_line"):
+                    st.caption(f"Gewaehlter RPM-Kandidat: {res.get('selected_candidate_line')}")
+            except Exception as _cand_e:
+                st.caption(f"Kandidatenauswahl nicht verfuegbar: {_cand_e}")
             if res.get('candidate_table'):
                 with st.expander("Kandidatenbewertung", expanded=False):
                     st.dataframe(pd.DataFrame(res['candidate_table']), width="stretch", hide_index=True)
@@ -811,40 +868,19 @@ def render(ns):
             except Exception as e:
                 st.warning(f"Plots konnten nicht erstellt werden: {e}")
             st.download_button("Debug ZIP herunterladen", data=_audio_make_debug_zip(res, shown_lines=st.session_state.get('aud_lines_new', [])), file_name=f"audio_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", width="stretch", key="aud_debug_zip_new")
-            save_mat_disabled = not bool(st.session_state.get("mat_selected_key") or st.session_state.get("mat_pending_selected_key") or st.session_state.get("audio_last_mat_path"))
-            if st.button("Audioanalyse in MAT + JSON speichern", type="primary", width="stretch", key="aud_save_to_mat", disabled=save_mat_disabled):
-                with st.spinner("Audioanalyse wird in MAT gespeichert ..."):
-                    ok_aud_save, msg_aud_save = _save_audio_result_to_selected_mat(res)
+            save_json_disabled = not bool(_result_json_path())
+            if st.button("Audioanalyse in JSON speichern", type="primary", width="stretch", key="aud_save_to_json", disabled=save_json_disabled):
+                with st.spinner("Audioanalyse wird in JSON gespeichert ..."):
+                    ok_aud_save, msg_aud_save = _write_audio_rpm_json_only(res)
                 if ok_aud_save:
-                    st.success(msg_aud_save)
-                    set_status("Audioanalyse in MAT gespeichert.", "ok")
-                elif msg_aud_save == _SAVE_NEEDS_CONFIRM:
-                    st.session_state["_audio_result_overwrite_pending"] = dict(res)
+                    st.success("Audio-RPM und Gangverlauf wurden in die JSON geschrieben.")
+                    set_status("Audioanalyse in JSON gespeichert.", "ok")
                 else:
-                    st.error(msg_aud_save)
-                    set_status(msg_aud_save, "warn")
+                    st.error(msg_aud_save or "Keine Ergebnis-JSON gefunden.")
+                    set_status(msg_aud_save or "Keine Ergebnis-JSON gefunden.", "warn")
 
-            _res_pending = st.session_state.get("_audio_result_overwrite_pending")
-            if _res_pending is not None:
-                st.warning("Audioanalyse ist bereits in der Datei gespeichert. Soll sie ueberschrieben werden?")
-                _row_c1, _row_c2 = st.columns(2)
-                if _row_c1.button("Ja, ueberschreiben", width="stretch", key="aud_res_overwrite_yes"):
-                    with st.spinner("Audioanalyse wird ueberschrieben ..."):
-                        ok3, msg3 = _save_audio_result_to_selected_mat(_res_pending, force=True)
-                    st.session_state["_audio_result_overwrite_pending"] = None
-                    if ok3:
-                        st.success(msg3)
-                        set_status("Audioanalyse ueberschrieben.", "ok")
-                    else:
-                        st.error(msg3)
-                        set_status(msg3, "warn")
-                    st.rerun()
-                if _row_c2.button("Nein, abbrechen", width="stretch", key="aud_res_overwrite_no"):
-                    st.session_state["_audio_result_overwrite_pending"] = None
-                    st.rerun()
-
-            if save_mat_disabled:
-                st.caption("Zum Speichern zuerst in MAT Selection eine MAT-Datei mit MAT + Video laden.")
+            if save_json_disabled:
+                st.caption("Zum Speichern muss eine Ergebnis-JSON fuer den aktuellen Datensatz vorhanden sein.")
 
     # ── Mode B: Sweep mit Messdatei ────────────────────────────────────────────
     if _mode_sweep:
@@ -1017,7 +1053,10 @@ def render(ns):
                 _sw1_f, _sw2_f = st.columns(2)
                 with _sw1_f:
                     st.markdown("**Audio-Parameter (werden variiert)**")
-                    from app_tabs.audio_sweep import METHOD_OPTIONS as _ALL_METHODS_F
+                    from app_tabs.audio_sweep import (
+                        CANDIDATE_FILTER_OPTIONS as _CANDIDATE_FILTER_OPTIONS_F,
+                        METHOD_OPTIONS as _ALL_METHODS_F,
+                    )
                     _default_methods_f = ["STFT/Ridge", "Viterbi", "Peak", "Autokorrelation/YIN",
                                           "Cepstrum", "Harmonic Comb/HPS", "Hybrid",
                                           "Harmonische Summe", "Bandpass/Autokorr"]
@@ -1030,6 +1069,16 @@ def render(ns):
                                    default=[50.0, 75.0, 87.5], key="sw_overlap")
                     st.multiselect("Ordnung", options=[0.5, 1.0, 2.0, 3.0],
                                    default=[0.5, 1.0, 2.0, 3.0], key="sw_order")
+                    st.multiselect(
+                        "Zugelassene RPM-Kandidatentypen",
+                        options=_CANDIDATE_FILTER_OPTIONS_F,
+                        default=list(_CANDIDATE_FILTER_OPTIONS_F),
+                        key="sw_candidate_filter",
+                        help=(
+                            "Begrenzt, welche generierten RPM-Linien der Sweep bewertet. "
+                            "Die konkrete Kandidatenauswahl am Ende bleibt erhalten."
+                        ),
+                    )
                 with _sw2_f:
                     st.markdown("**Suchmethode / Bewertung**")
                     _strat = st.selectbox("Strategie",
@@ -1647,6 +1696,10 @@ def render(ns):
             # Derive sweep config preview from session state (for start handler)
             _ss_sw = st.session_state
             _sw_methods      = _ss_sw.get("sw_methods") or []
+            from app_tabs.audio_sweep import CANDIDATE_FILTER_OPTIONS as _CANDIDATE_FILTER_OPTIONS_RUN
+            _sw_candidate_filter = _ss_sw.get("sw_candidate_filter")
+            if _sw_candidate_filter is None:
+                _sw_candidate_filter = list(_CANDIDATE_FILTER_OPTIONS_RUN)
             _sw_nfft         = _ss_sw.get("sw_nfft")    or [2048]
             _sw_overlap      = _ss_sw.get("sw_overlap") or [75.0]
             _sw_order        = _ss_sw.get("sw_order")   or [1.0]
@@ -1682,6 +1735,7 @@ def render(ns):
                 "overlap_values": _sw_overlap,
                 "fmax_headroom": _sw_fmax_headroom,
                 "order_values": _sw_order,
+                "candidate_filter": list(_sw_candidate_filter or []),
                 "cyl": _cyl_sel, "takt": _takt_sel,
                 "rpm_min": float(_ss_sw.get("aud_rpm_min_new") or 800.0),
                 "rpm_max": float(_ss_sw.get("aud_rpm_max_new") or 7500.0),
@@ -1703,7 +1757,7 @@ def render(ns):
                     _cur_jp = _cur_result_json()
                     if _cur_jp and _sw_res:
                         from app_tabs.audio_sweep import save_sweep_results
-                        save_sweep_results(str(_cur_jp), _sw_res)
+                        save_sweep_results(str(_cur_jp), _sw_res, gear_band_cfg=_sw_gear_band_cfg)
                 except Exception as _swe:
                     st.session_state.audio_sweep_error = str(_swe)
                 st.session_state.audio_sweep_running    = False
@@ -1720,7 +1774,7 @@ def render(ns):
             _sw_c1, _sw_c2 = st.columns(2)
             _sw_start_clicked = _sw_c1.button(
                 "Sweep starten", key="sw_start_btn",
-                disabled=_sw_running or not _sw_methods or not _sw_nfft,
+                disabled=_sw_running or not _sw_methods or not _sw_nfft or not _sw_candidate_filter,
                 type="primary",
             )
             if _sw_running:
@@ -1829,6 +1883,7 @@ def render(ns):
                                     "tol_abs_rpm": _sw_tol_abs,
                                     "tol_pct": _sw_tol_pct,
                                     "tol_logic": _sw_tol_logic,
+                                    "candidate_filter": list(_sw_cfg_preview.get("candidate_filter") or []),
                                     "n_combinations": len(_full_grid),
                                     "gear_band_cfg": {
                                         k: v for k, v in (_sw_gear_band_cfg or {}).items()
@@ -1939,6 +1994,7 @@ def render(ns):
                             top_n=_sw_top_n, errors_out=_sweep_errors,
                             pre_trial_cb=_pre_pcb,
                             gear_band_cfg=_gear_band_cfg_snap,
+                            candidate_filter=_cfg_snap.get("candidate_filter") or None,
                         )
 
                         try:
@@ -2082,6 +2138,29 @@ def render(ns):
                 use_container_width=True, hide_index=True,
                 column_config=_ccfg,
             )
+            _sw_candidate_labels = [
+                f"#{r.get('rank', i+1)} {r.get('selected_candidate_line') or r.get('method','?')} | "
+                f"{r.get('method','?')} NFFT={r.get('nfft','?')} Ovl={r.get('overlap_pct','?')}% "
+                f"Ord={r.get('order','?')} Score={r.get('combined_score', 0):.1f} "
+                f"Innerhalb={r.get('within_pct', 0):.1f}%"
+                for i, r in enumerate(_sw_results)
+            ]
+            try:
+                _sw_sel_default = int(st.session_state.get("audio_sweep_candidate_select_idx", 0) or 0)
+            except Exception:
+                _sw_sel_default = 0
+            _sw_sel_default = max(0, min(_sw_sel_default, len(_sw_results) - 1))
+            _sw_selected_idx = int(st.selectbox(
+                "Sweep-Kandidat auswaehlen",
+                options=list(range(len(_sw_results))),
+                index=_sw_sel_default,
+                format_func=lambda i: _sw_candidate_labels[i],
+                key="audio_sweep_candidate_select_idx",
+                help="Auswahl eines bewerteten Sweep-Kandidaten fuer Plot und JSON-Export.",
+            ))
+            if st.session_state.get("_audio_sweep_last_selected_idx") != _sw_selected_idx:
+                st.session_state["sw_plot_sel_ranks"] = [_sw_selected_idx]
+                st.session_state["_audio_sweep_last_selected_idx"] = _sw_selected_idx
 
             st.markdown("**RPM-Verläufe vergleichen**")
             st.markdown("**Top-1 RPM-Verlauf (gegen Referenz)**")
@@ -2098,16 +2177,11 @@ def render(ns):
 
                 # Rank selection
                 _rank_options = [r.get("rank", i+1) for i, r in enumerate(_sw_results)]
-                _rank_labels  = [
-                    f"#{r.get('rank', i+1)} {r.get('method','?')} NFFT={r.get('nfft','?')} "
-                    f"Ovl={r.get('overlap_pct','?')}% Ord={r.get('order','?')} "
-                    f"Score={r.get('combined_score', 0):.1f}"
-                    for i, r in enumerate(_sw_results)
-                ]
+                _rank_labels  = _sw_candidate_labels
                 _sel_ranks = st.multiselect(
                     "Ränge zum Anzeigen auswählen",
                     options=list(range(len(_sw_results))),
-                    default=[0],
+                    default=[_sw_selected_idx],
                     format_func=lambda i: _rank_labels[i],
                     key="sw_plot_sel_ranks",
                 )
@@ -2251,49 +2325,25 @@ def render(ns):
                     st.caption("Ränge auswählen und 'Verläufe berechnen' klicken.")
             except Exception as _top1_e:
                 st.warning(f"Verlauf-Plot (Fehler): {_top1_e}")
+            _cur_jp_sel = _cur_result_json()
+            if st.button(
+                "Ausgewaehlten RPM-Verlauf in JSON speichern",
+                key="sw_save_selected_audio_rpm",
+                disabled=not bool(_cur_jp_sel),
+                type="secondary",
+            ):
+                try:
+                    from app_tabs.audio_sweep import save_sweep_results
+                    save_sweep_results(
+                        str(_cur_jp_sel),
+                        _sw_results,
+                        gear_band_cfg=_sw_gear_band_cfg,
+                        selected_index=_sw_selected_idx,
+                    )
+                    st.success("Ausgewaehlter RPM- und Gangverlauf wurde in die JSON geschrieben.")
+                except Exception as _save_sel_e:
+                    st.error(f"JSON-Speichern fehlgeschlagen: {_save_sel_e}")
 
-            st.markdown("**Bestes Ergebnis übernehmen:**")
-            _top = _sw_results[0]
-            st.caption(
-                f"Rang 1: **{_top.get('method','')}** | "
-                f"NFFT={_top.get('nfft','')} | Overlap={_top.get('overlap_pct','')}% | "
-                f"Fmax={_top.get('fmax','')} Hz | Cyl={_top.get('cyl','')} | "
-                f"Takt={_top.get('takt','')} | Ord={_top.get('order','')} | "
-                f"Offset={_top.get('offset_s', 0.0):+.2f}s | "
-                f"Innerhalb={_top.get('within_pct', 0.0):.1f}% | RMSE={_top.get('rmse', 0.0):.0f}"
-            )
-            if st.button("Top-1 Parameter in Standard-Analyse übernehmen", key="sw_apply_top"):
-                def _to_int(v, default):
-                    try: return int(v)
-                    except Exception:
-                        try: return int(float(v))
-                        except Exception: return int(default)
-                def _to_float(v, default):
-                    try: return float(v)
-                    except Exception: return float(default)
-                _ks = {
-                    "aud_stft_mode_new":  "Fest auswählen",
-                    "aud_nfft_new":        _to_int(_top.get("nfft",        2048), 2048),
-                    "aud_overlap_new":     _to_float(_top.get("overlap_pct", 75.0), 75.0),
-                    "aud_fmax_new":        _to_float(_top.get("fmax",        500.0), 500.0),
-                    "aud_cyl_sel":         str(_to_int(_top.get("cyl",       4), 4)),
-                    "aud_takt_sel":        str(_to_int(_top.get("takt",      4), 4)),
-                    "aud_order_new":       _to_int(_top.get("order",         1), 1),
-                    "aud_offset_new":      _to_float(_top.get("offset_s",    0.0), 0.0),
-                    "aud_ridge_smooth":    _to_int(_top.get("ridge_smooth",   7), 7),
-                    "aud_viterbi_jump_hz": _to_float(_top.get("viterbi_jump_hz", 25.0), 25.0),
-                    "aud_viterbi_penalty": _to_float(_top.get("viterbi_penalty", 1.2), 1.2),
-                    "aud_viterbi_smooth":  _to_int(_top.get("viterbi_smooth",    5), 5),
-                    "aud_comb_harmonics":  _to_int(_top.get("comb_harmonics",    4), 4),
-                    "aud_hybrid_smooth":   _to_int(_top.get("hybrid_smooth",     9), 9),
-                }
-                for _k, _v in _ks.items():
-                    st.session_state[_k] = _v
-                st.session_state["aud_cyl_mode"]  = "Fest auswählen"
-                st.session_state["aud_harm_mode"] = "Fest auswählen"
-                st.session_state["aud_mode_idx"]  = 0
-                st.success("Parameter übernommen — wechsle zu Standard-Analyse und starte eine neue Audioanalyse.")
-                st.rerun()
 
 
 

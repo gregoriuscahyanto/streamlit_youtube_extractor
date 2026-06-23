@@ -7429,6 +7429,20 @@ def _build_audio_rpm_struct_from_result(res: dict) -> dict:
     t = t[:n]
     rpm = rpm[:n]
     fsel = fsel[:n] if len(fsel) else np.full(n, np.nan)
+    gear_trace = res.get("gear_trace") or {}
+    try:
+        gear = np.asarray(gear_trace.get("gear", []), dtype=float).reshape(-1)[:n]
+    except Exception:
+        gear = np.array([], dtype=float)
+    try:
+        gear_center = np.asarray(gear_trace.get("gear_center_rpm", []), dtype=float).reshape(-1)[:n]
+    except Exception:
+        gear_center = np.array([], dtype=float)
+    selected_candidate_line = str(
+        res.get("selected_candidate_line")
+        or p.get("selected_candidate_line")
+        or ""
+    )
 
     # freq_lines: 1D arrays (N,) matching MAT file convention
     freq_lines = {}
@@ -7440,7 +7454,11 @@ def _build_audio_rpm_struct_from_result(res: dict) -> dict:
     # params: scalars as plain float, strings as str, complex types as JSON string
     params = {}
     base_params = dict(p)
-    base_params.update({"source": res.get("source", ""), "selected_method": res.get("selected_method", "")})
+    base_params.update({
+        "source": res.get("source", ""),
+        "selected_method": res.get("selected_method", ""),
+        "selected_candidate_line": selected_candidate_line,
+    })
     for k, v in base_params.items():
         fn = _matlab_field_name(k)
         if isinstance(v, (dict, list, tuple)):
@@ -7480,14 +7498,21 @@ def _build_audio_rpm_struct_from_result(res: dict) -> dict:
     dbg = res.get("debug_lines") or st.session_state.get("audio_debug_lines") or []
     debug_lines_str = "\n".join(str(x) for x in dbg) if dbg else ""
 
+    processed = {
+        "t_s": t,        # 1D (N,) float64
+        "rpm": rpm,      # 1D (N,) float64
+        "freq_hz": fsel, # 1D (N,) float64
+        "method": str(res.get("selected_method", "")),
+        "selected_candidate_line": selected_candidate_line,
+    }
+    if gear.size == n:
+        processed["gear"] = gear
+    if gear_center.size == n:
+        processed["gear_center_rpm"] = gear_center
+
     return {
         "params": params,
-        "processed": {
-            "t_s": t,        # 1D (N,) float64
-            "rpm": rpm,      # 1D (N,) float64
-            "freq_hz": fsel, # 1D (N,) float64
-            "method": str(res.get("selected_method", "")),
-        },
+        "processed": processed,
         "freq_lines": freq_lines,
         "candidate_table": cand_tbl,
         "debug_lines": debug_lines_str,

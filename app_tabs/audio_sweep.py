@@ -641,6 +641,16 @@ METHOD_OPTIONS = [
     "Cepstrum", "Harmonic Comb/HPS", "CWT/Wavelet", "Hybrid",
     "pYIN", "CQT/Constant-Q", "Harmonische Summe", "Bandpass/Autokorr",
 ]
+CANDIDATE_FILTER_OPTIONS = [
+    "Extractor-Auswahl",
+    "Original Peak",
+    "STFT Viterbi",
+    "Gear-Band",
+    "Hybrid",
+    "Kandidat-Linien",
+    "Anti-Spike",
+    "Andere",
+]
 FMAX_VARIANTS = ["harmonic_3x"]
 
 
@@ -873,6 +883,7 @@ def _eval_single_params(
     extract_rpm_fn: Callable,
     errors_out: list | None = None,
     gear_band_cfg: dict | None = None,
+    candidate_filter: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
     """Evaluate one parameter combination. Always returns a result dict (score=0 on failure)."""
     import numpy as np
@@ -936,7 +947,7 @@ def _eval_single_params(
 
     best_score_dict = None
     last_score_error = ""
-    for cand_name, cand_rpm in _reference_aware_candidate_pool(t_audio, rpm_audio, _extra):
+    for cand_name, cand_rpm in _reference_aware_candidate_pool(t_audio, rpm_audio, _extra, candidate_filter):
         sd = _score_one_rpm_candidate(
             t_audio, cand_rpm, t_ref, rpm_ref,
             offset_base=offset_base,
@@ -1125,7 +1136,51 @@ def _reference_free_antispike_rpm(t_audio, rpm_line, window: int = 7):
     return _rolling_nanmedian(out, 3)
 
 
-def _reference_aware_candidate_pool(t_audio, rpm_audio, extra: dict | None) -> list[tuple[str, object]]:
+def _candidate_matches_filter(candidate_name: str, allowed_types: list[str] | tuple[str, ...] | None) -> bool:
+    """Return whether a generated candidate should be scored by the sweep."""
+    allowed = {str(x).strip() for x in (allowed_types or []) if str(x).strip()}
+    if not allowed:
+        return True
+    name = str(candidate_name or "").strip()
+    low = name.lower()
+    is_anti = low.startswith("anti-spike") or low.startswith("anti spike")
+    base = low.split(":", 1)[1].strip() if is_anti and ":" in low else low
+    matched = False
+    if "Anti-Spike" in allowed and is_anti:
+        return True
+    if is_anti:
+        return False
+    if "Extractor-Auswahl" in allowed and base == "extractor-auswahl":
+        matched = True
+    if "Original Peak" in allowed and "original peak" in base:
+        matched = True
+    if "STFT Viterbi" in allowed and "stft viterbi" in base:
+        matched = True
+    if "Gear-Band" in allowed and "gear-band" in base:
+        matched = True
+    if "Hybrid" in allowed and "hybrid" in base:
+        matched = True
+    if "Kandidat-Linien" in allowed and base.startswith("kandidat"):
+        matched = True
+    known = (
+        base == "extractor-auswahl"
+        or "original peak" in base
+        or "stft viterbi" in base
+        or "gear-band" in base
+        or "hybrid" in base
+        or base.startswith("kandidat")
+    )
+    if "Andere" in allowed and not known and not is_anti:
+        matched = True
+    return bool(matched)
+
+
+def _reference_aware_candidate_pool(
+    t_audio,
+    rpm_audio,
+    extra: dict | None,
+    candidate_filter: list[str] | tuple[str, ...] | None = None,
+) -> list[tuple[str, object]]:
     """Return baseline plus extractor-provided RPM candidate lines."""
     pool: list[tuple[str, object]] = [("Extractor-Auswahl", rpm_audio)]
     rpm_lines = (extra or {}).get("rpm_lines") or {}
@@ -1140,7 +1195,165 @@ def _reference_aware_candidate_pool(t_audio, rpm_audio, extra: dict | None) -> l
         except Exception:
             continue
     pool.extend(variants)
-    return pool
+    return [(n, r) for n, r in pool if _candidate_matches_filter(n, candidate_filter)]
+
+
+def audio_candidate_options_from_result(res: dict | None) -> list[str]:
+    """Candidate names available in a standard extraction result."""
+    opts: list[str] = []
+
+    def add(name: object) -> None:
+        s = str(name or "").strip()
+        if s and s not in opts:
+            opts.append(s)
+
+    add("Extractor-Auswahl")
+    rpm_lines = (res or {}).get("rpm_lines") or {}
+    if isinstance(rpm_lines, dict):
+        for name in rpm_lines.keys():
+            add(name)
+    for name in list(opts[:40]):
+        add(f"Anti-Spike: {name}")
+    return opts
+
+
+def _candidate_rpm_from_result(res: dict, candidate_name: str):
+    """Return a candidate RPM line from a standard extractor result."""
+    import numpy as np
+
+    name = str(candidate_name or "Extractor-Auswahl").strip() or "Extractor-Auswahl"
+    anti = False
+    base = name
+    if name.lower().startswith("anti-spike:"):
+        anti = True
+        base = name.split(":", 1)[1].strip()
+    elif name.lower().startswith("anti spike:"):
+        anti = True
+        base = name.split(":", 1)[1].strip()
+    elif name.lower().startswith("anti spike "):
+        anti = True
+        base = name[11:].strip()
+
+    rpm_lines = (res or {}).get("rpm_lines") or {}
+    if base == "Extractor-Auswahl":
+        rpm_line = (res or {}).get("rpm", [])
+    elif isinstance(rpm_lines, dict) and base in rpm_lines:
+        rpm_line = rpm_lines[base]
+    else:
+        rpm_line = (res or {}).get("rpm", [])
+        base = "Extractor-Auswahl"
+
+    t = np.asarray((res or {}).get("t", []), dtype=float).ravel()
+    r = np.asarray(rpm_line, dtype=float).ravel()
+    n = min(t.size, r.size)
+    t = t[:n]
+    r = r[:n]
+    if anti:
+        r = _reference_free_antispike_rpm(t, r, window=7)
+    return t, r, name, base
+
+
+def _safe_float_list(values, ndigits: int | None = None) -> list:
+    """JSON-safe float list with None for NaN/Inf."""
+    import numpy as np
+
+    out: list = []
+    for v in np.asarray(values, dtype=float).ravel():
+        fv = float(v)
+        if not math.isfinite(fv):
+            out.append(None)
+        elif ndigits is None:
+            out.append(fv)
+        else:
+            out.append(round(fv, int(ndigits)))
+    return out
+
+
+def gear_trace_from_rpm(t_audio, rpm_audio, gear_band_cfg: dict | None) -> dict:
+    """Infer the most plausible 1-based gear path for a selected RPM trace."""
+    import numpy as np
+
+    t = np.asarray(t_audio, dtype=float).ravel()
+    r = np.asarray(rpm_audio, dtype=float).ravel()
+    n = min(t.size, r.size)
+    t = t[:n]
+    r = r[:n]
+    empty = {
+        "t_s": _safe_float_list(t, 4),
+        "gear": [None] * n,
+        "gear_center_rpm": [None] * n,
+        "gear_band_active": False,
+    }
+    if n <= 0 or not isinstance(gear_band_cfg, dict) or not gear_band_cfg.get("gear_ratios"):
+        return empty
+    try:
+        bands = compute_gear_bands(
+            t,
+            gear_band_cfg["t_ocr"],
+            gear_band_cfg["v_kmph_ocr"],
+            gear_band_cfg["gear_ratios"],
+            float(gear_band_cfg.get("axle_ratio", 3.15)),
+            float(gear_band_cfg.get("r_dyn", 0.35)),
+            float(gear_band_cfg.get("rpm_min", 500.0)),
+            float(gear_band_cfg.get("rpm_max", 8000.0)),
+            float(gear_band_cfg.get("band_tol_pct", 5.0)),
+        )
+        if bands.ndim != 3 or bands.shape[0] <= 0 or bands.shape[1] <= 0:
+            return empty
+        path = _viterbi_gear_path(
+            r,
+            bands,
+            gear_shift_penalty=float(gear_band_cfg.get("gear_shift_penalty", 0.35) or 0.35),
+            higher_gear_bias=float(gear_band_cfg.get("higher_gear_bias", 0.08) or 0.08),
+            band_center_weight=float(gear_band_cfg.get("band_center_weight", 0.65) or 0.65),
+        )
+        gear: list = [None] * n
+        center: list = [None] * n
+        for i in range(n):
+            b = int(path[i]) if i < len(path) else -1
+            if b < 0 or b >= bands.shape[1] or not math.isfinite(float(r[i])):
+                continue
+            lo_b = float(bands[i, b, 0])
+            hi_b = float(bands[i, b, 1])
+            if hi_b <= 0.0 or not math.isfinite(lo_b) or not math.isfinite(hi_b):
+                continue
+            gear[i] = b + 1
+            center[i] = round(0.5 * (lo_b + hi_b), 2)
+        return {
+            "t_s": _safe_float_list(t, 4),
+            "gear": gear,
+            "gear_center_rpm": center,
+            "gear_band_active": any(g is not None for g in gear),
+        }
+    except Exception as exc:
+        empty["gear_band_error"] = str(exc)
+        return empty
+
+
+def apply_audio_candidate_selection(res: dict | None, candidate_name: str | None) -> dict:
+    """Apply a UI-selected RPM candidate without using any reference RPM."""
+    import numpy as np
+
+    if not isinstance(res, dict):
+        return {}
+    t, rpm, name, base = _candidate_rpm_from_result(res, candidate_name or "Extractor-Auswahl")
+    p = dict(res.get("params") or {})
+    gear_band_cfg = p.get("gear_band_cfg") if isinstance(p.get("gear_band_cfg"), dict) else None
+    gear_meta = {}
+    if gear_band_cfg:
+        rpm, gear_meta = constrain_rpm_to_gear_bands(t, rpm, _gear_band_cfg_for_candidate(gear_band_cfg, name))
+    out = dict(res)
+    out["t"] = np.asarray(t, dtype=float)
+    out["rpm"] = np.asarray(rpm, dtype=float)
+    out["selected_candidate_line"] = name
+    p["selected_candidate_line"] = name
+    p["candidate_base_line"] = base
+    p["candidate_selection_reference_free"] = True
+    for k, v in gear_meta.items():
+        p[f"candidate_{k}"] = v
+    out["params"] = p
+    out["gear_trace"] = gear_trace_from_rpm(t, rpm, gear_band_cfg)
+    return out
 
 
 def _sort_and_rank(results: list[dict], top_n: int) -> list[dict]:
@@ -1174,6 +1387,7 @@ def run_sweep(
     errors_out: list | None = None,
     pre_trial_cb: Callable | None = None,
     gear_band_cfg: dict | None = None,
+    candidate_filter: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict]:
     """
     Run the parameter sweep.
@@ -1202,6 +1416,7 @@ def run_sweep(
         offset_base=offset_base, offset_range=offset_range, offset_step=offset_step,
         extract_rpm_fn=extract_rpm_fn, errors_out=errors_out,
         gear_band_cfg=gear_band_cfg,
+        candidate_filter=candidate_filter,
     )
     for i, params in enumerate(grid):
         if stop_event is not None and stop_event.is_set():
@@ -1238,6 +1453,7 @@ def run_sweep_random(
     errors_out: list | None = None,
     pre_trial_cb: Callable | None = None,
     gear_band_cfg: dict | None = None,
+    candidate_filter: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Random search: shuffle the full grid, evaluate first n_trials entries."""
     import random as _rnd
@@ -1257,6 +1473,7 @@ def run_sweep_random(
         progress_cb=progress_cb, stop_event=stop_event,
         extract_rpm_fn=extract_rpm_fn, top_n=top_n, errors_out=errors_out,
         pre_trial_cb=pre_trial_cb, gear_band_cfg=gear_band_cfg,
+        candidate_filter=candidate_filter,
     )
 
 
@@ -1272,6 +1489,7 @@ def run_sweep_optuna(
     errors_out: list | None = None,
     pre_trial_cb: Callable | None = None,
     gear_band_cfg: dict | None = None,
+    candidate_filter: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Bayesian optimisation with Optuna (TPE sampler)."""
     try:
@@ -1303,6 +1521,7 @@ def run_sweep_optuna(
         offset_base=offset_base, offset_range=offset_range, offset_step=offset_step,
         extract_rpm_fn=extract_rpm_fn, errors_out=errors_out,
         gear_band_cfg=gear_band_cfg,
+        candidate_filter=candidate_filter,
     )
 
     def objective(trial: "optuna.Trial") -> float:
@@ -1380,8 +1599,86 @@ def run_sweep_optuna(
 
 # ── Persist sweep results ─────────────────────────────────────────────────────
 
-def save_sweep_results(json_path: str, results: list[dict]) -> None:
-    """Write top sweep results to recordResult.audio_sweep in the result JSON."""
+def _json_safe(obj):
+    """Convert numpy/NaN values to JSON-safe Python values."""
+    try:
+        import numpy as np
+    except Exception:  # pragma: no cover
+        np = None
+    if np is not None and isinstance(obj, np.ndarray):
+        return [_json_safe(v) for v in obj.tolist()]
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if np is not None and isinstance(obj, (np.integer,)):
+        return int(obj)
+    if np is not None and isinstance(obj, (np.floating,)):
+        obj = float(obj)
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    return obj
+
+
+def _sweep_trace_payload(result: dict, gear_band_cfg: dict | None = None) -> dict:
+    t = _safe_float_list((result or {}).get("plot_t_s") or [], 4)
+    rpm = _safe_float_list((result or {}).get("plot_rpm") or [], 2)
+    gear = gear_trace_from_rpm(t, rpm, gear_band_cfg)
+    return {
+        "t_s": t,
+        "rpm": rpm,
+        "gear": gear.get("gear") or [],
+        "gear_center_rpm": gear.get("gear_center_rpm") or [],
+        "gear_band_active": bool(gear.get("gear_band_active", False)),
+        "method": str((result or {}).get("method", "")),
+        "selected_candidate_line": str((result or {}).get("selected_candidate_line", "")),
+        "rank": int((result or {}).get("rank", 0) or 0),
+        "offset_s": float((result or {}).get("offset_s", 0.0) or 0.0),
+    }
+
+
+def audio_rpm_struct_from_sweep_result(result: dict, gear_band_cfg: dict | None = None) -> dict:
+    """Build recordResult.audio_rpm from one sweep result preview trace."""
+    from datetime import datetime
+
+    trace = _sweep_trace_payload(result, gear_band_cfg)
+    param_keys = [
+        "rank", "combined_score", "within_pct", "rmse", "pearson_r",
+        "band_compliance_pct", "jump_in_band_pct", "selected_candidate_line",
+        "candidate_source_method", "method", "nfft", "overlap_pct", "fmax",
+        "cyl", "takt", "order", "offset_s", "rpm_min", "rpm_max",
+        "fmax_variant", "score_error",
+    ]
+    params = {k: (result or {}).get(k) for k in param_keys if k in (result or {})}
+    params["source"] = "audio_sweep"
+    params["selected_method"] = str((result or {}).get("method", ""))
+    params["selected_candidate_line"] = trace["selected_candidate_line"]
+    return _json_safe({
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "source": "audio_sweep",
+        "params": params,
+        "processed": {
+            "t_s": trace["t_s"],
+            "rpm": trace["rpm"],
+            "gear": trace["gear"],
+            "gear_center_rpm": trace["gear_center_rpm"],
+            "method": trace["method"],
+            "selected_candidate_line": trace["selected_candidate_line"],
+            "offset_s": trace["offset_s"],
+        },
+        "freq_lines": {},
+        "candidate_table": {},
+        "debug_lines": "",
+    })
+
+
+def save_sweep_results(
+    json_path: str,
+    results: list[dict],
+    gear_band_cfg: dict | None = None,
+    selected_index: int = 0,
+) -> None:
+    """Write sweep results and selected audio RPM trace to the result JSON."""
     import json as _json
     from datetime import datetime
     from app_tabs.plausibility_filter import _atomic_write
@@ -1394,11 +1691,21 @@ def save_sweep_results(json_path: str, results: list[dict]) -> None:
     rr = doc.get("recordResult")
     if not isinstance(rr, dict):
         return
+    idx = int(selected_index or 0)
+    if idx < 0 or idx >= len(results):
+        idx = 0
+    top_trace = _sweep_trace_payload(results[0], gear_band_cfg) if results else {}
+    selected_trace = _sweep_trace_payload(results[idx], gear_band_cfg) if results else {}
     rr["audio_sweep"] = {
         "created": datetime.now().isoformat(timespec="seconds"),
         "n_results": len(results),
-        "results": results,
+        "selected_index": idx,
+        "top1_trace": top_trace,
+        "selected_trace": selected_trace,
+        "results": _json_safe(results),
     }
+    if results:
+        rr["audio_rpm"] = audio_rpm_struct_from_sweep_result(results[idx], gear_band_cfg)
     doc["recordResult"] = rr
     _atomic_write(path, doc)
 

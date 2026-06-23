@@ -153,6 +153,9 @@ def _load_file_data(json_path: str, offset_s: float, offset_m: float = 0.0) -> d
     # Audio RPM processed
     arpm = rr.get("audio_rpm") or {}
     proc = arpm.get("processed") if isinstance(arpm.get("processed"), dict) else {}
+    proc_col = arpm.get("processed_col") if isinstance(arpm.get("processed_col"), dict) else {}
+    if proc_col:
+        proc = {**proc_col, **proc}
     if isinstance(proc, dict) and proc.get("t_s"):
         t_audio = [float(x) + offset_s for x in proc["t_s"]]
         n_a = len(t_audio)
@@ -222,6 +225,140 @@ def _external_table_to_cols(df, mapping: dict, offset_s: float = 0.0, offset_m: 
 
 
 # ── Track calibration helper ──────────────────────────────────────────────────
+
+def _to_float_or_none(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        txt = str(value).strip().replace(",", ".")
+        if not txt:
+            return None
+        val = float(txt)
+        return val if val == val else None
+    except Exception:
+        return None
+
+
+def _compute_s_m_from_speed(data: dict[str, list]) -> list[float] | None:
+    """Cumulative distance from OCR speed and time; same integration as edit_tab."""
+    import numpy as np
+
+    t = data.get("time_s") or data.get("t_s") or data.get("audio_time_s")
+    v = data.get("v_Fzg_kmph") or data.get("v_Fzg_mph")
+    if not t or not v or len(t) != len(v):
+        return None
+    t_arr = np.asarray(t, dtype=float)
+    v_arr = np.asarray(v, dtype=float)
+    if not data.get("v_Fzg_kmph") and data.get("v_Fzg_mph"):
+        v_arr = v_arr * 1.60934
+    bad = ~np.isfinite(v_arr)
+    if bad.any():
+        good_idx = np.where(~bad)[0]
+        if good_idx.size == 0:
+            return None
+        v_arr = np.interp(np.arange(v_arr.size), good_idx, v_arr[good_idx])
+    v_mps = v_arr / 3.6
+    dt = np.concatenate(([0.0], np.diff(t_arr)))
+    dt[~np.isfinite(dt) | (dt < 0)] = 0.0
+    return np.cumsum(v_mps * dt).astype(float).tolist()
+
+
+def _fill_numeric_series(values) -> list[float] | None:
+    import numpy as np
+
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=float).ravel()
+    if arr.size == 0:
+        return None
+    bad = ~np.isfinite(arr)
+    if bad.any():
+        good_idx = np.where(~bad)[0]
+        if good_idx.size == 0:
+            return None
+        arr = np.interp(np.arange(arr.size), good_idx, arr[good_idx])
+    return arr.astype(float).tolist()
+
+
+def _add_wheel_dynamics(data: dict[str, list], cfg: dict) -> tuple[bool, list[str]]:
+    """Add wheel force/power/torque columns from speed and resistance inputs."""
+    import numpy as np
+
+    required = {
+        "Masse m kg": cfg.get("mass_kg"),
+        "Luftwiderstandsbeiwert Cw": cfg.get("cw"),
+        "Stirnflaeche A m^2": cfg.get("area_m2"),
+    }
+    missing = [name for name, val in required.items() if val is None]
+    if missing:
+        return False, missing
+
+    t = data.get("time_s") or data.get("t_s") or data.get("audio_time_s")
+    v_raw = data.get("v_Fzg_kmph") or data.get("v_Fzg_mph")
+    if not t or not v_raw or len(t) != len(v_raw):
+        return False, ["time_s und v_Fzg_kmph"]
+
+    t_arr = np.asarray(t, dtype=float)
+    v_series = _fill_numeric_series(v_raw)
+    if v_series is None:
+        return False, ["gueltige Geschwindigkeit"]
+    v_kmph = np.asarray(v_series, dtype=float)
+    if not data.get("v_Fzg_kmph") and data.get("v_Fzg_mph"):
+        v_kmph = v_kmph * 1.60934
+    n = min(t_arr.size, v_kmph.size)
+    if n < 2:
+        return False, ["mindestens zwei Geschwindigkeitspunkte"]
+    t_arr = t_arr[:n]
+    v_mps = v_kmph[:n] / 3.6
+
+    dt = np.gradient(t_arr)
+    dt[~np.isfinite(dt) | (np.abs(dt) < 1e-6)] = 1e-6
+    a_mps2 = np.gradient(v_mps) / dt
+    rho = float(cfg.get("rho") if cfg.get("rho") is not None else 1.225)
+    g = float(cfg.get("g") if cfg.get("g") is not None else 9.81)
+    crr = float(cfg.get("crr") if cfg.get("crr") is not None else 0.01)
+    lam = float(cfg.get("lambda_rot") if cfg.get("lambda_rot") is not None else 1.0)
+    mass = float(cfg["mass_kg"])
+    cw = float(cfg["cw"])
+    area = float(cfg["area_m2"])
+
+    f_aero = 0.5 * rho * cw * area * v_mps * v_mps
+    f_roll = np.full(n, mass * g * crr, dtype=float)
+    f_inertia = mass * lam * a_mps2
+    f_grade = np.zeros(n, dtype=float)
+    f_total = f_aero + f_roll + f_inertia + f_grade
+    p_w = f_total * v_mps
+
+    data["s_m_from_v"] = _compute_s_m_from_speed(data) or []
+    if "s_m" not in data and data["s_m_from_v"]:
+        data["s_m"] = list(data["s_m_from_v"])
+    data["a_mps2"] = a_mps2.astype(float).tolist()
+    data["wheel_force_n"] = f_total.astype(float).tolist()
+    data["wheel_force_aero_n"] = f_aero.astype(float).tolist()
+    data["wheel_force_roll_n"] = f_roll.astype(float).tolist()
+    data["wheel_force_inertia_n"] = f_inertia.astype(float).tolist()
+    data["wheel_force_grade_n"] = f_grade.astype(float).tolist()
+    data["wheel_power_w"] = p_w.astype(float).tolist()
+    data["wheel_power_kw"] = (p_w / 1000.0).astype(float).tolist()
+    data["wheel_power_ps"] = (p_w / 735.49875).astype(float).tolist()
+
+    r_dyn = cfg.get("r_dyn_m")
+    if r_dyn is not None:
+        data["wheel_torque_nm"] = (f_total * float(r_dyn)).astype(float).tolist()
+    return True, []
+
+
+def _add_compare_derivatives(data: dict[str, list], cfg: dict) -> tuple[bool, list[str]]:
+    """Add distance and optional wheel-power derived columns to one loaded dataset."""
+    s = _compute_s_m_from_speed(data)
+    if s:
+        data["s_m_from_v"] = s
+        if "s_m" not in data:
+            data["s_m"] = list(s)
+    if not cfg.get("enable_wheel_dynamics"):
+        return True, []
+    return _add_wheel_dynamics(data, cfg)
+
 
 def _load_trkCalSlim(json_path: str) -> dict:
     """Load trkCalSlim from a result JSON (centerline_px, minimap_pts, ref_pts)."""
@@ -449,6 +586,54 @@ def render(ns: dict) -> None:
         )
         c4.caption(f"{f['offset_s']:+.3f}s / {f['offset_m']:+.0f}m")
 
+    st.markdown("### Abgeleitete Verlaeufe")
+    with st.expander("Strecke, Radleistung und Raddrehmoment berechnen", expanded=False):
+        st.caption(
+            "s_m_from_v wird immer aus v_Fzg_kmph und time_s berechnet. "
+            "Radleistung/Raddrehmoment werden nur berechnet, wenn die Pflichtwerte vorhanden sind. "
+            "Steigung wird aktuell mit 0 % angesetzt; spaeter kann sie ueber Strecke/GPS per Lookup ergaenzt werden."
+        )
+        _cmp_enable_wheel = st.checkbox(
+            "Radleistung und Raddrehmoment aus Fahrwiderstaenden berechnen",
+            value=bool(st.session_state.get("cmp_enable_wheel_dynamics", False)),
+            key="cmp_enable_wheel_dynamics",
+        )
+        _d1, _d2, _d3, _d4 = st.columns(4)
+        _rho = _d1.text_input("Luftdichte rho [kg/m^3]", value=st.session_state.get("cmp_rho_txt", "1,225"), key="cmp_rho_txt")
+        _g = _d2.text_input("Erdbeschleunigung g [m/s^2]", value=st.session_state.get("cmp_g_txt", "9,81"), key="cmp_g_txt")
+        _crr = _d3.text_input("Rollreibungskoeffizient", value=st.session_state.get("cmp_crr_txt", "0,01"), key="cmp_crr_txt")
+        _lam = _d4.text_input("Rotationsmassenfaktor Lambda", value=st.session_state.get("cmp_lambda_txt", "1,00"), key="cmp_lambda_txt")
+        _r1, _r2, _r3, _r4 = st.columns(4)
+        _mass = _r1.text_input("Masse m [kg] (Pflicht)", value=st.session_state.get("cmp_mass_txt", ""), key="cmp_mass_txt")
+        _cw = _r2.text_input("Luftwiderstandsbeiwert Cw (Pflicht)", value=st.session_state.get("cmp_cw_txt", ""), key="cmp_cw_txt")
+        _area = _r3.text_input("Stirnflaeche A [m^2] (Pflicht)", value=st.session_state.get("cmp_area_txt", ""), key="cmp_area_txt")
+        _rdyn = _r4.text_input("r dyn [m] fuer Drehmoment", value=st.session_state.get("cmp_rdyn_txt", ""), key="cmp_rdyn_txt")
+        st.caption("Hinweis: Fuer Raddrehmoment in Nm ist r dyn erforderlich. Ohne r dyn wird nur Radleistung berechnet.")
+    _cmp_deriv_cfg = {
+        "enable_wheel_dynamics": bool(_cmp_enable_wheel),
+        "rho": _to_float_or_none(_rho),
+        "g": _to_float_or_none(_g),
+        "crr": _to_float_or_none(_crr),
+        "lambda_rot": _to_float_or_none(_lam),
+        "mass_kg": _to_float_or_none(_mass),
+        "cw": _to_float_or_none(_cw),
+        "area_m2": _to_float_or_none(_area),
+        "r_dyn_m": _to_float_or_none(_rdyn),
+    }
+    if _cmp_enable_wheel:
+        _missing_global = [
+            name for name, val in {
+                "Masse m kg": _cmp_deriv_cfg["mass_kg"],
+                "Cw": _cmp_deriv_cfg["cw"],
+                "Stirnflaeche A m^2": _cmp_deriv_cfg["area_m2"],
+            }.items()
+            if val is None
+        ]
+        if _missing_global:
+            st.warning("Fahrwiderstandsberechnung unvollstaendig: " + ", ".join(_missing_global))
+        if _cmp_deriv_cfg["r_dyn_m"] is None:
+            st.info("Raddrehmoment wird erst berechnet, wenn r dyn [m] eingetragen ist.")
+
     # Build a short hash of the current plausibility catalog so that changes
     # to bounds/slopes invalidate the cache and trigger a reload+refilter.
     _cmp_catalog = st.session_state.get("roi_catalog") or {}
@@ -481,9 +666,24 @@ def render(ns: dict) -> None:
                 except Exception:
                     pass
             st.session_state.cmp_data[key] = cached
-        cmp_data[f["path"]] = cached
-    cmp_data.update(external_data)
+        import copy as _copy
+        cmp_data[f["path"]] = _copy.deepcopy(cached)
+    for _ext_id, _ext_cols in external_data.items():
+        import copy as _copy
+        cmp_data[_ext_id] = _copy.deepcopy(_ext_cols)
     display_files = list(st.session_state.cmp_files) + list(external_files)
+
+    _derive_missing: dict[str, list[str]] = {}
+    for _src in display_files:
+        _cols = cmp_data.get(_src["path"], {})
+        if not _cols:
+            continue
+        _ok_der, _miss_der = _add_compare_derivatives(_cols, _cmp_deriv_cfg)
+        if not _ok_der and _miss_der:
+            _derive_missing[str(_src.get("label") or _src.get("path"))] = _miss_der
+    if _derive_missing and _cmp_deriv_cfg.get("enable_wheel_dynamics"):
+        _msg = "; ".join(f"{lbl}: {', '.join(vals)}" for lbl, vals in _derive_missing.items())
+        st.warning("Radleistung/Raddrehmoment nicht fuer alle Quellen berechnet: " + _msg)
 
     # Collect all column names across all loaded files
     all_cols: list[str] = []

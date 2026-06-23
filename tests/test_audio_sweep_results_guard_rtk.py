@@ -16,4 +16,4 @@ def test_audio_tab_filters_non_dict_sweep_entries_before_top1_access():
     assert '_sw_results = [r for r in _sw_results_raw if isinstance(r, dict)]' in txt
     assert 'st.session_state.audio_sweep_results = _sw_results' in txt
     assert 'if _sw_results_raw and not _sw_results:' in txt
-    assert '_top = _sw_results[0]' in txt
+    assert '_top = _sw_results[0]' not in txt
