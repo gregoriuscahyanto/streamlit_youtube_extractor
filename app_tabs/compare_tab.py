@@ -734,8 +734,8 @@ def render(ns: dict) -> None:
 
             col_a, col_b, col_c = st.columns([2, 2, 2])
 
-            _type_opts = ["line", "scatter", "geoplot", "heatmap"]
-            _type_labels = {"line": "Linie", "scatter": "Punkte", "geoplot": "Geoplot", "heatmap": "Heatmap"}
+            _type_opts = ["line", "scatter", "geoplot", "heatmap", "kennlinie"]
+            _type_labels = {"line": "Linie", "scatter": "Punkte", "geoplot": "Geoplot", "heatmap": "Heatmap", "kennlinie": "Kennlinie"}
             _cur_type = chart.get("plot_type", "line")
             if _cur_type not in _type_opts:
                 _cur_type = "line"
@@ -797,6 +797,78 @@ def render(ns: dict) -> None:
                 ):
                     chart["y_min"] = 0.0 if not _ymin_zero else None
                     st.rerun()
+                # Kennlinie-Overlay controls
+                _kl_c1, _kl_c2, _kl_c3 = st.columns([1, 2, 2])
+                chart["show_kennlinie"] = bool(_kl_c1.checkbox(
+                    "Kennlinie überlagern",
+                    value=bool(chart.get("show_kennlinie", False)),
+                    key=f"cmp_hm_kl_{ci}",
+                ))
+                if chart["show_kennlinie"]:
+                    _hm_pcts_key = f"cmp_hm_pcts_{ci}"
+                    if _hm_pcts_key not in st.session_state:
+                        st.session_state[_hm_pcts_key] = list(chart.get("kennlinie_pcts") or [95])
+                    chart["kennlinie_pcts"] = list(_kl_c2.multiselect(
+                        "Quantile [%]", options=[50, 75, 90, 95, 99],
+                        key=_hm_pcts_key,
+                    ))
+                    chart["kennlinie_min_n"] = int(_kl_c3.number_input(
+                        "Min. Punkte/Bin", min_value=1,
+                        value=int(chart.get("kennlinie_min_n") or 5),
+                        step=1, key=f"cmp_hm_minn_{ci}",
+                    ))
+            elif chart["plot_type"] == "kennlinie":
+                x_opts = ["time_s"] + [c for c in all_cols if c != "time_s"]
+                x_def = chart.get("x_col", "time_s")
+                x_idx = x_opts.index(x_def) if x_def in x_opts else 0
+                chart["x_col"] = col_a.selectbox("X-Achse", options=x_opts, index=x_idx, key=f"cmp_cx_{ci}")
+                y_opts = [c for c in all_cols if c != chart["x_col"]]
+                y_def = chart.get("y_col", "")
+                y_idx = y_opts.index(y_def) if y_def in y_opts else 0
+                chart["y_col"] = (
+                    col_b.selectbox("Y-Achse", options=y_opts, index=y_idx if y_opts else 0, key=f"cmp_cy_{ci}")
+                    if y_opts else ""
+                )
+                # Kennlinie-specific controls
+                _kl1, _kl2, _kl3, _kl4 = st.columns([2, 3, 2, 2])
+                chart["x_step"] = float(_kl1.number_input(
+                    "Schrittweite X", min_value=0.01,
+                    value=float(chart.get("x_step") or 100.0),
+                    step=10.0, key=f"cmp_kl_xstep_{ci}",
+                ))
+                _kl_pcts_key = f"cmp_kl_pcts_{ci}"
+                if _kl_pcts_key not in st.session_state:
+                    st.session_state[_kl_pcts_key] = list(chart.get("kennlinie_pcts") or [50, 90, 95, 99])
+                chart["kennlinie_pcts"] = list(_kl2.multiselect(
+                    "Quantile [%]", options=[50, 75, 90, 95, 99],
+                    key=_kl_pcts_key,
+                ))
+                chart["kennlinie_min_n"] = int(_kl3.number_input(
+                    "Min. Punkte/Bin", min_value=1,
+                    value=int(chart.get("kennlinie_min_n") or 5),
+                    step=1, key=f"cmp_kl_minn_{ci}",
+                ))
+                chart["kennlinie_smooth"] = int(_kl4.number_input(
+                    "Glättung (0=aus)", min_value=0, max_value=21,
+                    value=int(chart.get("kennlinie_smooth") or 0),
+                    step=2, key=f"cmp_kl_smooth_{ci}",
+                ))
+                _kly1, _kly2 = st.columns([3, 1])
+                _klymax_raw = float(chart.get("y_max") or 0.0)
+                _klymax_new = float(_kly1.number_input(
+                    "Y max (0 = auto)", min_value=0.0,
+                    value=_klymax_raw, step=100.0, key=f"cmp_kl_ymax_{ci}",
+                ))
+                chart["y_max"] = _klymax_new if _klymax_new > 0.0 else None
+                _kl_ymin_zero = chart.get("y_min") == 0.0
+                if _kly2.button(
+                    "Y ≥ 0" if not _kl_ymin_zero else "Y auto",
+                    key=f"cmp_kl_ymin_{ci}",
+                    help="Y-Achse unten auf 0 setzen / Begrenzung aufheben",
+                    width="stretch",
+                ):
+                    chart["y_min"] = 0.0 if not _kl_ymin_zero else None
+                    st.rerun()
             else:
                 x_opts = ["time_s"] + [c for c in all_cols if c != "time_s"]
                 x_def = chart.get("x_col", "time_s")
@@ -820,6 +892,11 @@ def render(ns: dict) -> None:
                     _render_heatmap_chart(chart, display_files, cmp_data, ci)
                 else:
                     st.caption("Y-Achse auswählen um die Heatmap anzuzeigen.")
+            elif chart["plot_type"] == "kennlinie":
+                if chart.get("y_col") and all_cols:
+                    _render_kennlinie_chart(chart, display_files, cmp_data, ci)
+                else:
+                    st.caption("Y-Achse auswählen um die Kennlinie anzuzeigen.")
             elif chart["y_col"] and all_cols:
                 _render_chart(chart, display_files, cmp_data, ci)
             else:
@@ -1114,6 +1191,45 @@ def _render_geoplot_chart(chart: dict, files: list[dict], cmp_data: dict[str, di
         st.caption(f"Geoplot-Fehler: {e}")
 
 
+def _extract_kennlinie(xs, ys, x_step: float, percentiles: list, min_n: int):
+    """Per-bin percentile curves. Returns (centers_array, {pct: [values]})."""
+    import numpy as np
+
+    x_step = max(1e-6, float(x_step))
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    valid = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[valid], ys[valid]
+    if len(xs) < 2:
+        return np.array([]), {p: [] for p in percentiles}
+    x_min = np.floor(xs.min() / x_step) * x_step
+    x_max = np.ceil(xs.max() / x_step) * x_step
+    edges = np.arange(x_min, x_max + x_step * 0.5, x_step)
+    if len(edges) < 2:
+        return np.array([]), {p: [] for p in percentiles}
+    centers: list = []
+    pct_vals: dict = {p: [] for p in percentiles}
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        vals = ys[(xs >= lo) & (xs < hi)]
+        if len(vals) < min_n:
+            continue
+        centers.append(float((lo + hi) / 2))
+        for p in percentiles:
+            pct_vals[p].append(float(np.percentile(vals, p)))
+    return np.array(centers), pct_vals
+
+
+def _smooth_kennlinie(arr, window: int):
+    """Box-filter smoothing over a 1D array; returns same-length array."""
+    import numpy as np
+
+    arr = np.asarray(arr, dtype=float)
+    if window < 2 or len(arr) < window:
+        return arr
+    kernel = np.ones(window) / float(window)
+    return np.convolve(arr, kernel, mode="same")
+
+
 def _render_heatmap_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], chart_idx: int) -> None:
     """Render a 2D density heatmap (Histogram2d) — one subplot per file."""
     try:
@@ -1196,6 +1312,40 @@ def _render_heatmap_chart(chart: dict, files: list[dict], cmp_data: dict[str, di
                 ),
                 row=row, col=col,
             )
+            # Kennlinie overlay
+            if chart.get("show_kennlinie"):
+                _ov_pcts = sorted(int(p) for p in (chart.get("kennlinie_pcts") or [95]))
+                _ov_min_n = int(chart.get("kennlinie_min_n") or 5)
+                _ov_colors = ["#ffffff", "#ff9900", "#ff4444", "#00ffff", "#aaffaa"]
+                if _ov_pcts:
+                    _ov_centers, _ov_pdict = _extract_kennlinie(
+                        d["xs"], d["ys"], x_step, _ov_pcts, _ov_min_n,
+                    )
+                    if len(_ov_centers) >= 2:
+                        for _opi, _opct in enumerate(_ov_pcts):
+                            _ov_vals = _ov_pdict.get(_opct, [])
+                            if len(_ov_vals) < 2:
+                                continue
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=_ov_centers.tolist(),
+                                    y=_ov_vals,
+                                    mode="lines+markers",
+                                    name=f"{d['label']} {_opct}. Pct",
+                                    line=dict(
+                                        color=_ov_colors[_opi % len(_ov_colors)],
+                                        width=2,
+                                    ),
+                                    marker=dict(size=4),
+                                    showlegend=True,
+                                    hovertemplate=(
+                                        f"{x_col}: %{{x:.0f}}<br>"
+                                        f"{y_col}: %{{y:.1f}}<br>"
+                                        f"{_opct}. Pct<extra>{d['label']}</extra>"
+                                    ),
+                                ),
+                                row=row, col=col,
+                            )
             _ax_kw = dict(
                 title_font=dict(color=_fc), tickfont=dict(color=_fc),
                 gridcolor=_gc, linecolor=_fc, zerolinecolor=_gc,
@@ -1220,6 +1370,141 @@ def _render_heatmap_chart(chart: dict, files: list[dict], cmp_data: dict[str, di
         st.plotly_chart(fig, use_container_width=True, key=f"cmp_heatmap_{chart_idx}")
     except Exception as e:
         st.caption(f"Heatmap-Fehler: {e}")
+
+
+def _render_kennlinie_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], chart_idx: int) -> None:
+    """Render percentile-based characteristic curves (Motorenkennlinie)."""
+    try:
+        import plotly.graph_objects as go
+        import numpy as np
+
+        x_col  = chart["x_col"]
+        y_col  = chart["y_col"]
+        x_step = max(1e-6, float(chart.get("x_step") or 100.0))
+        pcts   = sorted(int(p) for p in (chart.get("kennlinie_pcts") or [50, 90, 95, 99]))
+        min_n  = int(chart.get("kennlinie_min_n") or 5)
+        smooth = int(chart.get("kennlinie_smooth") or 0)
+        y_min  = chart.get("y_min")
+        y_max  = chart.get("y_max")
+
+        if not pcts:
+            st.caption("Mindestens ein Quantil auswählen.")
+            return
+
+        _FILE_COLORS = [
+            "#636EFA", "#EF553B", "#00CC96", "#AB63FA",
+            "#FFA15A", "#19D3F3", "#FF6692", "#B6E880",
+        ]
+        _DASH_STYLES = ["solid", "dash", "dot", "dashdot", "longdash"]
+
+        _light = bool(st.session_state.get("cmp_light_mode"))
+        _theme = "plotly_white" if _light else "plotly_dark"
+        _fc    = "black" if _light else "white"
+        _bg    = "white" if _light else "#0e1117"
+        _gc    = "rgba(0,0,0,0.15)" if _light else "rgba(255,255,255,0.1)"
+
+        fig = go.Figure()
+        excel_traces: list[dict] = []
+        multi_file = len(files) > 1
+
+        for fi, f in enumerate(files):
+            data = cmp_data.get(f["path"], {})
+            xs = data.get(x_col)
+            ys = data.get(y_col)
+            if not xs or not ys:
+                continue
+            if len(xs) != len(ys):
+                xs, ys = _align_xy(xs, ys, data, x_col, y_col)
+            if not xs or not ys:
+                continue
+
+            xs_arr = np.asarray(xs, dtype=float)
+            ys_arr = np.asarray(ys, dtype=float)
+            fin_mask = np.isfinite(xs_arr) & np.isfinite(ys_arr)
+            if y_min is not None:
+                fin_mask &= ys_arr >= float(y_min)
+            if y_max is not None:
+                fin_mask &= ys_arr <= float(y_max)
+            xs_arr, ys_arr = xs_arr[fin_mask], ys_arr[fin_mask]
+
+            centers, pct_dict = _extract_kennlinie(xs_arr, ys_arr, x_step, pcts, min_n)
+            if len(centers) < 2:
+                continue
+
+            _color = _FILE_COLORS[fi % len(_FILE_COLORS)]
+
+            for pi, pct in enumerate(pcts):
+                vals = pct_dict.get(pct, [])
+                if len(vals) < 2:
+                    continue
+                vals_arr = np.array(vals, dtype=float)
+                if smooth >= 2:
+                    vals_arr = _smooth_kennlinie(vals_arr, smooth)
+
+                _label = f"{f['label']} – {pct}. Pct" if multi_file else f"{pct}. Pct"
+                _dash = _DASH_STYLES[pi % len(_DASH_STYLES)]
+                _width = 2.5 if pct >= 90 else 1.5
+
+                fig.add_trace(go.Scatter(
+                    x=centers.tolist(),
+                    y=vals_arr.tolist(),
+                    mode="lines",
+                    name=_label,
+                    line=dict(color=_color, dash=_dash, width=_width),
+                    hovertemplate=(
+                        f"{x_col}: %{{x:.0f}}<br>{y_col}: %{{y:.1f}}"
+                        f"<br>{_label}<extra></extra>"
+                    ),
+                ))
+                excel_traces.append({"label": _label, "xs": centers.tolist(), "ys": vals_arr.tolist()})
+
+        if not fig.data:
+            st.caption("Keine Daten fuer Kennlinie (zu wenig Punkte pro Bin oder keine Daten vorhanden).")
+            return
+
+        _yrange_kw: dict = {}
+        if y_min is not None or y_max is not None:
+            _yrange_kw = {"range": [y_min, y_max]}
+
+        _ax_kw = dict(
+            title_font=dict(color=_fc), tickfont=dict(color=_fc),
+            gridcolor=_gc, linecolor=_fc, zerolinecolor=_gc,
+        )
+        fig.update_layout(
+            title=dict(text=chart.get("title", ""), font_color=_fc),
+            xaxis=dict(title=x_col, **_ax_kw),
+            yaxis=dict(title=y_col, **_ax_kw, **_yrange_kw),
+            height=420,
+            template=_theme,
+            paper_bgcolor=_bg,
+            plot_bgcolor=_bg,
+            font=dict(color=_fc),
+            legend=dict(
+                orientation="h", yanchor="bottom", y=1.02,
+                xanchor="right", x=1, font=dict(color=_fc),
+            ),
+            margin=dict(l=50, r=20, t=60, b=40),
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"cmp_kennlinie_{chart_idx}")
+
+        if excel_traces:
+            try:
+                excel_bytes = _build_excel_bytes(excel_traces, x_col, y_col)
+                _safe = "".join(
+                    c if c.isalnum() or c in " ._-" else "_"
+                    for c in chart.get("title", f"Kennlinie_{chart_idx + 1}")
+                ).strip() or f"Kennlinie_{chart_idx + 1}"
+                st.download_button(
+                    label="Als Excel herunterladen",
+                    data=excel_bytes,
+                    file_name=f"{_safe}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"cmp_kl_dl_{chart_idx}",
+                )
+            except Exception as _dl_err:
+                st.caption(f"Excel-Export nicht verfuegbar: {_dl_err}")
+    except Exception as e:
+        st.caption(f"Kennlinie-Fehler: {e}")
 
 
 def _render_config_section() -> None:
