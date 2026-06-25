@@ -1858,10 +1858,11 @@ def render(ns, headless: bool = False):
 
         for row in rows_now:
             link = str(row.get("youtube_link") or "").strip()
-            if not link:
-                continue
             folder = str(row.get("capture_folder") or "").strip()
             if not folder:
+                if not link:
+                    _wd_log("Eintrag ohne Link und capture_folder – skip")
+                    continue
                 folder = _default_capture_folder()
                 row = _wd_update_row(link, {"capture_folder": folder}) or {**row, "capture_folder": folder}
             out_video, out_audio = _capture_media_paths(folder, base_override=base_override)
@@ -1877,7 +1878,7 @@ def render(ns, headless: bool = False):
                 if not need_ocr:
                     _wd_log(f"OCR {folder}: {reason} – skip")
 
-            if task_download:
+            if task_download and link:
                 video_faulty = _wd_is_video_faulty(json_file)
                 with _YT_WATCHDOG_LOCK:
                     faulty_tried: set = _YT_WATCHDOG.setdefault("faulty_tried", set())
@@ -1957,7 +1958,8 @@ def render(ns, headless: bool = False):
                     return True
 
             if status != "downloaded":
-                _wd_update_row(link, {"download_status": "downloaded", "last_error": ""})
+                if link:
+                    _wd_update_row(link, {"download_status": "downloaded", "last_error": ""})
 
             need_ocr, reason = _wd_ocr_pending(json_file)
             if task_ocr and need_ocr and folder not in ocr_skip_now:
@@ -1969,16 +1971,19 @@ def render(ns, headless: bool = False):
                 ok_ocr, msg_ocr = _wd_run_ocr(folder, json_file, base_override=base_override, target_fps_str=str(cfg.get("ocr_fps", "2") or "2"))
                 if ok_ocr:
                     _wd_inc("ocr")
-                    _wd_update_row(link, {"last_error": "", "ocr_status": str(msg_ocr)})
+                    if link:
+                        _wd_update_row(link, {"last_error": "", "ocr_status": str(msg_ocr)})
                     _wd_log(f"OCR abgeschlossen: {folder} – {msg_ocr}")
                     return True
                 elif "abgebrochen" in str(msg_ocr):
                     # Stopped by stop_event — partial progress already saved, resume next time
-                    _wd_update_row(link, {"ocr_status": str(msg_ocr)})
+                    if link:
+                        _wd_update_row(link, {"ocr_status": str(msg_ocr)})
                     return True
                 else:
                     _wd_inc("errors")
-                    _wd_update_row(link, {"last_error": f"OCR: {msg_ocr}"})
+                    if link:
+                        _wd_update_row(link, {"last_error": f"OCR: {msg_ocr}"})
                     _wd_log(f"OCR Fehler: {folder} -> {msg_ocr}")
                     with _YT_WATCHDOG_LOCK:
                         _YT_WATCHDOG.setdefault("ocr_skip", set()).add(folder)

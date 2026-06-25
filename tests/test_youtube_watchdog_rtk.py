@@ -21,12 +21,12 @@ def test_watchdog_runtime_state_and_loop_exist():
     assert '"sync_lite": True' not in state_txt
     assert "def watchdog_snapshot() -> dict:" in txt
     assert 'def _wd_loop(stop_event, cfg: dict) -> None:' in txt
-    assert 'def _wd_process_once(cfg: dict) -> bool:' in txt
+    assert 'def _wd_process_once(cfg: dict, stop_event=None) -> bool:' in txt
 
 
 def test_watchdog_tab_dashboard_controls_exist():
     txt = _read("app_tabs/watchdog_tab.py")
-    assert '"Konvertierung MAT -> JSON"' in txt
+    assert '"Konvertierung MAT -> JSON"' in txt or '"Konvertierung MAT â†’ JSON"' in txt or '"Konvertierung MAT → JSON"' in txt
     assert '"YouTube Download"' in txt
     assert '"OCR Auswertung"' in txt
     assert '"Watchdog-Intervall (Sek.)"' in txt
@@ -67,3 +67,14 @@ def test_watchdog_runs_download_and_ocr_pipeline_without_lite_dependencies():
     assert 'st.session_state.setdefault("yt_watchdog_cmd", "")' in txt
     assert '_wd_cmd == "start"' in txt
     assert '_wd_cmd == "stop"' in txt
+
+
+def test_watchdog_ocr_allows_private_results_without_youtube_url():
+    """Private/local captures have no youtube_link; OCR must still be reachable."""
+    txt = _read("app_tabs/youtube_tab.py")
+    loop = txt[txt.index("        for row in rows_now:"):txt.index("        # ── Nachkorrektur")]
+
+    assert 'if not link:\n                continue' not in loop
+    assert "if task_download and link:" in loop
+    assert "if task_ocr and need_ocr and folder not in ocr_skip_now:" in loop
+    assert loop.index("if task_download and link:") < loop.index("if task_ocr and need_ocr and folder not in ocr_skip_now:")
