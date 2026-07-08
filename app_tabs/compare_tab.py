@@ -135,6 +135,16 @@ def _load_file_data(json_path: str, offset_s: float, offset_m: float = 0.0) -> d
                         cols[k] = [float(x) if x not in ("", None) else float("nan") for x in v]
                     except Exception:
                         cols[k] = list(v)
+        try:
+            import numpy as _np
+            _t_sort = _np.asarray(cols.get("time_s") or [], dtype=float)
+            if _t_sort.size == n and _np.isfinite(_t_sort).any() and (_np.diff(_t_sort[_np.isfinite(_t_sort)]) < 0).any():
+                _order = _np.argsort(_t_sort, kind="stable")
+                for _k, _v in list(cols.items()):
+                    if isinstance(_v, list) and len(_v) == n:
+                        cols[_k] = [_v[int(i)] for i in _order]
+        except Exception:
+            pass
 
     # Interpolate track_xy_x / track_xy_y gaps so the track line is continuous
     _ts = cols.get("time_s")

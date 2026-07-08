@@ -37,3 +37,12 @@ def test_watchdog_ocr_reruns_when_expected_columns_are_missing():
     assert "_miss_tbl = [k for k in exp_cols if k not in existing_table]" in txt
     assert "_miss_cln = [k for k in exp_cols if k not in existing_cleaned]" in txt
     assert "fehlende Spalten erkannt -> kompletter Rebuild" in txt
+
+
+def test_watchdog_ocr_accepts_legacy_single_roi_row():
+    """Legacy private captures may store one ROI as [name, roi, fmt, scale]."""
+    txt = _read("app_tabs/youtube_tab.py")
+    assert "# Legacy single-row variant: [name_roi, roi, fmt, max_scale]." in txt
+    assert '"name_roi": roi_table[0]' in txt
+    assert '"roi": roi_table[1]' in txt
+    assert '"fmt": roi_table[2]' in txt

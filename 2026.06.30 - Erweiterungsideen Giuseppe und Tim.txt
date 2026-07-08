@@ -1,0 +1,17 @@
+Mehr Metadaten:
+-	Fahrzeugparameter: BEV, VKM
+-	Rundenzeit
+
+Lokales tool oder datenbank? -> 
+
+GPS Strecke verknüpfen
+
+Schätzung Querbeschleunigung 
+
+bis Sommerferien:
+- Korrektur Geschwindigkeit und ggf. Neulauf von OCR
+- Berechnung Strecke aus Geschwindigkeit
+- Anknüpfung OCR-Strecke zu GPS-Strecke
+- Berechnung Beschleunigung X (aus Geschwindigkeit) und Y (aus GPS-Krümmung + Geschwindigkeit)
+- Anbindung Videodatenbank zu Autodatenbank -> Suche nach Fahrzeugen mit 7m20s +- 10s
+- G-G-Diagramm erstellen

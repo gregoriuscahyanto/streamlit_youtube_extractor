@@ -93,6 +93,16 @@ def _load_cleaned(json_path: str) -> dict[str, list]:
             if not isinstance(v, list) or len(v) != n:
                 continue
             out[k] = [_to_f(x) for x in v]
+        try:
+            import numpy as np
+            t_vals = np.array(out.get(t_key) or [], dtype=float)
+            if t_vals.size == n and np.isfinite(t_vals).any() and (np.diff(t_vals[np.isfinite(t_vals)]) < 0).any():
+                order = np.argsort(t_vals, kind="stable")
+                for k, v in list(out.items()):
+                    if isinstance(v, list) and len(v) == n:
+                        out[k] = [v[int(i)] for i in order]
+        except Exception:
+            pass
         return out
     except Exception:
         return {}
@@ -156,13 +166,23 @@ def _interpolate_column(
     valid = np.isfinite(xs_k) & np.isfinite(ys_k)
     if valid.sum() < 2:
         return ys
+    xs_src = xs_k[valid]
+    ys_src = ys_k[valid]
+    order = np.argsort(xs_src, kind="stable")
+    xs_src = xs_src[order]
+    ys_src = ys_src[order]
+    uniq_x, uniq_idx = np.unique(xs_src, return_index=True)
+    xs_src = uniq_x
+    ys_src = ys_src[uniq_idx]
+    if xs_src.size < 2:
+        return ys
 
     # Positions that need filling: manually marked + existing NaN in the data
     need_fill = (~keep) | (~np.isfinite(ys_arr))
 
     # No extrapolation: clamp to [x_min, x_max] of the source — set NaN outside
-    x_min = float(xs_k[valid].min())
-    x_max = float(xs_k[valid].max())
+    x_min = float(xs_src.min())
+    x_max = float(xs_src.max())
     in_range = need_fill & np.isfinite(xs_arr) & (xs_arr >= x_min) & (xs_arr <= x_max)
     out_of_range = need_fill & ~in_range
 
@@ -175,13 +195,13 @@ def _interpolate_column(
     try:
         if method == "akima":
             from scipy.interpolate import Akima1DInterpolator
-            f = Akima1DInterpolator(xs_k[valid], ys_k[valid])
+            f = Akima1DInterpolator(xs_src, ys_src)
             result[in_range] = f(xs_arr[in_range])
         else:
             from scipy.interpolate import interp1d
             kind = {"linear": "linear", "quadratic": "quadratic",
                     "cubic": "cubic", "nearest": "nearest"}.get(method, "linear")
-            f = interp1d(xs_k[valid], ys_k[valid], kind=kind,
+            f = interp1d(xs_src, ys_src, kind=kind,
                          bounds_error=False, fill_value=float("nan"))
             result[in_range] = f(xs_arr[in_range])
         return result.tolist()

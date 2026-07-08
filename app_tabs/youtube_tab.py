@@ -777,6 +777,18 @@ def render(ns, headless: bool = False):
                     "pattern": _pat,
                     "max_scale": _msc,
                 }]
+        elif (
+            isinstance(roi_table, list)
+            and len(roi_table) >= 3
+            and not any(isinstance(x, dict) for x in roi_table)
+        ):
+            # Legacy single-row variant: [name_roi, roi, fmt, max_scale].
+            roi_table = [{
+                "name_roi": roi_table[0],
+                "roi": roi_table[1],
+                "fmt": roi_table[2],
+                "max_scale": roi_table[3] if len(roi_table) >= 4 else 1.2,
+            }]
         elif not isinstance(roi_table, list):
             roi_table = []
 
