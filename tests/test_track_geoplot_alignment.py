@@ -43,7 +43,7 @@ def test_align_traces_uses_identical_canonical_xy_grid():
         "xs": [2.0, 25.0, 50.0, 75.0, 99.0, 101.0, 100.0, 80.0],
         "ys": [2.0, -2.0, 3.0, -2.0, 1.0, 30.0, 70.0, 99.0],
         "cs": [100.0, 110.0, 120.0, 130.0, 125.0, 115.0, 105.0, 95.0],
-        "ps": np.linspace(0.0, 2500.0, 8).tolist(),
+        "ps": np.linspace(0.0, 2500.0, 20).tolist(),
         "centerline": centerline,
     }
     trace_b = {
@@ -51,7 +51,7 @@ def test_align_traces_uses_identical_canonical_xy_grid():
         "xs": [-3.0, 22.0, 52.0, 78.0, 103.0, 97.0, 96.0, 77.0],
         "ys": [-4.0, 4.0, -3.0, 5.0, 3.0, 28.0, 72.0, 104.0],
         "cs": [98.0, 108.0, 118.0, 128.0, 123.0, 113.0, 103.0, 93.0],
-        "ps": np.linspace(0.0, 2520.0, 8).tolist(),
+        "ps": np.linspace(0.0, 2520.0, 20).tolist(),
         "centerline": centerline,
     }
 
