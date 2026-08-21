@@ -89,7 +89,11 @@ def test_compare_computes_distance_like_editor_and_wheel_power():
 def test_compare_derivatives_ui_tokens_exist():
     txt = _read("app_tabs/compare_tab.py")
     assert "Abgeleitete Verlaeufe" in txt
-    assert "Radleistung und Raddrehmoment aus Fahrwiderstaenden berechnen" in txt
+    assert "G-G / Querbeschleunigung" in txt
+    assert "G-G berechnen" in txt
+    assert '"gg": "G-G"' in txt
+    assert "def _render_gg_chart" in txt
+    assert "Radleistung und Raddrehmoment" in txt
     assert "Luftdichte rho [kg/m^3]" in txt
     assert "Masse m [kg] (Pflicht)" in txt
     assert "Stirnflaeche A [m^2] (Pflicht)" in txt

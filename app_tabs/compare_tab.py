@@ -363,6 +363,14 @@ def _add_compare_derivatives(data: dict[str, list], cfg: dict) -> tuple[bool, li
     s = _compute_s_m_from_speed(data)
     if s:
         data["s_m"] = list(s)
+    if cfg.get("enable_gg_dynamics"):
+        try:
+            from core.vehicle_dynamics import add_gg_dynamics
+            ok_gg, missing_gg = add_gg_dynamics(data, cfg)
+            if not ok_gg:
+                return False, missing_gg
+        except Exception as e:
+            return False, [f"G-G Berechnung: {e}"]
     if not cfg.get("enable_wheel_dynamics"):
         return True, []
     return _add_wheel_dynamics(data, cfg)
@@ -523,7 +531,10 @@ def render(ns: dict) -> None:
         with st.container(border=True):
             st.caption(f"Extern: {getattr(uf, 'name', '')} ({len(df_ext)} Zeilen)")
             numeric_ext_cols = list(df_ext.columns)
-            map_targets = ["time_s", "rpm", "v_Fzg_kmph", "s_m", "track_xy_x", "track_xy_y"]
+            map_targets = [
+                "time_s", "rpm", "v_Fzg_kmph", "s_m", "track_xy_x", "track_xy_y",
+                "gps_x_m", "gps_y_m", "x_m", "y_m", "lat", "lon",
+            ]
             aliases = {
                 "time_s": ["time_s", "t_s", "time", "t"],
                 "rpm": ["rpm", "n_VKM_anzeige_Upm1n", "n", "engine_rpm"],
@@ -531,6 +542,12 @@ def render(ns: dict) -> None:
                 "s_m": ["s_m", "distance", "dist_m"],
                 "track_xy_x": ["track_xy_x", "x"],
                 "track_xy_y": ["track_xy_y", "y"],
+                "gps_x_m": ["gps_x_m"],
+                "gps_y_m": ["gps_y_m"],
+                "x_m": ["x_m"],
+                "y_m": ["y_m"],
+                "lat": ["lat", "latitude", "gps_lat"],
+                "lon": ["lon", "longitude", "gps_lon"],
             }
             mapping: dict[str, str] = {}
             mcols = st.columns(3)
@@ -596,6 +613,51 @@ def render(ns: dict) -> None:
 
     st.markdown("### Abgeleitete Verlaeufe")
     st.caption("s_m wird immer aus v_Fzg_kmph und time_s berechnet.")
+    with st.expander("G-G / Querbeschleunigung", expanded=False):
+        st.caption("Berechnet Gx aus OCR-Geschwindigkeit und Gy aus GPS-/Streckenkruemmung plus Geschwindigkeit.")
+        _gg1, _gg2, _gg3 = st.columns([2, 1, 1])
+        _gg_source_opts = ["auto", "track_xy"]
+        _gg_source_labels = {
+            "auto": "GPS/Meterdaten bevorzugen",
+            "track_xy": "track_xy + Skalierung",
+        }
+        _gg_source_cur = str(st.session_state.get("cmp_gg_source", "auto") or "auto")
+        if _gg_source_cur not in _gg_source_opts:
+            _gg_source_cur = "auto"
+        _gg1.selectbox(
+            "Datenquelle",
+            options=_gg_source_opts,
+            index=_gg_source_opts.index(_gg_source_cur),
+            format_func=lambda v: _gg_source_labels.get(v, v),
+            key="cmp_gg_source",
+        )
+        _gg2.text_input(
+            "m pro Pixel",
+            value=st.session_state.get("cmp_gg_m_per_px_txt", "1,0"),
+            key="cmp_gg_m_per_px_txt",
+        )
+        _gg3.number_input(
+            "Glaettung Samples",
+            min_value=1,
+            max_value=51,
+            value=int(st.session_state.get("cmp_gg_smooth_window", 5) or 5),
+            step=2,
+            key="cmp_gg_smooth_window",
+        )
+        _gg_active = bool(st.session_state.get("cmp_enable_gg_dynamics", False))
+        _ggb1, _ggb2 = st.columns([2, 1])
+        if _ggb1.button(
+            "G-G berechnen" if not _gg_active else "Aktiv - Parameter aendern und neu berechnen",
+            type="primary",
+            key="cmp_gg_calc_btn",
+            width="stretch",
+        ):
+            st.session_state["cmp_enable_gg_dynamics"] = True
+            st.rerun()
+        if _gg_active and _ggb2.button("Deaktivieren", key="cmp_gg_reset_btn", width="stretch"):
+            st.session_state["cmp_enable_gg_dynamics"] = False
+            st.rerun()
+
     with st.expander("Radleistung und Raddrehmoment", expanded=False):
         st.caption(
             "Steigung wird aktuell mit 0 % angesetzt; spaeter kann sie ueber Strecke/GPS per Lookup ergaenzt werden."
@@ -626,6 +688,7 @@ def render(ns: dict) -> None:
             st.rerun()
 
     _cmp_enable_wheel = bool(st.session_state.get("cmp_enable_wheel_dynamics", False))
+    _cmp_enable_gg = bool(st.session_state.get("cmp_enable_gg_dynamics", False))
     _rho  = st.session_state.get("cmp_rho_txt",    "1,225")
     _g    = st.session_state.get("cmp_g_txt",      "9,81")
     _crr  = st.session_state.get("cmp_crr_txt",    "0,01")
@@ -644,6 +707,10 @@ def render(ns: dict) -> None:
         "cw": _to_float_or_none(_cw),
         "area_m2": _to_float_or_none(_area),
         "r_dyn_m": _to_float_or_none(_rdyn),
+        "enable_gg_dynamics": _cmp_enable_gg,
+        "gg_source": st.session_state.get("cmp_gg_source", "auto"),
+        "gg_m_per_px": _to_float_or_none(st.session_state.get("cmp_gg_m_per_px_txt", "1,0")),
+        "gg_smooth_window": int(st.session_state.get("cmp_gg_smooth_window", 5) or 5),
     }
     if _cmp_enable_wheel:
         _missing_global = [
@@ -706,6 +773,9 @@ def render(ns: dict) -> None:
         _ok_der, _miss_der = _add_compare_derivatives(_cols, _cmp_deriv_cfg)
         if not _ok_der and _miss_der:
             _derive_missing[str(_src.get("label") or _src.get("path"))] = _miss_der
+    if _derive_missing and _cmp_deriv_cfg.get("enable_gg_dynamics"):
+        _msg = "; ".join(f"{lbl}: {', '.join(vals)}" for lbl, vals in _derive_missing.items())
+        st.warning("G-G / Querbeschleunigung nicht fuer alle Quellen berechnet: " + _msg)
     if _derive_missing and _cmp_deriv_cfg.get("enable_wheel_dynamics"):
         _msg = "; ".join(f"{lbl}: {', '.join(vals)}" for lbl, vals in _derive_missing.items())
         st.warning("Radleistung/Raddrehmoment nicht fuer alle Quellen berechnet: " + _msg)
@@ -744,8 +814,8 @@ def render(ns: dict) -> None:
 
             col_a, col_b, col_c = st.columns([2, 2, 2])
 
-            _type_opts = ["line", "scatter", "geoplot", "heatmap", "kennlinie"]
-            _type_labels = {"line": "Linie", "scatter": "Punkte", "geoplot": "Geoplot", "heatmap": "Heatmap", "kennlinie": "Kennlinie"}
+            _type_opts = ["line", "scatter", "geoplot", "gg", "heatmap", "kennlinie"]
+            _type_labels = {"line": "Linie", "scatter": "Punkte", "geoplot": "Geoplot", "gg": "G-G", "heatmap": "Heatmap", "kennlinie": "Kennlinie"}
             _cur_type = chart.get("plot_type", "line")
             if _cur_type not in _type_opts:
                 _cur_type = "line"
@@ -768,6 +838,11 @@ def render(ns: dict) -> None:
                 col_b.caption("X: `track_xy_x`  ·  Y: `track_xy_y`")
                 chart["x_col"] = "track_xy_x"
                 chart["y_col"] = "track_xy_y"
+            elif chart["plot_type"] == "gg":
+                col_a.caption("X: `gy_g`")
+                col_b.caption("Y: `gx_g`")
+                chart["x_col"] = "gy_g"
+                chart["y_col"] = "gx_g"
             elif chart["plot_type"] == "heatmap":
                 x_opts = ["time_s"] + [c for c in all_cols if c != "time_s"]
                 x_def = chart.get("x_col", "time_s")
@@ -897,6 +972,8 @@ def render(ns: dict) -> None:
             # Render this chart
             if chart["plot_type"] == "geoplot":
                 _render_geoplot_chart(chart, display_files, cmp_data, ci)
+            elif chart["plot_type"] == "gg":
+                _render_gg_chart(chart, display_files, cmp_data, ci)
             elif chart["plot_type"] == "heatmap":
                 if chart.get("y_col") and all_cols:
                     _render_heatmap_chart(chart, display_files, cmp_data, ci)
@@ -1082,6 +1159,81 @@ def _render_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], cha
                 st.caption(f"Excel-Export nicht verfügbar: {dl_err}")
     except Exception as e:
         st.caption(f"Diagramm-Fehler: {e}")
+
+
+def _render_gg_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], chart_idx: int) -> None:
+    """Render G-G diagram: lateral Gy on X, longitudinal Gx on Y."""
+    try:
+        import numpy as np
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+        traces = []
+        max_abs = 0.0
+        for f in files:
+            d = cmp_data.get(f["path"], {})
+            gx = d.get("gx_g")
+            gy = d.get("gy_g")
+            if not gx or not gy or len(gx) != len(gy):
+                continue
+            gx_arr = np.asarray(gx, dtype=float)
+            gy_arr = np.asarray(gy, dtype=float)
+            ok = np.isfinite(gx_arr) & np.isfinite(gy_arr)
+            if ok.sum() < 2:
+                continue
+            t = np.full(len(gx_arr), np.nan, dtype=float)
+            v = np.full(len(gx_arr), np.nan, dtype=float)
+            t_raw = np.asarray(d.get("time_s") or [], dtype=float)
+            v_raw = np.asarray(d.get("v_Fzg_kmph") or [], dtype=float)
+            t[:min(len(t), len(t_raw))] = t_raw[:min(len(t), len(t_raw))]
+            v[:min(len(v), len(v_raw))] = v_raw[:min(len(v), len(v_raw))]
+            custom = np.column_stack([t[ok], v[ok]])
+            fig.add_trace(go.Scattergl(
+                x=gy_arr[ok],
+                y=gx_arr[ok],
+                mode="markers",
+                name=f["label"],
+                marker=dict(size=4, opacity=0.72),
+                customdata=custom,
+                hovertemplate=(
+                    "Gy=%{x:.3f} g<br>Gx=%{y:.3f} g<br>"
+                    "t=%{customdata[0]:.2f}s<br>v=%{customdata[1]:.1f} km/h"
+                    "<extra>%{fullData.name}</extra>"
+                ),
+            ))
+            traces.append({"label": f["label"], "xs": gy_arr[ok].tolist(), "ys": gx_arr[ok].tolist()})
+            max_abs = max(max_abs, float(np.nanmax(np.abs(gx_arr[ok]))), float(np.nanmax(np.abs(gy_arr[ok]))))
+
+        if not fig.data:
+            st.caption("Keine G-G-Daten vorhanden. Bitte G-G / Querbeschleunigung in den abgeleiteten Verlaeufen aktivieren.")
+            return
+
+        lim = max(0.25, min(3.0, max_abs * 1.08))
+        _light = bool(st.session_state.get("cmp_light_mode"))
+        _theme = "plotly_white" if _light else "plotly_dark"
+        _fc = "black" if _light else "white"
+        _gc = "rgba(0,0,0,0.15)" if _light else "rgba(255,255,255,0.1)"
+        fig.update_layout(
+            title=dict(text=chart.get("title", "G-G"), font_color=_fc),
+            height=430,
+            template=_theme,
+            paper_bgcolor="white" if _light else "#0e1117",
+            plot_bgcolor="white" if _light else "#0e1117",
+            font=dict(color=_fc),
+            margin=dict(l=50, r=20, t=50, b=50),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig.update_xaxes(
+            title="Gy [g]", range=[-lim, lim], scaleanchor="y", scaleratio=1,
+            zeroline=True, zerolinecolor=_fc, gridcolor=_gc, linecolor=_fc,
+        )
+        fig.update_yaxes(
+            title="Gx [g]", range=[-lim, lim],
+            zeroline=True, zerolinecolor=_fc, gridcolor=_gc, linecolor=_fc,
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"cmp_gg_{chart_idx}")
+    except Exception as e:
+        st.caption(f"G-G-Fehler: {e}")
 
 
 def _render_geoplot_chart(chart: dict, files: list[dict], cmp_data: dict[str, dict], chart_idx: int) -> None:
